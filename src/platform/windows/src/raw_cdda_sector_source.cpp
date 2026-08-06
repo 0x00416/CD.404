@@ -11,14 +11,21 @@ namespace cd404::platform::windows {
 
 RawCddaSectorSource::RawCddaSectorSource(
     void* const native_handle,
+    void* const native_io_event,
     const core::Sector first_lba,
     const core::Sector end_lba) noexcept
-    : native_handle_(native_handle), first_lba_(first_lba), end_lba_(end_lba)
+    : native_handle_(native_handle),
+      native_io_event_(native_io_event),
+      first_lba_(first_lba),
+      end_lba_(end_lba)
 {
 }
 
 RawCddaSectorSource::~RawCddaSectorSource()
 {
+    if (native_io_event_ != nullptr) {
+        CloseHandle(static_cast<HANDLE>(native_io_event_));
+    }
     if (native_handle_ != nullptr && native_handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(static_cast<HANDLE>(native_handle_));
     }
@@ -63,16 +70,39 @@ audio::SectorReadResult RawCddaSectorSource::read_sectors(
     request.SectorCount = static_cast<ULONG>(sector_count);
     request.TrackMode = CDDA;
 
+    auto* const event_handle = static_cast<HANDLE>(native_io_event_);
+    if (event_handle == nullptr || ResetEvent(event_handle) == FALSE) {
+        return {audio::ReadStatus::io_error, 0, GetLastError()};
+    }
+
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event_handle;
     DWORD bytes_returned{};
-    if (!DeviceIoControl(
+    const BOOL started = DeviceIoControl(
             static_cast<HANDLE>(native_handle_),
             IOCTL_CDROM_RAW_READ,
             &request,
             sizeof(request),
             destination.data(),
             static_cast<DWORD>(destination.size()),
+            nullptr,
+            &overlapped);
+    if (started == FALSE) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_IO_PENDING) {
+            return {audio::ReadStatus::io_error, 0, error};
+        }
+        if (WaitForSingleObject(event_handle, INFINITE) != WAIT_OBJECT_0) {
+            return {audio::ReadStatus::io_error, 0, GetLastError()};
+        }
+    }
+    // FILE_FLAG_OVERLAPPED operations may still complete synchronously. In
+    // both cases GetOverlappedResult is the single source of the byte count.
+    if (GetOverlappedResult(
+            static_cast<HANDLE>(native_handle_),
+            &overlapped,
             &bytes_returned,
-            nullptr)) {
+            FALSE) == FALSE) {
         return {audio::ReadStatus::io_error, 0, GetLastError()};
     }
 
@@ -81,6 +111,13 @@ audio::SectorReadResult RawCddaSectorSource::read_sectors(
     }
 
     return {audio::ReadStatus::ok, sector_count, ERROR_SUCCESS};
+}
+
+void RawCddaSectorSource::request_cancel() noexcept
+{
+    if (native_handle_ != nullptr && native_handle_ != INVALID_HANDLE_VALUE) {
+        static_cast<void>(CancelIoEx(static_cast<HANDLE>(native_handle_), nullptr));
+    }
 }
 
 RawCddaOpenResult open_raw_cdda_source(
@@ -98,14 +135,25 @@ RawCddaOpenResult open_raw_cdda_source(
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         return {nullptr, GetLastError()};
     }
 
+    HANDLE io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (io_event == nullptr) {
+        const DWORD error = GetLastError();
+        CloseHandle(handle);
+        return {nullptr, error};
+    }
+
     return {
-        std::make_unique<RawCddaSectorSource>(handle, first_lba, end_lba),
+        std::make_unique<RawCddaSectorSource>(
+            handle,
+            io_event,
+            first_lba,
+            end_lba),
         ERROR_SUCCESS,
     };
 }

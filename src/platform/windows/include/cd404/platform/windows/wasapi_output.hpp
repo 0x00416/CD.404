@@ -35,16 +35,29 @@ public:
     [[nodiscard]] std::int32_t open_default_shared() noexcept;
 
     // Writes interleaved stereo samples. The span must contain exactly two
-    // samples per frame (or more when frame_count addresses a prefix).
+    // samples per frame (or more when frame_count addresses a prefix). Before
+    // start(), this only primes the currently available endpoint space and
+    // returns S_FALSE with a partial frame count rather than waiting when full.
     [[nodiscard]] WasapiWriteResult write_interleaved(
         std::span<const std::int16_t> samples,
         std::uint32_t frame_count) noexcept;
 
+    // Starts rendering frames previously primed through write_interleaved().
+    [[nodiscard]] std::int32_t start() noexcept;
+
     // Waits until all submitted frames have left the WASAPI endpoint buffer.
     [[nodiscard]] std::int32_t drain() noexcept;
 
+    // Returns the number of frames still queued in the endpoint buffer.
+    [[nodiscard]] std::int32_t get_current_padding(
+        std::uint32_t& frame_count) noexcept;
+
     // Stops and resets the stream, discarding queued frames. It is idempotent.
     [[nodiscard]] std::int32_t stop() noexcept;
+
+    // May be called from another thread to interrupt a blocked write or drain.
+    // The object must remain alive until that operation has returned.
+    void request_cancel() noexcept;
     void close() noexcept;
 
     [[nodiscard]] bool is_open() const noexcept;

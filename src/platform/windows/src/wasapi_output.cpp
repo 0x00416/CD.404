@@ -24,10 +24,26 @@ constexpr DWORD kEventWaitMilliseconds = 2'000;
     return HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
 }
 
-[[nodiscard]] HRESULT wait_for_audio_event(const HANDLE event_handle) noexcept
+[[nodiscard]] constexpr HRESULT operation_cancelled() noexcept
 {
-    const DWORD wait_result = WaitForSingleObject(event_handle, kEventWaitMilliseconds);
+    return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+}
+
+[[nodiscard]] HRESULT wait_for_audio_event(
+    const HANDLE audio_event,
+    const HANDLE cancel_event) noexcept
+{
+    // Cancellation is first so it wins when both handles are already signaled.
+    const HANDLE handles[]{cancel_event, audio_event};
+    const DWORD wait_result = WaitForMultipleObjects(
+        static_cast<DWORD>(std::size(handles)),
+        handles,
+        FALSE,
+        kEventWaitMilliseconds);
     if (wait_result == WAIT_OBJECT_0) {
+        return operation_cancelled();
+    }
+    if (wait_result == WAIT_OBJECT_0 + 1) {
         return S_OK;
     }
     if (wait_result == WAIT_FAILED) {
@@ -44,6 +60,7 @@ struct WasapiOutput::Implementation final {
     ComPtr<IAudioClient> audio_client;
     ComPtr<IAudioRenderClient> render_client;
     HANDLE buffer_event{};
+    HANDLE cancel_event{};
     DWORD owner_thread{};
     UINT32 buffer_frames{};
     bool com_owned{};
@@ -80,6 +97,10 @@ struct WasapiOutput::Implementation final {
         if (buffer_event != nullptr) {
             CloseHandle(buffer_event);
             buffer_event = nullptr;
+        }
+        if (cancel_event != nullptr) {
+            CloseHandle(cancel_event);
+            cancel_event = nullptr;
         }
     }
 };
@@ -184,6 +205,13 @@ std::int32_t WasapiOutput::open_default_shared() noexcept
         return result;
     }
 
+    state.cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (state.cancel_event == nullptr) {
+        result = HRESULT_FROM_WIN32(GetLastError());
+        state.release_resources();
+        return result;
+    }
+
     result = state.audio_client->SetEventHandle(state.buffer_event);
     if (FAILED(result)) {
         state.release_resources();
@@ -223,6 +251,10 @@ WasapiWriteResult WasapiOutput::write_interleaved(
 
     std::uint32_t written{};
     while (written < frame_count) {
+        if (WaitForSingleObject(state.cancel_event, 0) == WAIT_OBJECT_0) {
+            return WasapiWriteResult{operation_cancelled(), written};
+        }
+
         UINT32 padding{};
         result = state.audio_client->GetCurrentPadding(&padding);
         if (FAILED(result)) {
@@ -234,7 +266,10 @@ WasapiWriteResult WasapiOutput::write_interleaved(
 
         const UINT32 available = state.buffer_frames - padding;
         if (available == 0) {
-            result = wait_for_audio_event(state.buffer_event);
+            if (!state.started) {
+                return WasapiWriteResult{S_FALSE, written};
+            }
+            result = wait_for_audio_event(state.buffer_event, state.cancel_event);
             if (FAILED(result)) {
                 return WasapiWriteResult{result, written};
             }
@@ -257,17 +292,34 @@ WasapiWriteResult WasapiOutput::write_interleaved(
             return WasapiWriteResult{result, written};
         }
         written += frames_to_write;
-
-        if (!state.started) {
-            result = state.audio_client->Start();
-            if (FAILED(result)) {
-                return WasapiWriteResult{result, written};
-            }
-            state.started = true;
-        }
     }
 
     return WasapiWriteResult{S_OK, written};
+}
+
+std::int32_t WasapiOutput::start() noexcept
+{
+    if (implementation_ == nullptr || !implementation_->open) {
+        return invalid_state();
+    }
+
+    Implementation& state = *implementation_;
+    HRESULT result = state.check_thread();
+    if (FAILED(result)) {
+        return result;
+    }
+    if (WaitForSingleObject(state.cancel_event, 0) == WAIT_OBJECT_0) {
+        return operation_cancelled();
+    }
+    if (state.started) {
+        return S_OK;
+    }
+
+    result = state.audio_client->Start();
+    if (SUCCEEDED(result)) {
+        state.started = true;
+    }
+    return result;
 }
 
 std::int32_t WasapiOutput::drain() noexcept
@@ -286,16 +338,35 @@ std::int32_t WasapiOutput::drain() noexcept
     }
 
     for (;;) {
+        if (WaitForSingleObject(state.cancel_event, 0) == WAIT_OBJECT_0) {
+            return operation_cancelled();
+        }
         UINT32 padding{};
         result = state.audio_client->GetCurrentPadding(&padding);
         if (FAILED(result) || padding == 0) {
             return result;
         }
-        result = wait_for_audio_event(state.buffer_event);
+        result = wait_for_audio_event(state.buffer_event, state.cancel_event);
         if (FAILED(result)) {
             return result;
         }
     }
+}
+
+std::int32_t WasapiOutput::get_current_padding(
+    std::uint32_t& frame_count) noexcept
+{
+    frame_count = 0;
+    if (implementation_ == nullptr || !implementation_->open) {
+        return invalid_state();
+    }
+
+    Implementation& state = *implementation_;
+    const HRESULT result = state.check_thread();
+    if (FAILED(result)) {
+        return result;
+    }
+    return state.audio_client->GetCurrentPadding(&frame_count);
 }
 
 std::int32_t WasapiOutput::stop() noexcept
@@ -318,6 +389,15 @@ std::int32_t WasapiOutput::stop() noexcept
     }
     state.started = false;
     return state.audio_client->Reset();
+}
+
+void WasapiOutput::request_cancel() noexcept
+{
+    // request_cancel is intentionally the sole method without COM-thread
+    // affinity. Lifetime synchronization remains the caller's responsibility.
+    if (implementation_ != nullptr && implementation_->cancel_event != nullptr) {
+        static_cast<void>(SetEvent(implementation_->cancel_event));
+    }
 }
 
 void WasapiOutput::close() noexcept

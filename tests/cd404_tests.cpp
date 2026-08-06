@@ -1,6 +1,7 @@
 #include <cd404/audio/cdda_pcm.hpp>
 #include <cd404/audio/cdda_sector_source.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
+#include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/toc.hpp>
 
@@ -12,7 +13,9 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -373,6 +376,126 @@ void test_cdda_pcm_conversion()
         "empty CDDA input is valid");
 }
 
+void test_pcm16_spsc_ring_buffer()
+{
+    using namespace cd404::audio;
+
+    Pcm16SpscRingBuffer ring(3);
+    constexpr std::array<std::int16_t, 8> source{1, 2, 3, 4, 5, 6, 7, 8};
+
+    const auto first_push = ring.push(std::span(source).first(4));
+    expect(
+        first_push.status == Pcm16BufferStatus::ok &&
+            first_push.frames_transferred == 2,
+        "ring accepts two complete stereo frames");
+
+    std::array<std::int16_t, 2> first_frame{};
+    const auto first_pop = ring.pop(first_frame);
+    expect(
+        first_pop.frames_transferred == 1 &&
+            first_frame == std::array<std::int16_t, 2>{1, 2},
+        "ring pops the oldest stereo frame");
+
+    const auto wrapped_push = ring.push(std::span(source).subspan(4));
+    expect(
+        wrapped_push.status == Pcm16BufferStatus::ok &&
+            wrapped_push.frames_transferred == 2,
+        "ring writes across its storage boundary");
+    expect(
+        ring.push(std::span(source).first(2)).status == Pcm16BufferStatus::full,
+        "full ring rejects another frame without blocking");
+
+    ring.close();
+    std::array<std::int16_t, 8> remaining{};
+    const auto final_pop = ring.pop(remaining);
+    expect(
+        final_pop.status == Pcm16BufferStatus::partial &&
+            final_pop.frames_transferred == 3,
+        "closed ring remains readable until drained");
+    expect(
+        std::equal(
+            remaining.begin(),
+            remaining.begin() + 6,
+            std::array<std::int16_t, 6>{3, 4, 5, 6, 7, 8}.begin()),
+        "wrapped frames preserve sample order");
+    expect(
+        ring.pop(first_frame).status == Pcm16BufferStatus::closed && ring.drained(),
+        "drained closed ring reports end of stream");
+
+    ring.reset();
+    expect(!ring.closed() && ring.readable_frames() == 0, "reset reopens the ring");
+    expect(
+        ring.push(std::span(source).first(3)).status ==
+            Pcm16BufferStatus::invalid_frame_alignment,
+        "ring rejects an odd number of stereo samples");
+
+    bool rejected_zero_capacity{};
+    try {
+        Pcm16SpscRingBuffer invalid_ring(0);
+    } catch (const std::invalid_argument&) {
+        rejected_zero_capacity = true;
+    }
+    expect(rejected_zero_capacity, "ring rejects zero frame capacity");
+
+    constexpr std::uint32_t kConcurrentFrameCount = 50'000;
+    Pcm16SpscRingBuffer concurrent_ring(97);
+    std::thread producer([&concurrent_ring] {
+        std::array<std::int16_t, 26> block{};
+        std::uint32_t produced{};
+        while (produced < kConcurrentFrameCount) {
+            const std::size_t block_frames = std::min<std::size_t>(
+                block.size() / kPcm16StereoChannelCount,
+                kConcurrentFrameCount - produced);
+            for (std::size_t frame = 0; frame < block_frames; ++frame) {
+                const auto value = static_cast<std::uint16_t>(produced + frame);
+                block[frame * 2] = static_cast<std::int16_t>(value);
+                block[frame * 2 + 1] =
+                    static_cast<std::int16_t>(static_cast<std::uint16_t>(~value));
+            }
+
+            std::size_t block_offset{};
+            while (block_offset < block_frames) {
+                const auto result = concurrent_ring.push(
+                    std::span(block).subspan(
+                        block_offset * kPcm16StereoChannelCount,
+                        (block_frames - block_offset) *
+                            kPcm16StereoChannelCount));
+                block_offset += result.frames_transferred;
+                if (result.frames_transferred == 0) {
+                    std::this_thread::yield();
+                }
+            }
+            produced += static_cast<std::uint32_t>(block_frames);
+        }
+        concurrent_ring.close();
+    });
+
+    std::array<std::int16_t, 34> consumed_samples{};
+    std::uint32_t consumed{};
+    bool sequence_is_intact{true};
+    while (!concurrent_ring.drained()) {
+        const auto result = concurrent_ring.pop(consumed_samples);
+        if (result.frames_transferred == 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        for (std::size_t frame = 0; frame < result.frames_transferred; ++frame) {
+            const auto value = static_cast<std::uint16_t>(consumed + frame);
+            if (consumed_samples[frame * 2] != static_cast<std::int16_t>(value) ||
+                consumed_samples[frame * 2 + 1] !=
+                    static_cast<std::int16_t>(static_cast<std::uint16_t>(~value))) {
+                sequence_is_intact = false;
+                break;
+            }
+        }
+        consumed += static_cast<std::uint32_t>(result.frames_transferred);
+    }
+    producer.join();
+    expect(
+        sequence_is_intact && consumed == kConcurrentFrameCount,
+        "concurrent ring transfer preserves every stereo frame in order");
+}
+
 } // namespace
 
 int main()
@@ -382,6 +505,7 @@ int main()
     test_invalid_toc();
     test_continuous_cdda_stream();
     test_cdda_pcm_conversion();
+    test_pcm16_spsc_ring_buffer();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed.\n";
