@@ -3,11 +3,13 @@ add_library(cd404_audio STATIC)
 target_sources(
     cd404_audio
     PRIVATE
+        src/cdda_pcm.cpp
         src/continuous_cdda_stream.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
+            include/cd404/audio/cdda_pcm.hpp
             include/cd404/audio/cdda_sector_source.hpp
             include/cd404/audio/continuous_cdda_stream.hpp
 )

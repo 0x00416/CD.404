@@ -20,6 +20,7 @@ if(WIN32)
     add_subdirectory(src/platform/windows)
     add_subdirectory(apps/drive_probe)
     add_subdirectory(apps/cdda_probe)
+    add_subdirectory(apps/play_probe)
 endif()
 
 if(CD404_BUILD_TESTS)

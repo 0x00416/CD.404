@@ -1,0 +1,6 @@
+add_executable(cd404_play_probe main.cpp)
+
+target_compile_features(cd404_play_probe PRIVATE cxx_std_20)
+target_compile_definitions(cd404_play_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_link_libraries(cd404_play_probe PRIVATE cd404::windows)
+cd404_set_project_warnings(cd404_play_probe)

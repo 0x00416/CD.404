@@ -1,3 +1,4 @@
+#include <cd404/audio/cdda_pcm.hpp>
 #include <cd404/audio/cdda_sector_source.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/core/cd_time.hpp>
@@ -7,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -320,6 +322,57 @@ void test_continuous_cdda_stream()
     expect(!overflowing_stream.valid(), "stream rejects an overflowing LBA range");
 }
 
+void test_cdda_pcm_conversion()
+{
+    using namespace cd404::audio;
+
+    constexpr std::array<std::byte, 8> source{
+        std::byte{0x00},
+        std::byte{0x00},
+        std::byte{0xff},
+        std::byte{0x7f},
+        std::byte{0x00},
+        std::byte{0x80},
+        std::byte{0xff},
+        std::byte{0xff},
+    };
+    std::array<std::byte, 8> destination{};
+    const auto copy_result = copy_cdda_to_pcm16le(source, destination);
+    expect(
+        copy_result.status == CddaPcmConversionStatus::ok &&
+            copy_result.frames_written == 2,
+        "two aligned CDDA frames convert to PCM16LE");
+    expect(destination == source, "CDDA byte order is already PCM16LE");
+
+    std::array<std::int16_t, 4> samples{};
+    std::memcpy(samples.data(), destination.data(), destination.size());
+    expect(
+        samples[0] == 0 && samples[1] == 32'767 && samples[2] == -32'768 &&
+            samples[3] == -1,
+        "PCM16LE test vector decodes expected signed samples");
+
+    std::array<std::byte, 3> unaligned{};
+    expect(
+        convert_cdda_to_pcm16le_in_place(unaligned) ==
+            CddaPcmConversionStatus::source_not_frame_aligned,
+        "unaligned CDDA input is rejected");
+
+    std::array<std::byte, 3> small_destination{};
+    expect(
+        copy_cdda_to_pcm16le(
+            std::span<const std::byte>(source.data(), 4),
+            small_destination)
+                .status == CddaPcmConversionStatus::destination_too_small,
+        "undersized PCM destination is rejected");
+
+    std::array<std::byte, 0> empty{};
+    const auto empty_result = copy_cdda_to_pcm16le(empty, empty);
+    expect(
+        empty_result.status == CddaPcmConversionStatus::ok &&
+            empty_result.frames_written == 0,
+        "empty CDDA input is valid");
+}
+
 } // namespace
 
 int main()
@@ -328,6 +381,7 @@ int main()
     test_valid_toc();
     test_invalid_toc();
     test_continuous_cdda_stream();
+    test_cdda_pcm_conversion();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed.\n";
