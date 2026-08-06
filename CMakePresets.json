@@ -1,0 +1,80 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2026-x64",
+      "displayName": "Visual Studio 2026 x64",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "environment": {
+        "VSLANG": "1033"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "CD404_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "ninja-msvc-x64",
+      "displayName": "Ninja with MSVC x64",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "environment": {
+        "VSLANG": "1033"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "CD404_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2026-debug",
+      "displayName": "Build Debug",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2026-release",
+      "displayName": "Build Release",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "ninja-msvc-debug",
+      "displayName": "Build Debug with Ninja and MSVC",
+      "configurePreset": "ninja-msvc-x64"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "vs2026-debug",
+      "displayName": "Test Debug",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ninja-msvc-debug",
+      "displayName": "Test Debug with Ninja and MSVC",
+      "configurePreset": "ninja-msvc-x64",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

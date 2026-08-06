@@ -1,0 +1,57 @@
+# CMake
+/build/
+/out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Visual Studio
+/.vs/
+*.VC.db
+*.VC.opendb
+*.sln.docstates
+*.user
+*.userosscache
+*.suo
+
+# Build outputs
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Package managers
+/vcpkg_installed/
+/.cache/
+
+# Runtime data and logs
+/data/
+/logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# Local developer environment and secrets
+/.codex-temp/
+/docs/DEVELOPMENT_ENVIRONMENT.md
+/docs/LOCAL_ENVIRONMENT*.md
+/CMakeUserPresets.json
+/.env
+/.env.*
+!/.env.example
+
+# OS and editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
