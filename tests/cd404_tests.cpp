@@ -3,6 +3,7 @@
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
 #include <cd404/core/cd_time.hpp>
+#include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/toc.hpp>
 
 #include <algorithm>
@@ -211,6 +212,63 @@ void test_invalid_toc()
         !Toc::create(invalid_lead_out, 100, error) &&
             error == TocError::invalid_lead_out,
         "lead-out at track start is rejected");
+}
+
+void test_cd_text_parsing()
+{
+    using namespace cd404::disc;
+
+    CdTextPack title_first;
+    title_first.type = kCdTextAlbumNamePack;
+    title_first.track_number = 0;
+    title_first.sequence_number = 0;
+    title_first.payload = {
+        'A', 'l', 'b', 'u', 'm', 0, 'F', 'i', 'r', 's', 't', ' ',
+    };
+
+    CdTextPack title_second;
+    title_second.type = kCdTextAlbumNamePack;
+    title_second.track_number = 1;
+    title_second.sequence_number = 1;
+    title_second.payload = {
+        'S', 'o', 'n', 'g', 0, 'S', 'e', 'c', 'o', 'n', 'd', ' ',
+    };
+
+    CdTextPack title_third;
+    title_third.type = kCdTextAlbumNamePack;
+    title_third.track_number = 2;
+    title_third.sequence_number = 2;
+    title_third.payload = {'T', 'r', 'a', 'c', 'k', 0};
+
+    CdTextPack performer;
+    performer.type = kCdTextPerformerPack;
+    performer.track_number = 0;
+    performer.sequence_number = 3;
+    performer.payload = {
+        'A', 'r', 't', 'i', 's', 't', 0, 'B', 'a', 'n', 'd', 0,
+    };
+
+    CdTextPack repeated_performer;
+    repeated_performer.type = kCdTextPerformerPack;
+    repeated_performer.track_number = 2;
+    repeated_performer.sequence_number = 4;
+    repeated_performer.payload = {'\t', 0};
+
+    const std::array packs{
+        title_second,
+        performer,
+        title_third,
+        title_first,
+        repeated_performer,
+    };
+    const auto metadata = parse_cd_text(packs);
+    expect(metadata.album_title == u"Album", "CD-TEXT parses the album title");
+    expect(metadata.album_performer == u"Artist", "CD-TEXT parses the album performer");
+    expect(metadata.tracks[1].title == u"First Song", "CD-TEXT joins text across packs");
+    expect(metadata.tracks[2].title == u"Second Track", "CD-TEXT advances at terminators");
+    expect(metadata.tracks[1].performer == u"Band", "CD-TEXT parses track performer");
+    expect(metadata.tracks[2].performer == u"Band", "CD-TEXT expands tab repetition");
+    expect(!metadata.empty(), "parsed CD-TEXT reports non-empty metadata");
 }
 
 [[nodiscard]] std::uint32_t read_pattern_frame(
@@ -503,6 +561,7 @@ int main()
     test_cd_time_conversions();
     test_valid_toc();
     test_invalid_toc();
+    test_cd_text_parsing();
     test_continuous_cdda_stream();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();

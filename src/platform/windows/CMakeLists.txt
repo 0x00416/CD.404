@@ -4,6 +4,7 @@ target_sources(
     cd404_windows
     PRIVATE
         src/optical_drive.cpp
+        src/musicbrainz_client.cpp
         src/raw_cdda_sector_source.cpp
         src/wasapi_output.cpp
     PUBLIC
@@ -11,6 +12,7 @@ target_sources(
         BASE_DIRS include
         FILES
             include/cd404/platform/windows/optical_drive.hpp
+            include/cd404/platform/windows/musicbrainz_client.hpp
             include/cd404/platform/windows/raw_cdda_sector_source.hpp
             include/cd404/platform/windows/wasapi_output.hpp
 )
@@ -25,7 +27,11 @@ target_link_libraries(
     PRIVATE
         kernel32
         ole32
+        shell32
+        shlwapi
         uuid
+        winhttp
+        xmllite
 )
 cd404_set_project_warnings(cd404_windows)
 

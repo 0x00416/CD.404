@@ -3,11 +3,13 @@ add_library(cd404_disc STATIC)
 target_sources(
     cd404_disc
     PRIVATE
+        src/cd_text.cpp
         src/toc.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
+            include/cd404/disc/cd_text.hpp
             include/cd404/disc/toc.hpp
 )
 

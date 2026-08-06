@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/toc.hpp>
 
 #include <optional>
@@ -19,8 +20,14 @@ struct TocReadResult final {
     disc::TocError validation_error{disc::TocError::none};
 };
 
+struct CdTextReadResult final {
+    std::optional<disc::CdTextMetadata> metadata;
+    unsigned long system_error{};
+};
+
 [[nodiscard]] std::vector<OpticalDrive> enumerate_optical_drives();
 [[nodiscard]] TocReadResult read_toc(const OpticalDrive& drive);
+[[nodiscard]] CdTextReadResult read_cd_text(const OpticalDrive& drive);
 // Requests a hardware eject for the selected drive. Returns ERROR_SUCCESS on
 // success or the Win32 error reported while opening/controlling the device.
 [[nodiscard]] unsigned long eject_media(const OpticalDrive& drive) noexcept;

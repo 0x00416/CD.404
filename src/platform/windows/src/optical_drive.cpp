@@ -6,7 +6,9 @@
 #include <cd404/core/cd_time.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cwchar>
 #include <memory>
 #include <utility>
@@ -179,6 +181,82 @@ TocReadResult read_toc(const OpticalDrive& drive)
         static_cast<unsigned long>(toc ? ERROR_SUCCESS : ERROR_INVALID_DATA),
         validation_error,
     };
+}
+
+CdTextReadResult read_cd_text(const OpticalDrive& drive)
+{
+    UniqueHandle handle(CreateFileW(
+        drive.device_path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr));
+
+    if (handle.get() == INVALID_HANDLE_VALUE) {
+        return CdTextReadResult{std::nullopt, GetLastError()};
+    }
+
+    CDROM_READ_TOC_EX request{};
+    request.Format = CDROM_READ_TOC_EX_FORMAT_CDTEXT;
+
+    constexpr std::size_t kMaximumCdTextBytes = 64U * 1'024U;
+    std::vector<std::uint8_t> buffer(kMaximumCdTextBytes);
+    DWORD bytes_returned{};
+    if (!DeviceIoControl(
+            handle.get(),
+            IOCTL_CDROM_READ_TOC_EX,
+            &request,
+            sizeof(request),
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()),
+            &bytes_returned,
+            nullptr)) {
+        return CdTextReadResult{std::nullopt, GetLastError()};
+    }
+
+    constexpr std::size_t kHeaderBytes =
+        offsetof(CDROM_TOC_CD_TEXT_DATA, Descriptors);
+    if (bytes_returned < kHeaderBytes) {
+        return CdTextReadResult{std::nullopt, ERROR_INVALID_DATA};
+    }
+
+    const std::size_t declared_bytes =
+        (static_cast<std::size_t>(buffer[0]) << 8U) |
+        static_cast<std::size_t>(buffer[1]);
+    const std::size_t usable_bytes = std::min<std::size_t>(
+        bytes_returned,
+        declared_bytes + 2U);
+    if (usable_bytes < kHeaderBytes) {
+        return CdTextReadResult{std::nullopt, ERROR_INVALID_DATA};
+    }
+
+    const std::size_t descriptor_count =
+        (usable_bytes - kHeaderBytes) / sizeof(CDROM_TOC_CD_TEXT_DATA_BLOCK);
+    const auto* native_blocks = reinterpret_cast<const CDROM_TOC_CD_TEXT_DATA_BLOCK*>(
+        buffer.data() + kHeaderBytes);
+    std::vector<disc::CdTextPack> packs;
+    packs.reserve(descriptor_count);
+    for (std::size_t index = 0; index < descriptor_count; ++index) {
+        const auto& native = native_blocks[index];
+        disc::CdTextPack pack;
+        pack.type = native.PackType;
+        pack.track_number = native.TrackNumber;
+        pack.sequence_number = native.SequenceNumber;
+        pack.character_position = native.CharacterPosition;
+        pack.block_number = native.BlockNumber;
+        pack.unicode = native.Unicode != 0;
+        pack.extension = native.ExtensionFlag != 0;
+        std::copy(std::begin(native.Text), std::end(native.Text), pack.payload.begin());
+        packs.push_back(pack);
+    }
+
+    auto metadata = disc::parse_cd_text(packs);
+    if (metadata.empty()) {
+        return CdTextReadResult{std::nullopt, ERROR_NOT_FOUND};
+    }
+    return CdTextReadResult{std::move(metadata), ERROR_SUCCESS};
 }
 
 unsigned long eject_media(const OpticalDrive& drive) noexcept

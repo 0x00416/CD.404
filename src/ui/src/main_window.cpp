@@ -5,9 +5,11 @@
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 
 #include <cd404/core/cd_time.hpp>
+#include <cd404/platform/windows/musicbrainz_client.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/ui/main_window.hpp>
 
@@ -18,10 +20,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -34,6 +38,7 @@ using Microsoft::WRL::ComPtr;
 constexpr wchar_t kWindowClassName[] = L"CD404.MainWindow";
 constexpr wchar_t kWindowTitle[] = L"CD.404";
 constexpr UINT kDiscReadyMessage = WM_APP + 1;
+constexpr UINT kMetadataReadyMessage = WM_APP + 2;
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT kAnimationIntervalMs = 50;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
@@ -73,19 +78,41 @@ constexpr float kMinimumHeight = 600.0F;
     return std::format(L"{}:{:02}", seconds / 60, seconds % 60);
 }
 
+[[nodiscard]] std::wstring to_wstring(const std::u16string_view text)
+{
+    std::wstring result;
+    result.reserve(text.size());
+    std::ranges::transform(text, std::back_inserter(result), [](const char16_t character) {
+        return static_cast<wchar_t>(character);
+    });
+    return result;
+}
+
 struct UiTrack final {
     std::uint8_t number{};
     core::SampleFrame frame_count{};
     bool is_audio{};
+    bool has_metadata_title{};
     std::wstring title;
+    std::wstring artist;
 };
 
 struct DiscSnapshot final {
     std::optional<platform::windows::OpticalDrive> drive;
+    std::optional<disc::Toc> toc;
     std::vector<UiTrack> tracks;
     core::SampleFrame total_audio_frames{};
+    std::wstring album_title;
+    std::wstring album_artist;
+    std::wstring metadata_source;
+    std::filesystem::path cover_art_path;
     std::wstring status;
+    bool has_cd_text{};
     bool has_optical_drive{};
+};
+
+struct OnlineMetadataSnapshot final {
+    platform::windows::MusicBrainzLookupResult result;
 };
 
 [[nodiscard]] DiscSnapshot load_disc_snapshot()
@@ -107,6 +134,7 @@ struct DiscSnapshot final {
         }
 
         snapshot.drive = drive;
+        snapshot.toc = *toc_result.toc;
         for (const auto& track : toc_result.toc->tracks()) {
             UiTrack view;
             view.number = track.number;
@@ -119,6 +147,24 @@ struct DiscSnapshot final {
                 snapshot.total_audio_frames += track.frame_count;
             }
             snapshot.tracks.push_back(std::move(view));
+        }
+
+        const auto cd_text_result = platform::windows::read_cd_text(drive);
+        if (cd_text_result.metadata) {
+            snapshot.has_cd_text = true;
+            snapshot.metadata_source = L"CD-TEXT";
+            snapshot.album_title = to_wstring(cd_text_result.metadata->album_title);
+            snapshot.album_artist = to_wstring(cd_text_result.metadata->album_performer);
+            for (auto& track : snapshot.tracks) {
+                const auto& metadata = cd_text_result.metadata->tracks[track.number];
+                if (!metadata.title.empty()) {
+                    track.title = to_wstring(metadata.title);
+                    track.has_metadata_title = true;
+                }
+                if (!metadata.performer.empty()) {
+                    track.artist = to_wstring(metadata.performer);
+                }
+            }
         }
         snapshot.status = std::format(
             L"已就绪 · {} 首音频轨",
@@ -139,6 +185,14 @@ struct DiscSnapshot final {
 struct TrackHit final {
     D2D1_RECT_F rectangle{};
     std::size_t track_index{};
+};
+
+struct ScrollbarGeometry final {
+    D2D1_RECT_F track{};
+    D2D1_RECT_F thumb{};
+    std::size_t visible_rows{};
+    std::size_t maximum_scroll{};
+    bool visible{};
 };
 
 struct Layout final {
@@ -309,6 +363,12 @@ private:
             return 0;
         }
         case WM_MOUSEMOVE:
+            if (scrollbar_dragging_) {
+                update_scrollbar_drag(D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))));
+                return 0;
+            }
             update_hover(D2D1::Point2F(
                 pixel_to_dip(GET_X_LPARAM(lparam)),
                 pixel_to_dip(GET_Y_LPARAM(lparam))));
@@ -320,13 +380,31 @@ private:
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_MOUSEWHEEL:
-            scroll_tracks(GET_WHEEL_DELTA_WPARAM(wparam));
+            handle_mouse_wheel(
+                GET_WHEEL_DELTA_WPARAM(wparam),
+                GET_X_LPARAM(lparam),
+                GET_Y_LPARAM(lparam));
             return 0;
         case WM_LBUTTONDOWN:
             SetFocus(window_);
+            if (handle_scrollbar_press(D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))))) {
+                return 0;
+            }
             handle_click(D2D1::Point2F(
                 pixel_to_dip(GET_X_LPARAM(lparam)),
                 pixel_to_dip(GET_Y_LPARAM(lparam))));
+            return 0;
+        case WM_LBUTTONUP:
+            if (scrollbar_dragging_) {
+                scrollbar_dragging_ = false;
+                ReleaseCapture();
+                return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:
+            scrollbar_dragging_ = false;
             return 0;
         case WM_LBUTTONDBLCLK:
             handle_double_click(D2D1::Point2F(
@@ -355,6 +433,11 @@ private:
             receive_disc_snapshot(
                 std::unique_ptr<DiscSnapshot>(
                     reinterpret_cast<DiscSnapshot*>(lparam)));
+            return 0;
+        case kMetadataReadyMessage:
+            receive_online_metadata(
+                std::unique_ptr<OnlineMetadataSnapshot>(
+                    reinterpret_cast<OnlineMetadataSnapshot*>(lparam)));
             return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
@@ -403,6 +486,22 @@ private:
             return result;
         }
 
+        result = CoCreateInstance(
+            CLSID_WICImagingFactory2,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(imaging_factory_.ReleaseAndGetAddressOf()));
+        if (FAILED(result)) {
+            result = CoCreateInstance(
+                CLSID_WICImagingFactory,
+                nullptr,
+                CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(imaging_factory_.ReleaseAndGetAddressOf()));
+        }
+        if (FAILED(result)) {
+            return result;
+        }
+
         result = create_text_format(
             18.0F,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
@@ -424,6 +523,18 @@ private:
                 15.0F,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 body_format_);
+        }
+        if (SUCCEEDED(result)) {
+            result = create_text_format(
+                15.0F,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                track_format_);
+        }
+        if (SUCCEEDED(result)) {
+            result = create_text_format(
+                13.0F,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                track_duration_format_);
         }
         if (SUCCEEDED(result)) {
             result = create_text_format(
@@ -451,6 +562,8 @@ private:
         icon_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         caption_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         caption_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        track_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        track_duration_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         small_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         return S_OK;
     }
@@ -534,7 +647,48 @@ private:
                 stop_collection.Get(),
                 cover_brush_.ReleaseAndGetAddressOf());
         }
+        if (SUCCEEDED(result) && !disc_.cover_art_path.empty()) {
+            load_cover_bitmap(disc_.cover_art_path);
+        }
         return result;
+    }
+
+    void load_cover_bitmap(const std::filesystem::path& path)
+    {
+        cover_bitmap_.Reset();
+        if (!render_target_ || !imaging_factory_ || path.empty()) {
+            return;
+        }
+
+        ComPtr<IWICBitmapDecoder> decoder;
+        if (FAILED(imaging_factory_->CreateDecoderFromFilename(
+                path.c_str(),
+                nullptr,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnLoad,
+                decoder.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(0, frame.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(imaging_factory_->CreateFormatConverter(
+                converter.ReleaseAndGetAddressOf())) ||
+            FAILED(converter->Initialize(
+                frame.Get(),
+                GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                nullptr,
+                0.0,
+                WICBitmapPaletteTypeMedianCut))) {
+            return;
+        }
+        static_cast<void>(render_target_->CreateBitmapFromWicBitmap(
+            converter.Get(),
+            nullptr,
+            cover_bitmap_.ReleaseAndGetAddressOf()));
     }
 
     HRESULT create_brush(
@@ -548,6 +702,7 @@ private:
 
     void discard_device_resources()
     {
+        cover_bitmap_.Reset();
         cover_brush_.Reset();
         disc_brush_.Reset();
         hover_brush_.Reset();
@@ -605,6 +760,7 @@ private:
         const float cover_size = std::min(
             left_width,
             std::max(220.0F, transport_top - top - 185.0F));
+        const float cover_top = top + 52.0F;
 
         result.refresh_button = D2D1::RectF(
             size.width - 112.0F,
@@ -618,9 +774,9 @@ private:
             52.0F);
         result.cover = D2D1::RectF(
             margin,
-            top,
+            cover_top,
             margin + cover_size,
-            top + cover_size);
+            cover_top + cover_size);
         result.track_list = D2D1::RectF(
             margin + left_width + gap,
             top + 52.0F,
@@ -723,7 +879,8 @@ private:
             text_brush_.Get());
 
         const float status_left = device_right + 18.0F;
-        if (status_left < layout_.width - 130.0F) {
+        if ((disc_loading_ || disc_.tracks.empty()) &&
+            status_left < layout_.width - 130.0F) {
             draw_text(
                 disc_loading_ ? L"正在读取目录…" : disc_.status,
                 small_format_.Get(),
@@ -748,61 +905,46 @@ private:
         if (disc_loading_ && disc_.tracks.empty()) {
             draw_empty_state(
                 L"正在读取光盘",
-                L"先建立本地曲目结构，元数据将在后台继续补全");
+                L"");
             return;
         }
         if (disc_.tracks.empty()) {
             draw_empty_state(
                 disc_.has_optical_drive ? L"插入一张音频 CD" : L"未检测到光驱",
                 disc_.has_optical_drive
-                    ? L"CD.404 会先显示曲目，再在后台补全资料"
+                    ? L""
                     : L"连接 USB 光驱后会自动刷新");
             return;
         }
 
         draw_cover();
-        const float text_top = layout_.cover.bottom + 18.0F;
+        const float album_info_height = 88.0F;
+        const float text_top = layout_.track_list.bottom - album_info_height;
         draw_text(
-            L"未知专辑",
+            disc_.album_title.empty() ? L"未知专辑" : disc_.album_title,
             album_format_.Get(),
             D2D1::RectF(
                 layout_.cover.left,
                 text_top,
                 layout_.cover.right,
-                text_top + 40.0F),
+                text_top + 36.0F),
             text_brush_.Get());
         draw_text(
-            L"未知艺术家",
+            disc_.album_artist.empty() ? L"未知艺术家" : disc_.album_artist,
             body_format_.Get(),
             D2D1::RectF(
                 layout_.cover.left,
-                text_top + 42.0F,
+                text_top + 36.0F,
                 layout_.cover.right,
-                text_top + 68.0F),
+                text_top + 60.0F),
             secondary_brush_.Get());
-        draw_text(
-            L"正在查询 CD-TEXT 与 MusicBrainz",
-            small_format_.Get(),
-            D2D1::RectF(
+        if (!disc_.metadata_source.empty()) {
+            draw_metadata_source_pill(
                 layout_.cover.left,
-                text_top + 70.0F,
-                layout_.cover.right,
-                text_top + 94.0F),
-            muted_brush_.Get());
-
-        draw_status_pill(
-            layout_.cover.left,
-            text_top + 108.0F,
-            92.0F,
-            L"共享输出",
-            accent_brush_.Get());
-        draw_status_pill(
-            layout_.cover.left + 102.0F,
-            text_top + 108.0F,
-            104.0F,
-            playback_active_ ? L"连续流播放" : L"连续流就绪",
-            success_brush_.Get());
-
+                text_top + 64.0F,
+                layout_.cover.right - layout_.cover.left,
+                disc_.metadata_source);
+        }
         const float right_left = layout_.track_list.left;
         draw_text(
             L"曲目",
@@ -824,6 +966,30 @@ private:
     void draw_cover()
     {
         const auto rounded = D2D1::RoundedRect(layout_.cover, 14.0F, 14.0F);
+        if (cover_bitmap_) {
+            ComPtr<ID2D1RoundedRectangleGeometry> clip_geometry;
+            ComPtr<ID2D1Layer> layer;
+            if (SUCCEEDED(factory_->CreateRoundedRectangleGeometry(
+                    rounded,
+                    clip_geometry.ReleaseAndGetAddressOf())) &&
+                SUCCEEDED(render_target_->CreateLayer(
+                    nullptr,
+                    layer.ReleaseAndGetAddressOf()))) {
+                render_target_->PushLayer(
+                    D2D1::LayerParameters(
+                        layout_.cover,
+                        clip_geometry.Get()),
+                    layer.Get());
+                render_target_->DrawBitmap(
+                    cover_bitmap_.Get(),
+                    layout_.cover,
+                    1.0F,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                render_target_->PopLayer();
+                render_target_->DrawRoundedRectangle(rounded, border_brush_.Get(), 1.0F);
+                return;
+            }
+        }
         cover_brush_->SetStartPoint(D2D1::Point2F(
             layout_.cover.left,
             layout_.cover.top));
@@ -869,7 +1035,13 @@ private:
         const std::wstring& description)
     {
         const float center_x = layout_.width * 0.5F;
-        const float center_y = (64.0F + layout_.height - 124.0F) * 0.5F;
+        const float content_top = 64.0F;
+        const float content_bottom = layout_.progress_hit.top - 14.0F;
+        const float group_top_offset = -110.0F;
+        const float group_bottom_offset = description.empty() ? 58.0F : 96.0F;
+        const float center_y =
+            (content_top + content_bottom - group_top_offset - group_bottom_offset) *
+            0.5F;
         render_target_->DrawEllipse(
             D2D1::Ellipse(D2D1::Point2F(center_x, center_y - 56.0F), 54.0F, 54.0F),
             border_brush_.Get(),
@@ -892,10 +1064,49 @@ private:
             DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
+    [[nodiscard]] ScrollbarGeometry track_scrollbar_geometry() const
+    {
+        const float row_height = layout_.height < 680.0F ? 40.0F : 44.0F;
+        const float rows_top = layout_.track_list.top + 28.0F;
+        ScrollbarGeometry result;
+        result.visible_rows = static_cast<std::size_t>(std::max(
+            1.0F,
+            std::floor((layout_.track_list.bottom - rows_top) / row_height)));
+        result.maximum_scroll = disc_.tracks.size() > result.visible_rows
+            ? disc_.tracks.size() - result.visible_rows
+            : 0;
+        result.visible = result.maximum_scroll != 0;
+        result.track = D2D1::RectF(
+            layout_.track_list.right - 14.0F,
+            rows_top + 6.0F,
+            layout_.track_list.right,
+            layout_.track_list.bottom - 6.0F);
+        if (!result.visible) {
+            return result;
+        }
+
+        const float available = result.track.bottom - result.track.top;
+        const float thumb_height = std::max(
+            28.0F,
+            available * static_cast<float>(result.visible_rows) /
+                static_cast<float>(disc_.tracks.size()));
+        const float travel = available - thumb_height;
+        const float thumb_top = result.track.top +
+            travel * static_cast<float>(std::min(scroll_row_, result.maximum_scroll)) /
+                static_cast<float>(result.maximum_scroll);
+        result.thumb = D2D1::RectF(
+            result.track.left,
+            thumb_top,
+            result.track.right,
+            thumb_top + thumb_height);
+        return result;
+    }
+
     void draw_track_list()
     {
         const float row_height = layout_.height < 680.0F ? 40.0F : 44.0F;
         const float header_height = 28.0F;
+        const ScrollbarGeometry scrollbar = track_scrollbar_geometry();
         const auto list_background = D2D1::RoundedRect(
             layout_.track_list,
             12.0F,
@@ -935,13 +1146,8 @@ private:
 
         track_hits_.clear();
         const float rows_top = layout_.track_list.top + header_height;
-        const std::size_t visible_rows = static_cast<std::size_t>(std::max(
-            1.0F,
-            std::floor((layout_.track_list.bottom - rows_top) / row_height)));
-        const std::size_t maximum_scroll = disc_.tracks.size() > visible_rows
-            ? disc_.tracks.size() - visible_rows
-            : 0;
-        scroll_row_ = std::min(scroll_row_, maximum_scroll);
+        const std::size_t visible_rows = scrollbar.visible_rows;
+        scroll_row_ = std::min(scroll_row_, scrollbar.maximum_scroll);
 
         render_target_->PushAxisAlignedClip(
             D2D1::RectF(
@@ -991,38 +1197,30 @@ private:
                                : muted_brush_.Get());
             draw_text(
                 track.title,
-                body_format_.Get(),
-                D2D1::RectF(row.left + 56.0F, top + 6.0F, row.right - 88.0F, top + row_height - 4.0F),
+                track_format_.Get(),
+                D2D1::RectF(row.left + 56.0F, top, row.right - 88.0F, top + row_height),
                 track.is_audio ? text_brush_.Get() : muted_brush_.Get());
             draw_text(
                 track.is_audio ? format_duration(track.frame_count) : L"数据",
-                small_format_.Get(),
-                D2D1::RectF(row.right - 76.0F, top + 8.0F, row.right - 12.0F, top + row_height - 4.0F),
+                track_duration_format_.Get(),
+                D2D1::RectF(row.right - 76.0F, top, row.right - 12.0F, top + row_height),
                 track.is_audio ? secondary_brush_.Get() : warning_brush_.Get(),
                 DWRITE_TEXT_ALIGNMENT_TRAILING);
             track_hits_.push_back(TrackHit{row, index});
         }
         render_target_->PopAxisAlignedClip();
 
-        if (maximum_scroll != 0) {
-            const float available = layout_.track_list.bottom - rows_top - 12.0F;
-            const float thumb_height = std::max(
-                28.0F,
-                available * static_cast<float>(visible_rows) /
-                    static_cast<float>(disc_.tracks.size()));
-            const float thumb_top = rows_top + 6.0F +
-                (available - thumb_height) * static_cast<float>(scroll_row_) /
-                    static_cast<float>(maximum_scroll);
+        if (scrollbar.visible) {
             render_target_->FillRoundedRectangle(
                 D2D1::RoundedRect(
                     D2D1::RectF(
-                        layout_.track_list.right - 5.0F,
-                        thumb_top,
+                        layout_.track_list.right - 6.0F,
+                        scrollbar.thumb.top,
                         layout_.track_list.right - 2.0F,
-                        thumb_top + thumb_height),
-                    1.5F,
-                    1.5F),
-                muted_brush_.Get());
+                        scrollbar.thumb.bottom),
+                    2.0F,
+                    2.0F),
+                scrollbar_dragging_ ? secondary_brush_.Get() : muted_brush_.Get());
         }
     }
 
@@ -1057,21 +1255,36 @@ private:
                 accent_brush_.Get());
         }
 
-        const float content_y = panel_top + 36.0F;
+        const float content_center_y =
+            (layout_.play_button.top + layout_.play_button.bottom) * 0.5F;
+        const float content_top = content_center_y - 24.0F;
         const std::wstring current_title = selected_track_ < disc_.tracks.size()
             ? disc_.tracks[selected_track_].title
             : L"等待音频 CD";
+        const std::wstring current_artist = selected_track_ < disc_.tracks.size() &&
+                !disc_.tracks[selected_track_].artist.empty()
+            ? disc_.tracks[selected_track_].artist
+            : disc_.album_artist;
         draw_text(
             current_title,
-            body_format_.Get(),
-            D2D1::RectF(24.0F, content_y, layout_.width * 0.35F, content_y + 25.0F),
+            heading_format_.Get(),
+            D2D1::RectF(
+                24.0F,
+                content_top,
+                layout_.width * 0.35F,
+                content_top + 28.0F),
             disc_.tracks.empty() ? muted_brush_.Get() : text_brush_.Get());
-        draw_text(
-            playback_active_ ? L"连续流播放中" : L"WASAPI 共享 · 44.1 kHz",
-            small_format_.Get(),
-            D2D1::RectF(24.0F, content_y + 27.0F, layout_.width * 0.35F, content_y + 51.0F),
-            playback_active_ ? success_brush_.Get() : muted_brush_.Get());
-
+        if (!current_artist.empty()) {
+            draw_text(
+                current_artist,
+                small_format_.Get(),
+                D2D1::RectF(
+                    24.0F,
+                    content_top + 28.0F,
+                    layout_.width * 0.35F,
+                    content_top + 50.0F),
+                secondary_brush_.Get());
+        }
         draw_round_control(
             layout_.previous_button,
             ControlIcon::previous,
@@ -1090,20 +1303,34 @@ private:
 
         const float volume_right = layout_.width - 28.0F;
         const float volume_left = std::max(layout_.width * 0.77F, volume_right - 160.0F);
+        const float volume_center_y =
+            (layout_.play_button.top + layout_.play_button.bottom) * 0.5F;
         draw_text(
             L"VOL",
             caption_format_.Get(),
-            D2D1::RectF(volume_left - 48.0F, content_y + 13.0F, volume_left - 8.0F, content_y + 37.0F),
+            D2D1::RectF(
+                volume_left - 48.0F,
+                volume_center_y - 12.0F,
+                volume_left - 8.0F,
+                volume_center_y + 12.0F),
             muted_brush_.Get());
         render_target_->FillRoundedRectangle(
             D2D1::RoundedRect(
-                D2D1::RectF(volume_left, content_y + 23.0F, volume_right, content_y + 27.0F),
+                D2D1::RectF(
+                    volume_left,
+                    volume_center_y - 2.0F,
+                    volume_right,
+                    volume_center_y + 2.0F),
                 2.0F,
                 2.0F),
             border_brush_.Get());
         render_target_->FillRoundedRectangle(
             D2D1::RoundedRect(
-                D2D1::RectF(volume_left, content_y + 23.0F, volume_left + (volume_right - volume_left) * 0.72F, content_y + 27.0F),
+                D2D1::RectF(
+                    volume_left,
+                    volume_center_y - 2.0F,
+                    volume_left + (volume_right - volume_left) * 0.72F,
+                    volume_center_y + 2.0F),
                 2.0F,
                 2.0F),
             secondary_brush_.Get());
@@ -1290,30 +1517,34 @@ private:
         }
     }
 
-    void draw_status_pill(
+    void draw_metadata_source_pill(
         const float left,
         const float top,
-        const float width,
-        const std::wstring& label,
-        ID2D1Brush* dot_brush)
+        const float maximum_width,
+        const std::wstring& source)
     {
-        const D2D1_RECT_F rectangle = D2D1::RectF(left, top, left + width, top + 28.0F);
-        render_target_->FillRoundedRectangle(
-            D2D1::RoundedRect(rectangle, 14.0F, 14.0F),
-            surface_brush_.Get());
-        render_target_->DrawRoundedRectangle(
-            D2D1::RoundedRect(rectangle, 14.0F, 14.0F),
-            border_brush_.Get(),
-            1.0F);
-        render_target_->FillEllipse(
-            D2D1::Ellipse(D2D1::Point2F(left + 14.0F, top + 14.0F), 3.0F, 3.0F),
-            dot_brush);
+        const float width = std::min(
+            maximum_width,
+            std::max(76.0F, 28.0F + static_cast<float>(source.size()) * 7.0F));
+        const auto capsule = D2D1::RoundedRect(
+            D2D1::RectF(left, top, left + width, top + 24.0F),
+            12.0F,
+            12.0F);
+
+        accent_brush_->SetOpacity(0.10F);
+        render_target_->DrawRoundedRectangle(capsule, accent_brush_.Get(), 6.0F);
+        accent_brush_->SetOpacity(0.14F);
+        render_target_->FillRoundedRectangle(capsule, accent_brush_.Get());
+        accent_brush_->SetOpacity(0.72F);
+        render_target_->DrawRoundedRectangle(capsule, accent_brush_.Get(), 1.0F);
+        accent_brush_->SetOpacity(1.0F);
+
         draw_text(
-            label,
+            source,
             caption_format_.Get(),
-            D2D1::RectF(left + 21.0F, top, left + width - 8.0F, top + 28.0F),
-            secondary_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_LEADING);
+            capsule.rect,
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
     void draw_text(
@@ -1337,7 +1568,7 @@ private:
 
     void refresh_disc()
     {
-        if (disc_loading_ || disc_worker_.joinable()) {
+        if (disc_loading_ || disc_worker_.joinable() || metadata_worker_.joinable()) {
             return;
         }
         stop_playback();
@@ -1367,6 +1598,75 @@ private:
         disc_ = std::move(*snapshot);
         selected_track_ = first_audio_track();
         scroll_row_ = 0;
+        InvalidateRect(window_, nullptr, FALSE);
+        start_online_metadata_lookup();
+    }
+
+    void start_online_metadata_lookup()
+    {
+        if (!disc_.toc || metadata_worker_.joinable()) {
+            return;
+        }
+        const HWND target_window = window_;
+        const disc::Toc toc = *disc_.toc;
+        metadata_worker_ = std::jthread([target_window, toc] {
+            auto snapshot = std::make_unique<OnlineMetadataSnapshot>();
+            snapshot->result = platform::windows::lookup_musicbrainz(toc);
+            auto* const raw_snapshot = snapshot.release();
+            if (PostMessageW(
+                    target_window,
+                    kMetadataReadyMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(raw_snapshot)) == FALSE) {
+                delete raw_snapshot;
+            }
+        });
+    }
+
+    void receive_online_metadata(std::unique_ptr<OnlineMetadataSnapshot> snapshot)
+    {
+        if (metadata_worker_.joinable()) {
+            metadata_worker_.join();
+        }
+
+        const auto& result = snapshot->result;
+        if (!result.metadata) {
+            return;
+        }
+
+        const auto& metadata = *result.metadata;
+        disc_.metadata_source = disc_.has_cd_text
+            ? L"CD-TEXT + MusicBrainz"
+            : L"MusicBrainz";
+        if (disc_.album_title.empty()) {
+            disc_.album_title = metadata.album_title;
+        }
+        if (disc_.album_artist.empty()) {
+            disc_.album_artist = metadata.album_artist;
+        }
+        disc_.cover_art_path = metadata.cover_art_path;
+        if (!disc_.cover_art_path.empty()) {
+            load_cover_bitmap(disc_.cover_art_path);
+        }
+        const std::size_t title_count = std::min(
+            disc_.tracks.size(),
+            metadata.track_titles.size());
+        for (std::size_t index = 0; index < title_count; ++index) {
+            if (!disc_.tracks[index].has_metadata_title &&
+                !metadata.track_titles[index].empty()) {
+                disc_.tracks[index].title = metadata.track_titles[index];
+                disc_.tracks[index].has_metadata_title = true;
+            }
+        }
+        const std::size_t artist_count = std::min(
+            disc_.tracks.size(),
+            metadata.track_artists.size());
+        for (std::size_t index = 0; index < artist_count; ++index) {
+            if (disc_.tracks[index].artist.empty() &&
+                !metadata.track_artists[index].empty()) {
+                disc_.tracks[index].artist = metadata.track_artists[index];
+            }
+        }
         InvalidateRect(window_, nullptr, FALSE);
     }
 
@@ -1510,15 +1810,98 @@ private:
         return DefWindowProcW(window_, WM_KEYDOWN, key, 0);
     }
 
-    void scroll_tracks(const short wheel_delta)
+    void handle_mouse_wheel(
+        const short wheel_delta,
+        const int screen_x,
+        const int screen_y)
     {
-        if (disc_.tracks.empty()) {
+        POINT client_point{screen_x, screen_y};
+        if (ScreenToClient(window_, &client_point) == FALSE) {
             return;
         }
-        const int direction = wheel_delta > 0 ? -3 : 3;
-        const auto next = static_cast<long long>(scroll_row_) + direction;
-        scroll_row_ = static_cast<std::size_t>(std::max<long long>(next, 0));
+        const D2D1_POINT_2F point = D2D1::Point2F(
+            pixel_to_dip(client_point.x),
+            pixel_to_dip(client_point.y));
+        if (!contains(layout_.track_list, point)) {
+            return;
+        }
+
+        wheel_delta_remainder_ += wheel_delta;
+        const int notches = wheel_delta_remainder_ / WHEEL_DELTA;
+        wheel_delta_remainder_ %= WHEEL_DELTA;
+        if (notches == 0) {
+            return;
+        }
+
+        UINT lines_per_notch{3};
+        static_cast<void>(SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            &lines_per_notch,
+            0));
+        const auto geometry = track_scrollbar_geometry();
+        const int lines = lines_per_notch == WHEEL_PAGESCROLL
+            ? static_cast<int>(geometry.visible_rows)
+            : static_cast<int>(std::max<UINT>(lines_per_notch, 1));
+        scroll_by_rows(-notches * lines);
+    }
+
+    void scroll_by_rows(const int rows)
+    {
+        const auto geometry = track_scrollbar_geometry();
+        const auto next = std::clamp<long long>(
+            static_cast<long long>(scroll_row_) + rows,
+            0,
+            static_cast<long long>(geometry.maximum_scroll));
+        const auto next_row = static_cast<std::size_t>(next);
+        if (next_row == scroll_row_) {
+            return;
+        }
+        scroll_row_ = next_row;
         InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    [[nodiscard]] bool handle_scrollbar_press(const D2D1_POINT_2F point)
+    {
+        const auto geometry = track_scrollbar_geometry();
+        if (!geometry.visible || !contains(geometry.track, point)) {
+            return false;
+        }
+        if (contains(geometry.thumb, point)) {
+            scrollbar_dragging_ = true;
+            scrollbar_drag_offset_ = point.y - geometry.thumb.top;
+            SetCapture(window_);
+        } else {
+            const int page = static_cast<int>(std::max<std::size_t>(
+                geometry.visible_rows - 1,
+                1));
+            scroll_by_rows(point.y < geometry.thumb.top ? -page : page);
+        }
+        return true;
+    }
+
+    void update_scrollbar_drag(const D2D1_POINT_2F point)
+    {
+        const auto geometry = track_scrollbar_geometry();
+        if (!geometry.visible) {
+            return;
+        }
+        const float thumb_height = geometry.thumb.bottom - geometry.thumb.top;
+        const float travel = geometry.track.bottom - geometry.track.top - thumb_height;
+        if (travel <= 0.0F) {
+            return;
+        }
+        const float thumb_top = std::clamp(
+            point.y - scrollbar_drag_offset_,
+            geometry.track.top,
+            geometry.track.bottom - thumb_height);
+        const float ratio = (thumb_top - geometry.track.top) / travel;
+        const auto next = static_cast<std::size_t>(std::lround(
+            ratio * static_cast<float>(geometry.maximum_scroll)));
+        if (next != scroll_row_) {
+            scroll_row_ = next;
+            InvalidateRect(window_, nullptr, FALSE);
+        }
     }
 
     void select_relative_track(const int direction)
@@ -1767,7 +2150,9 @@ private:
     HWND window_{};
     ComPtr<ID2D1Factory> factory_;
     ComPtr<IDWriteFactory> write_factory_;
+    ComPtr<IWICImagingFactory> imaging_factory_;
     ComPtr<ID2D1HwndRenderTarget> render_target_;
+    ComPtr<ID2D1Bitmap> cover_bitmap_;
     ComPtr<ID2D1SolidColorBrush> background_brush_;
     ComPtr<ID2D1SolidColorBrush> surface_brush_;
     ComPtr<ID2D1SolidColorBrush> elevated_brush_;
@@ -1788,11 +2173,14 @@ private:
     ComPtr<IDWriteTextFormat> album_format_;
     ComPtr<IDWriteTextFormat> heading_format_;
     ComPtr<IDWriteTextFormat> body_format_;
+    ComPtr<IDWriteTextFormat> track_format_;
+    ComPtr<IDWriteTextFormat> track_duration_format_;
     ComPtr<IDWriteTextFormat> small_format_;
     ComPtr<IDWriteTextFormat> caption_format_;
     ComPtr<IDWriteTextFormat> icon_format_;
     DiscSnapshot disc_;
     std::jthread disc_worker_;
+    std::jthread metadata_worker_;
     bool disc_loading_{};
     Layout layout_{};
     std::vector<TrackHit> track_hits_;
@@ -1801,6 +2189,9 @@ private:
     bool tracking_mouse_{};
     std::size_t selected_track_{};
     std::size_t scroll_row_{};
+    int wheel_delta_remainder_{};
+    bool scrollbar_dragging_{};
+    float scrollbar_drag_offset_{};
     HANDLE playback_process_{};
     bool playback_active_{};
     std::size_t playback_start_track_{};

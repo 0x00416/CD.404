@@ -53,6 +53,7 @@ ctest --preset ninja-msvc-debug
 ```
 
 当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/停止、进度定位、刷新和弹出。播放仍通过同一构建目录中的流式播放组件完成。
+元数据优先使用光盘内嵌 CD-TEXT，并在后台通过 MusicBrainz TOC 匹配补全缺失字段；匹配版本的正面封面来自 Cover Art Archive，缓存位于当前用户的本地应用数据目录，不会写入仓库。
 
 也可以直接生成 Visual Studio 工程：
 

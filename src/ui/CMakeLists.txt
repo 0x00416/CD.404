@@ -22,6 +22,7 @@ target_link_libraries(
         dwrite
         dwmapi
         user32
+        windowscodecs
 )
 cd404_set_project_warnings(cd404_ui)
 
