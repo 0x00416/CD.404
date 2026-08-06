@@ -181,6 +181,41 @@ TocReadResult read_toc(const OpticalDrive& drive)
     };
 }
 
+unsigned long eject_media(const OpticalDrive& drive) noexcept
+{
+    if (drive.device_path.empty()) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    UniqueHandle handle(CreateFileW(
+        drive.device_path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr));
+
+    if (handle.get() == INVALID_HANDLE_VALUE) {
+        return GetLastError();
+    }
+
+    DWORD bytes_returned{};
+    if (!DeviceIoControl(
+            handle.get(),
+            IOCTL_STORAGE_EJECT_MEDIA,
+            nullptr,
+            0,
+            nullptr,
+            0,
+            &bytes_returned,
+            nullptr)) {
+        return GetLastError();
+    }
+
+    return ERROR_SUCCESS;
+}
+
 std::wstring format_system_error(const unsigned long error_code)
 {
     if (error_code == ERROR_SUCCESS) {

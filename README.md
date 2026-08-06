@@ -46,6 +46,14 @@ cmake --build --preset ninja-msvc-debug
 ctest --preset ninja-msvc-debug
 ```
 
+启动图形播放器：
+
+```powershell
+.\out\build\ninja-msvc-x64\apps\cd404\CD.404.exe
+```
+
+当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/停止、进度定位、刷新和弹出。播放仍通过同一构建目录中的流式播放组件完成。
+
 也可以直接生成 Visual Studio 工程：
 
 ```powershell

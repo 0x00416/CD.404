@@ -21,6 +21,9 @@ struct TocReadResult final {
 
 [[nodiscard]] std::vector<OpticalDrive> enumerate_optical_drives();
 [[nodiscard]] TocReadResult read_toc(const OpticalDrive& drive);
+// Requests a hardware eject for the selected drive. Returns ERROR_SUCCESS on
+// success or the Win32 error reported while opening/controlling the device.
+[[nodiscard]] unsigned long eject_media(const OpticalDrive& drive) noexcept;
 [[nodiscard]] std::wstring format_system_error(unsigned long error_code);
 
 } // namespace cd404::platform::windows
