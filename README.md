@@ -28,6 +28,7 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - CD MSF、LBA、扇区和采样帧转换。
 - 平台无关的 TOC 验证与曲目时间轴模型。
 - Windows 光驱枚举和 TOC 读取探针。
+- 连续 CDDA 流、跨轨样本连续性测试和原始扇区读取探针。
 - 基础自动测试。
 
 ## 构建
@@ -52,6 +53,12 @@ ctest --preset vs2026-debug
 
 ```powershell
 .\out\build\ninja-msvc-x64\apps\drive_probe\cd404_drive_probe.exe
+```
+
+读取当前光盘的原始 CDDA 扇区并计算诊断哈希：
+
+```powershell
+.\out\build\ninja-msvc-x64\apps\cdda_probe\cd404_cdda_probe.exe
 ```
 
 构建产物位于 `out/`，不会加入 Git。

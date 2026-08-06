@@ -9,6 +9,7 @@ inline constexpr std::int64_t kCdSampleFramesPerSecond = 44'100;
 inline constexpr std::int64_t kCdSectorsPerSecond = 75;
 inline constexpr std::int64_t kCdSampleFramesPerSector = 588;
 inline constexpr std::int64_t kCdBytesPerSector = 2'352;
+inline constexpr std::int64_t kCdBytesPerSampleFrame = 4;
 inline constexpr std::int64_t kCdProgramAreaOffsetSectors = 150;
 
 using Sector = std::int64_t;

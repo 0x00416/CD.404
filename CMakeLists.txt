@@ -14,10 +14,12 @@ include(CompilerWarnings)
 
 add_subdirectory(src/core)
 add_subdirectory(src/disc)
+add_subdirectory(src/audio)
 
 if(WIN32)
     add_subdirectory(src/platform/windows)
     add_subdirectory(apps/drive_probe)
+    add_subdirectory(apps/cdda_probe)
 endif()
 
 if(CD404_BUILD_TESTS)

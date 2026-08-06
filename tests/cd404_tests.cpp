@@ -1,15 +1,91 @@
+#include <cd404/audio/cdda_sector_source.hpp>
+#include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/toc.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <string_view>
+#include <vector>
 
 namespace {
 
 int failures{};
+
+class PatternSectorSource final : public cd404::audio::CddaSectorSource {
+public:
+    PatternSectorSource(
+        const cd404::core::Sector first_lba,
+        const cd404::core::Sector end_lba)
+        : first_lba_(first_lba), end_lba_(end_lba)
+    {
+    }
+
+    [[nodiscard]] cd404::core::Sector first_lba() const noexcept override
+    {
+        return first_lba_;
+    }
+
+    [[nodiscard]] cd404::core::Sector end_lba() const noexcept override
+    {
+        return end_lba_;
+    }
+
+    [[nodiscard]] cd404::audio::SectorReadResult read_sectors(
+        const cd404::core::Sector start_lba,
+        const std::span<std::byte> destination) override
+    {
+        using namespace cd404;
+
+        const auto bytes_per_sector =
+            static_cast<std::size_t>(core::kCdBytesPerSector);
+        if (start_lba < first_lba_ || destination.size() % bytes_per_sector != 0) {
+            return {audio::ReadStatus::invalid_request, 0, 0};
+        }
+        if (start_lba >= end_lba_) {
+            return {audio::ReadStatus::end_of_stream, 0, 0};
+        }
+
+        const std::size_t requested_sectors = destination.size() / bytes_per_sector;
+        const std::size_t available_sectors =
+            static_cast<std::size_t>(end_lba_ - start_lba);
+        const std::size_t sectors_to_write =
+            std::min(requested_sectors, available_sectors);
+
+        for (std::size_t sector = 0; sector < sectors_to_write; ++sector) {
+            const auto current_lba =
+                start_lba + static_cast<core::Sector>(sector);
+            const auto first_frame = static_cast<std::uint32_t>(
+                (current_lba - first_lba_) * core::kCdSampleFramesPerSector);
+
+            for (std::uint32_t frame = 0;
+                 frame < static_cast<std::uint32_t>(core::kCdSampleFramesPerSector);
+                 ++frame) {
+                const std::uint32_t value = first_frame + frame;
+                const std::size_t offset = sector * bytes_per_sector +
+                                           static_cast<std::size_t>(frame) * 4;
+                destination[offset] = static_cast<std::byte>(value & 0xffU);
+                destination[offset + 1] =
+                    static_cast<std::byte>((value >> 8U) & 0xffU);
+                destination[offset + 2] =
+                    static_cast<std::byte>((value >> 16U) & 0xffU);
+                destination[offset + 3] =
+                    static_cast<std::byte>((value >> 24U) & 0xffU);
+            }
+        }
+
+        return {audio::ReadStatus::ok, sectors_to_write, 0};
+    }
+
+private:
+    cd404::core::Sector first_lba_{};
+    cd404::core::Sector end_lba_{};
+};
 
 void expect(const bool condition, const std::string_view description)
 {
@@ -132,6 +208,118 @@ void test_invalid_toc()
         "lead-out at track start is rejected");
 }
 
+[[nodiscard]] std::uint32_t read_pattern_frame(
+    const std::span<const std::byte> bytes,
+    const std::size_t frame)
+{
+    const std::size_t offset = frame * 4;
+    return std::to_integer<std::uint32_t>(bytes[offset]) |
+           (std::to_integer<std::uint32_t>(bytes[offset + 1]) << 8U) |
+           (std::to_integer<std::uint32_t>(bytes[offset + 2]) << 16U) |
+           (std::to_integer<std::uint32_t>(bytes[offset + 3]) << 24U);
+}
+
+void test_continuous_cdda_stream()
+{
+    using namespace cd404;
+
+    constexpr core::Sector kFirstLba = 100;
+    constexpr core::Sector kTrackBoundaryLba = 102;
+    constexpr core::Sector kEndLba = 104;
+    PatternSectorSource source(kFirstLba, kEndLba);
+    audio::ContinuousCddaStream stream(source, kFirstLba, kEndLba);
+
+    expect(stream.valid(), "continuous stream accepts a valid source range");
+    expect(stream.position() == 0, "continuous stream starts at frame zero");
+    expect(stream.total_frames() == 2'352, "four sectors contain 2352 frames");
+
+    const auto total_bytes = static_cast<std::size_t>(
+        stream.total_frames() * core::kCdBytesPerSampleFrame);
+    std::vector<std::byte> output(total_bytes);
+    constexpr std::array<std::size_t, 7> chunk_frames{
+        1,
+        586,
+        2,
+        137,
+        700,
+        17,
+        909,
+    };
+
+    std::size_t output_offset{};
+    std::size_t chunk_index{};
+    while (output_offset < output.size()) {
+        const std::size_t remaining_frames =
+            (output.size() - output_offset) /
+            static_cast<std::size_t>(core::kCdBytesPerSampleFrame);
+        const std::size_t frames_to_read =
+            std::min(chunk_frames[chunk_index % chunk_frames.size()], remaining_frames);
+        const std::size_t bytes_to_read =
+            frames_to_read * static_cast<std::size_t>(core::kCdBytesPerSampleFrame);
+        const auto result = stream.read_frames(
+            std::span<std::byte>(output.data() + output_offset, bytes_to_read));
+        expect(result.status == audio::ReadStatus::ok, "chunked stream read succeeds");
+        expect(result.frames_read == frames_to_read, "chunked stream returns requested frames");
+        output_offset += bytes_to_read;
+        ++chunk_index;
+    }
+
+    for (std::size_t frame = 0; frame < static_cast<std::size_t>(stream.total_frames());
+         ++frame) {
+        if (read_pattern_frame(output, frame) != frame) {
+            expect(false, "continuous output contains no dropped or duplicated frames");
+            break;
+        }
+    }
+
+    const std::size_t boundary_frame = static_cast<std::size_t>(
+        (kTrackBoundaryLba - kFirstLba) * core::kCdSampleFramesPerSector);
+    expect(
+        read_pattern_frame(output, boundary_frame - 1) == boundary_frame - 1,
+        "last frame before track boundary is preserved");
+    expect(
+        read_pattern_frame(output, boundary_frame) == boundary_frame,
+        "first frame after track boundary immediately follows");
+
+    std::array<std::byte, 4> end_buffer{};
+    const auto end_result = stream.read_frames(end_buffer);
+    expect(
+        end_result.status == audio::ReadStatus::end_of_stream &&
+            end_result.frames_read == 0,
+        "read after final frame reports end of stream");
+
+    expect(
+        stream.seek(static_cast<core::SampleFrame>(boundary_frame - 1)),
+        "stream can seek to frame before track boundary");
+    std::array<std::byte, 12> seek_buffer{};
+    const auto seek_result = stream.read_frames(seek_buffer);
+    expect(
+        seek_result.status == audio::ReadStatus::ok && seek_result.frames_read == 3,
+        "unaligned seek reads across track boundary");
+    expect(
+        read_pattern_frame(seek_buffer, 0) == boundary_frame - 1 &&
+            read_pattern_frame(seek_buffer, 1) == boundary_frame &&
+            read_pattern_frame(seek_buffer, 2) == boundary_frame + 1,
+        "seek preserves exact boundary frame order");
+
+    std::array<std::byte, 3> invalid_buffer{};
+    expect(
+        stream.read_frames(invalid_buffer).status == audio::ReadStatus::invalid_request,
+        "non-frame-aligned destination is rejected");
+
+    audio::ContinuousCddaStream invalid_stream(source, kFirstLba - 1, kEndLba);
+    expect(!invalid_stream.valid(), "stream rejects a range outside its source");
+
+    PatternSectorSource extreme_source(
+        std::numeric_limits<core::Sector>::min(),
+        std::numeric_limits<core::Sector>::max());
+    audio::ContinuousCddaStream overflowing_stream(
+        extreme_source,
+        extreme_source.first_lba(),
+        extreme_source.end_lba());
+    expect(!overflowing_stream.valid(), "stream rejects an overflowing LBA range");
+}
+
 } // namespace
 
 int main()
@@ -139,6 +327,7 @@ int main()
     test_cd_time_conversions();
     test_valid_toc();
     test_invalid_toc();
+    test_continuous_cdda_stream();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed.\n";
