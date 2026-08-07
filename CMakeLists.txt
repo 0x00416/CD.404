@@ -8,6 +8,7 @@ project(
 )
 
 option(CD404_BUILD_TESTS "Build CD.404 tests" ON)
+option(CD404_BUILD_TOOLS "Build CD.404 diagnostic tools" ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
@@ -20,9 +21,13 @@ if(WIN32)
     add_subdirectory(src/platform/windows)
     add_subdirectory(src/ui)
     add_subdirectory(apps/cd404)
-    add_subdirectory(apps/drive_probe)
-    add_subdirectory(apps/cdda_probe)
-    add_subdirectory(apps/play_probe)
+    add_subdirectory(apps/playback)
+
+    if(CD404_BUILD_TOOLS)
+        add_subdirectory(tools/probes/drive)
+        add_subdirectory(tools/probes/cdda)
+        add_subdirectory(tools/probes/metadata)
+    endif()
 endif()
 
 if(CD404_BUILD_TESTS)

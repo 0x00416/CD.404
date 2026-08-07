@@ -29,6 +29,9 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
+constexpr std::uint64_t kMaximumAverageTrackDifferenceMilliseconds = 2'000U;
+constexpr std::uint64_t kMaximumSingleTrackDifferenceMilliseconds = 5'000U;
+
 class InternetHandle final {
 public:
     explicit InternetHandle(HINTERNET handle = nullptr) noexcept : handle_(handle) {}
@@ -111,7 +114,8 @@ private:
     }
     const std::filesystem::path base(local_app_data);
     CoTaskMemFree(local_app_data);
-    return base / L"CD.404" / L"Cache" / L"covers" / (release_id + L".jpg");
+    return base / L"CD.404" / L"Cache" / L"covers" /
+           (release_id + L"-1200.jpg");
 }
 
 [[nodiscard]] bool looks_like_image(const std::span<const std::uint8_t> bytes)
@@ -159,7 +163,7 @@ private:
     if (connection.get() == nullptr) {
         return {};
     }
-    const std::wstring path = L"/release/" + release_id + L"/front-500";
+    const std::wstring path = L"/release/" + release_id + L"/front-1200";
     InternetHandle request(WinHttpOpenRequest(
         connection.get(),
         L"GET",
@@ -355,20 +359,26 @@ void end_element(
     } else if (name == L"medium" && depth == state.medium_depth) {
         if (state.medium_matches &&
             state.candidate.track_titles.size() == expected_tracks &&
-            !state.candidate.album_title.empty()) {
-            std::uint64_t score = std::numeric_limits<std::uint64_t>::max() / 2U;
-            if (state.track_lengths.size() == expected_tracks &&
-                std::ranges::none_of(state.track_lengths, [](const std::uint64_t value) {
-                    return value == 0;
-                })) {
-                score = 0;
-                for (std::size_t index = 0; index < expected_tracks; ++index) {
-                    const auto actual = state.track_lengths[index];
-                    const auto expected = expected_lengths[index];
-                    score += actual > expected ? actual - expected : expected - actual;
-                }
+            !state.candidate.album_title.empty() &&
+            state.track_lengths.size() == expected_tracks &&
+            std::ranges::none_of(state.track_lengths, [](const std::uint64_t value) {
+                return value == 0;
+            })) {
+            std::uint64_t score{};
+            std::uint64_t maximum_difference{};
+            for (std::size_t index = 0; index < expected_tracks; ++index) {
+                const auto actual = state.track_lengths[index];
+                const auto expected = expected_lengths[index];
+                const auto difference = actual > expected
+                    ? actual - expected
+                    : expected - actual;
+                score += difference;
+                maximum_difference = std::max(maximum_difference, difference);
             }
-            if (score < state.best_score) {
+            const bool durations_match =
+                maximum_difference <= kMaximumSingleTrackDifferenceMilliseconds &&
+                score <= kMaximumAverageTrackDifferenceMilliseconds * expected_tracks;
+            if (durations_match && score < state.best_score) {
                 state.best_score = score;
                 state.best_match = state.candidate;
             }

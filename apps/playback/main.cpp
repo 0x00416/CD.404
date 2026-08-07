@@ -168,7 +168,7 @@ struct SubmitResult final {
 
 void print_usage()
 {
-    std::wcout << L"Usage: cd404_play_probe [--track N] [--offset-seconds N] "
+    std::wcout << L"Usage: CD.404.Playback [--track N] [--offset-seconds N] "
                   L"[--seconds N | --all]\n"
                   L"  --track N    Start at this audio track; defaults to the first.\n"
                   L"  --offset-seconds N  Seek N seconds from the selected track start.\n"

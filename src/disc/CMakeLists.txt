@@ -4,12 +4,14 @@ target_sources(
     cd404_disc
     PRIVATE
         src/cd_text.cpp
+        src/gnudb.cpp
         src/toc.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
             include/cd404/disc/cd_text.hpp
+            include/cd404/disc/gnudb.hpp
             include/cd404/disc/toc.hpp
 )
 

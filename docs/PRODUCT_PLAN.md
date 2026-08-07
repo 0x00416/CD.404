@@ -12,7 +12,7 @@ CD.404 是一款面向 Windows 10/11 的轻量原生音频 CD 播放器。产品
 首版聚焦以下四项能力：
 
 1. 使用 Windows 原生接口可靠读取和播放音频 CD。
-2. 从 CD-TEXT、MusicBrainz 和 Cover Art Archive 获取并合并元数据。
+2. 从 CD-TEXT、MusicBrainz、GnuDB、iTunes 和 Cover Art Archive 获取并合并元数据。
 3. 向 ListenBrainz 上报正在播放状态和符合规则的正式播放记录。
 4. 将整张光盘建模为连续 PCM 时间轴，实现相邻曲目之间不丢样、不插样、不重启输出流的无缝播放。
 
@@ -52,6 +52,8 @@ CD.404 是一款面向 Windows 10/11 的轻量原生音频 CD 播放器。产品
 - WASAPI 共享模式、独占直通模式和输出设备选择。
 - 跨相邻音轨的采样级无缝播放。
 - MusicBrainz Disc ID 精确查询及 TOC 模糊匹配。
+- GnuDB/CDDB Disc ID 精确查询及协议 6 UTF-8 条目解析。
+- iTunes 目录补全，并使用音轨数量、编号和 TOC 时长严格校验候选。
 - 多发行版候选选择、记忆与重新选择。
 - Cover Art Archive 封面获取和本地缓存。
 - 元数据字段来源追踪和手动修订。
@@ -78,10 +80,11 @@ CD.404 是一款面向 Windows 10/11 的轻量原生音频 CD 播放器。产品
 1. 监听设备变化并检测可用光驱。
 2. 读取 TOC，建立本地光盘和曲目结构。
 3. 尝试读取 CD-TEXT，并立即显示可用标题。
-4. 计算 MusicBrainz Disc ID，同时检查本地缓存。
+4. 计算 MusicBrainz 与 GnuDB/CDDB 光盘标识，同时检查本地缓存。
 5. 如果命中缓存，立即显示已确认的元数据和封面。
-6. 在后台查询 MusicBrainz；精确匹配时自动合并，多候选时提示用户选择。
-7. 用户可以在互联网元数据尚未返回时直接开始播放。
+6. 在后台并行查询 MusicBrainz 与 GnuDB；精确匹配时自动合并，多候选时提示用户选择。
+7. 获得可信专辑和艺术家后查询 iTunes，仅在音轨结构和时长校验通过时补全空字段。
+8. 用户可以在互联网元数据尚未返回时直接开始播放。
 
 ### 4.2 播放流程
 
@@ -140,9 +143,14 @@ flowchart LR
 
     DiscIO --> Identity["Disc ID / TOC 指纹"]
     Identity --> MB["MusicBrainz"]
+    Identity --> GnuDB["GnuDB"]
     MB --> CAA["Cover Art Archive"]
+    MB --> ITunes["iTunes 严格校验补全"]
+    GnuDB --> ITunes
     DiscIO --> Merge["元数据合并"]
     MB --> Merge
+    GnuDB --> Merge
+    ITunes --> Merge
     CAA --> Merge
     Merge --> Cache["SQLite 缓存"]
     Cache --> UI
@@ -156,7 +164,7 @@ cd404_ui               Win32/Direct2D 界面、主题和交互
 cd404_disc             光驱枚举、TOC、CD-TEXT、CDDA 读取
 cd404_audio            连续时间轴、缓冲、WASAPI、设备管理
 cd404_metadata         Disc ID、元数据合并和候选评分
-cd404_musicbrainz      MusicBrainz 与 Cover Art Archive 客户端
+cd404_online_metadata  MusicBrainz、GnuDB、iTunes 与 Cover Art Archive 客户端
 cd404_listenbrainz     播放会话、上报与离线队列
 cd404_storage          SQLite、缓存、设置和迁移
 cd404_platform         Win32、凭据、日志、线程和通用基础设施
@@ -249,24 +257,25 @@ Track
 
 1. 用户手动修订。
 2. 已确认的本地发行版缓存。
-3. MusicBrainz 精确 Disc ID 结果。
-4. MusicBrainz TOC 模糊匹配结果。
-5. CD-TEXT。
-6. TOC 生成的占位数据，如 `Track 01`。
+3. CD-TEXT。
+4. MusicBrainz 精确 Disc ID 或高置信 TOC 结果。
+5. GnuDB/CDDB 精确结果。
+6. 通过音轨结构和时长校验的 iTunes 结果。
+7. TOC 生成的占位数据，如 `Track 01`。
 
-封面以 MusicBrainz Release MBID 查询 Cover Art Archive，优先缓存 500 像素缩略图，高分辨率版本按需下载。
+封面以 MusicBrainz Release MBID 查询 Cover Art Archive，缓存 1200 像素缩略图并由界面按显示尺寸高质量缩小。
 
 ### 8.2 查询过程
 
-1. 从 TOC 生成 MusicBrainz Disc ID 和标准 TOC 查询字符串。
-2. 使用 Disc ID 查询 MusicBrainz。
-3. 未命中时提交带 TOC 的模糊查询。
-4. 获取发行版、介质、曲目、录音、艺术家和所需 MBID。
-5. 对候选结果评分。
-6. 唯一高置信候选自动采用，否则由用户选择。
+1. 从 TOC 生成 MusicBrainz 查询参数、GnuDB/CDDB Disc ID 和标准 TOC 指纹。
+2. 并行查询 MusicBrainz 与 GnuDB；GnuDB 按协议先执行 `query`，再对精确命中执行 `read`。
+3. MusicBrainz 获取发行版、介质、曲目、录音、艺术家和所需 MBID，并对候选结果评分。
+4. 合并 CD-TEXT 与高置信在线结果，获得可信的专辑/艺术家查询种子。
+5. 查询 iTunes 专辑及曲目；只有专辑、艺术家、音轨数、编号和 TOC 时长差均通过校验才采用。
+6. 不同来源仅补全当前仍为空的字段，唯一高置信候选自动采用，否则由用户选择。
 7. 保存选择与 TOC 指纹的绑定。
 
-MusicBrainz 请求必须使用包含应用名和版本的有效 User-Agent，并由全局限速器确保不超过官方服务要求。HTTP 缓存、退避和取消必须集中实现。
+MusicBrainz 请求必须使用包含应用名和版本的有效 User-Agent，并由全局限速器确保不超过官方服务要求。GnuDB 使用 HTTPS CGI、包含客户端 `hello` 标识并请求协议 6 UTF-8。iTunes 请求按官方建议限速和缓存；不使用其宣传图作为播放器封面。所有来源的 HTTP 缓存、退避和取消必须集中实现。
 
 ### 8.3 候选评分
 
@@ -295,7 +304,7 @@ MetadataValue
   updated_at
 ```
 
-用户锁定字段永远不被后台刷新覆盖。不同来源可以组合使用，例如专辑标题来自 MusicBrainz、某首曲名来自 CD-TEXT、封面来自 Cover Art Archive。
+用户锁定字段永远不被后台刷新覆盖。不同来源可以组合使用，例如专辑标题来自 MusicBrainz、某首曲名来自 CD-TEXT、缺失艺术家来自 GnuDB 或经校验的 iTunes，封面来自 Cover Art Archive。
 
 ### 8.5 离线策略
 
@@ -417,7 +426,7 @@ app_settings
 - 设备监控线程：光驱和音频设备变化。
 - CDDA 读取线程：顺序扇区读取、重试和环形缓冲生产。
 - WASAPI 渲染线程：事件驱动消费 PCM，注册 MMCSS。
-- 网络任务线程池：MusicBrainz、封面和 ListenBrainz。
+- 网络任务线程池：MusicBrainz、GnuDB、iTunes、封面和 ListenBrainz。
 - 数据库工作线程：缓存和上报队列事务。
 
 WASAPI 渲染线程禁止：
@@ -441,6 +450,8 @@ WASAPI 渲染线程禁止：
 - TOC 解析和 lead-out 处理。
 - CD-TEXT pack 组合、字符集和字段映射。
 - MusicBrainz Disc ID 输入构造。
+- GnuDB/CDDB Disc ID 与 xmcd 条目解析。
+- iTunes 候选的音轨结构和 TOC 时长校验。
 - 发行版候选评分。
 - 字段来源合并与用户锁定。
 - ListenBrainz 阈值、暂停、跳转、循环和去重。
@@ -529,6 +540,7 @@ MVP 发布前必须满足：
 ### P3：元数据，1 至 2 周
 
 - Disc ID 与 MusicBrainz 客户端。
+- GnuDB/CDDB 与 iTunes 补全客户端。
 - 请求限速、缓存、取消和退避。
 - CD-TEXT 与互联网元数据合并。
 - 发行版候选评分与用户选择。
@@ -588,6 +600,8 @@ MVP 发布前必须满足：
 - [MusicBrainz Web Service v2](https://musicbrainz.org/doc/Development/XML_Web_Service/Version_2)
 - [MusicBrainz libdiscid](https://musicbrainz.org/doc/libdiscid)
 - [Cover Art Archive API](https://musicbrainz.org/doc/Cover_Art_Archive/API)
+- [GnuDB/CDDB 协议与 HTTPS CGI](https://gnudb.org/howtognudb.php)
+- [Apple iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/)
 - [ListenBrainz Core API](https://listenbrainz.readthedocs.io/en/latest/users/api/core.html)
 - [ListenBrainz JSON 格式](https://listenbrainz.readthedocs.io/en/latest/users/json.html)
 

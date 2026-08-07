@@ -9,7 +9,7 @@
 #include <wrl/client.h>
 
 #include <cd404/core/cd_time.hpp>
-#include <cd404/platform/windows/musicbrainz_client.hpp>
+#include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/ui/main_window.hpp>
 
@@ -112,7 +112,8 @@ struct DiscSnapshot final {
 };
 
 struct OnlineMetadataSnapshot final {
-    platform::windows::MusicBrainzLookupResult result;
+    std::optional<platform::windows::OnlineMetadata> metadata;
+    std::uint64_t disc_generation{};
 };
 
 [[nodiscard]] DiscSnapshot load_disc_snapshot()
@@ -965,8 +966,25 @@ private:
 
     void draw_cover()
     {
-        const auto rounded = D2D1::RoundedRect(layout_.cover, 14.0F, 14.0F);
         if (cover_bitmap_) {
+            const D2D1_SIZE_U bitmap_size = cover_bitmap_->GetPixelSize();
+            const float cover_width = layout_.cover.right - layout_.cover.left;
+            const float cover_height = layout_.cover.bottom - layout_.cover.top;
+            const float scale = std::min(
+                cover_width / static_cast<float>(bitmap_size.width),
+                cover_height / static_cast<float>(bitmap_size.height));
+            const float image_width = static_cast<float>(bitmap_size.width) * scale;
+            const float image_height = static_cast<float>(bitmap_size.height) * scale;
+            const float image_left =
+                layout_.cover.left + (cover_width - image_width) * 0.5F;
+            const float image_top = layout_.track_list.top;
+            const D2D1_RECT_F image_rect = D2D1::RectF(
+                image_left,
+                image_top,
+                image_left + image_width,
+                image_top + image_height);
+            const auto rounded = D2D1::RoundedRect(image_rect, 14.0F, 14.0F);
+
             ComPtr<ID2D1RoundedRectangleGeometry> clip_geometry;
             ComPtr<ID2D1Layer> layer;
             if (SUCCEEDED(factory_->CreateRoundedRectangleGeometry(
@@ -977,12 +995,12 @@ private:
                     layer.ReleaseAndGetAddressOf()))) {
                 render_target_->PushLayer(
                     D2D1::LayerParameters(
-                        layout_.cover,
+                        image_rect,
                         clip_geometry.Get()),
                     layer.Get());
                 render_target_->DrawBitmap(
                     cover_bitmap_.Get(),
-                    layout_.cover,
+                    image_rect,
                     1.0F,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                 render_target_->PopLayer();
@@ -990,6 +1008,7 @@ private:
                 return;
             }
         }
+        const auto rounded = D2D1::RoundedRect(layout_.cover, 14.0F, 14.0F);
         cover_brush_->SetStartPoint(D2D1::Point2F(
             layout_.cover.left,
             layout_.cover.top));
@@ -1568,7 +1587,7 @@ private:
 
     void refresh_disc()
     {
-        if (disc_loading_ || disc_worker_.joinable() || metadata_worker_.joinable()) {
+        if (disc_loading_ || disc_worker_.joinable()) {
             return;
         }
         stop_playback();
@@ -1595,6 +1614,7 @@ private:
             disc_worker_.join();
         }
         disc_loading_ = false;
+        ++disc_generation_;
         disc_ = std::move(*snapshot);
         selected_track_ = first_audio_track();
         scroll_row_ = 0;
@@ -1609,9 +1629,21 @@ private:
         }
         const HWND target_window = window_;
         const disc::Toc toc = *disc_.toc;
-        metadata_worker_ = std::jthread([target_window, toc] {
+        const std::wstring album_title = disc_.album_title;
+        const std::wstring album_artist = disc_.album_artist;
+        const std::uint64_t disc_generation = disc_generation_;
+        metadata_worker_ = std::jthread([
+            target_window,
+            toc,
+            album_title,
+            album_artist,
+            disc_generation] {
             auto snapshot = std::make_unique<OnlineMetadataSnapshot>();
-            snapshot->result = platform::windows::lookup_musicbrainz(toc);
+            snapshot->disc_generation = disc_generation;
+            snapshot->metadata = platform::windows::lookup_online_metadata(
+                toc,
+                album_title,
+                album_artist);
             auto* const raw_snapshot = snapshot.release();
             if (PostMessageW(
                     target_window,
@@ -1629,15 +1661,25 @@ private:
             metadata_worker_.join();
         }
 
-        const auto& result = snapshot->result;
-        if (!result.metadata) {
+        if (snapshot->disc_generation != disc_generation_ || disc_loading_) {
+            if (!disc_loading_) {
+                start_online_metadata_lookup();
+            }
             return;
         }
 
-        const auto& metadata = *result.metadata;
-        disc_.metadata_source = disc_.has_cd_text
-            ? L"CD-TEXT + MusicBrainz"
-            : L"MusicBrainz";
+        if (!snapshot->metadata) {
+            return;
+        }
+
+        const auto& metadata = *snapshot->metadata;
+        disc_.metadata_source = disc_.has_cd_text ? L"CD-TEXT" : L"";
+        for (const auto& source : metadata.sources) {
+            if (!disc_.metadata_source.empty()) {
+                disc_.metadata_source += L" · ";
+            }
+            disc_.metadata_source += source;
+        }
         if (disc_.album_title.empty()) {
             disc_.album_title = metadata.album_title;
         }
@@ -1970,7 +2012,7 @@ private:
 
         const std::filesystem::path probe_path = playback_probe_path();
         if (!std::filesystem::exists(probe_path)) {
-            ui_message_ = L"找不到播放组件，请先构建 cd404_play_probe";
+            ui_message_ = L"找不到播放组件，请重新构建完整程序";
             ui_message_is_error_ = true;
             return;
         }
@@ -2136,8 +2178,8 @@ private:
         const std::filesystem::path app_directory =
             std::filesystem::path(module_path).parent_path();
         return app_directory.parent_path() /
-               L"play_probe" /
-               L"cd404_play_probe.exe";
+               L"playback" /
+               L"CD.404.Playback.exe";
     }
 
     [[nodiscard]] float pixel_to_dip(const int pixel) const
@@ -2181,6 +2223,7 @@ private:
     DiscSnapshot disc_;
     std::jthread disc_worker_;
     std::jthread metadata_worker_;
+    std::uint64_t disc_generation_{};
     bool disc_loading_{};
     Layout layout_{};
     std::vector<TrackHit> track_hits_;

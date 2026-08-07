@@ -4,6 +4,7 @@
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/cd_text.hpp>
+#include <cd404/disc/gnudb.hpp>
 #include <cd404/disc/toc.hpp>
 
 #include <algorithm>
@@ -269,6 +270,61 @@ void test_cd_text_parsing()
     expect(metadata.tracks[1].performer == u"Band", "CD-TEXT parses track performer");
     expect(metadata.tracks[2].performer == u"Band", "CD-TEXT expands tab repetition");
     expect(!metadata.empty(), "parsed CD-TEXT reports non-empty metadata");
+}
+
+void test_gnudb_identity_and_entry()
+{
+    using namespace cd404;
+    using namespace cd404::disc;
+
+    constexpr std::array<std::uint32_t, 13> absolute_offsets{
+        150, 15'105, 26'335, 40'545, 48'890, 66'822, 92'035,
+        104'685, 114'340, 130'040, 146'350, 165'575, 171'530,
+    };
+    std::vector<RawTocEntry> entries;
+    entries.reserve(absolute_offsets.size());
+    for (std::size_t index = 0; index < absolute_offsets.size(); ++index) {
+        entries.push_back(RawTocEntry{
+            static_cast<std::uint8_t>(index + 1U),
+            static_cast<core::Sector>(absolute_offsets[index]) -
+                core::kCdProgramAreaOffsetSectors,
+            true,
+        });
+    }
+    TocError error{};
+    const auto toc = Toc::create(
+        entries,
+        2'358 * core::kCdSectorsPerSecond - core::kCdProgramAreaOffsetSectors,
+        error);
+    expect(toc.has_value(), "GnuDB reference TOC is valid");
+    if (toc) {
+        const auto identity = make_gnudb_disc_identity(*toc);
+        expect(
+            identity && identity->disc_id == 0x9a09340dU &&
+                identity->disc_length_seconds == 2'358U &&
+                identity->track_offsets ==
+                    std::vector<std::uint32_t>(absolute_offsets.begin(), absolute_offsets.end()),
+            "GnuDB Disc ID matches the published protocol example");
+    }
+
+    constexpr std::string_view response =
+        "210 data 12345603 entry follows\r\n"
+        "# xmcd database file\r\n"
+        "DTITLE=Various Artists / Example Album\r\n"
+        "TTITLE0=Artist One / First Track\r\n"
+        "TTITLE1=Artist Two / Second\r\n"
+        "TTITLE1= Track\r\n"
+        "TTITLE2=Artist Three / Third Track\r\n"
+        ".\r\n";
+    const auto metadata = parse_gnudb_entry(response, 3);
+    expect(
+        metadata && metadata->album_title == "Example Album" &&
+            metadata->album_artist == "Various Artists" &&
+            metadata->track_titles ==
+                std::vector<std::string>{"First Track", "Second Track", "Third Track"} &&
+            metadata->track_artists ==
+                std::vector<std::string>{"Artist One", "Artist Two", "Artist Three"},
+        "GnuDB UTF-8 entry joins repeated fields and separates compilation artists");
 }
 
 [[nodiscard]] std::uint32_t read_pattern_frame(
@@ -562,6 +618,7 @@ int main()
     test_valid_toc();
     test_invalid_toc();
     test_cd_text_parsing();
+    test_gnudb_identity_and_entry();
     test_continuous_cdda_stream();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();

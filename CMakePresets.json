@@ -19,7 +19,8 @@
         "CMAKE_CXX_STANDARD": "20",
         "CMAKE_CXX_STANDARD_REQUIRED": "ON",
         "CMAKE_CXX_EXTENSIONS": "OFF",
-        "CD404_BUILD_TESTS": "ON"
+        "CD404_BUILD_TESTS": "ON",
+        "CD404_BUILD_TOOLS": "ON"
       }
     },
     {
@@ -35,7 +36,18 @@
         "CMAKE_CXX_STANDARD": "20",
         "CMAKE_CXX_STANDARD_REQUIRED": "ON",
         "CMAKE_CXX_EXTENSIONS": "OFF",
-        "CD404_BUILD_TESTS": "ON"
+        "CD404_BUILD_TESTS": "ON",
+        "CD404_BUILD_TOOLS": "ON"
+      }
+    },
+    {
+      "name": "ninja-msvc-x64-release",
+      "displayName": "Ninja with MSVC x64 Release",
+      "inherits": "ninja-msvc-x64",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CD404_BUILD_TOOLS": "OFF"
       }
     }
   ],
@@ -56,6 +68,11 @@
       "name": "ninja-msvc-debug",
       "displayName": "Build Debug with Ninja and MSVC",
       "configurePreset": "ninja-msvc-x64"
+    },
+    {
+      "name": "ninja-msvc-release",
+      "displayName": "Build Release with Ninja and MSVC",
+      "configurePreset": "ninja-msvc-x64-release"
     }
   ],
   "testPresets": [
@@ -72,6 +89,14 @@
       "name": "ninja-msvc-debug",
       "displayName": "Test Debug with Ninja and MSVC",
       "configurePreset": "ninja-msvc-x64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ninja-msvc-release",
+      "displayName": "Test Release with Ninja and MSVC",
+      "configurePreset": "ninja-msvc-x64-release",
       "output": {
         "outputOnFailure": true
       }

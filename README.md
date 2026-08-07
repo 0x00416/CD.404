@@ -33,10 +33,27 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - CDDA 到 44.1 kHz、16 位、双声道 PCM 的无损格式适配。
 - 光驱生产线程、约 6 秒有界 SPSC 环形缓冲和 1 秒首播水位。
 - 支持显式启动、排空和跨线程取消的事件驱动 WASAPI 共享模式输出。
-- 可跨相邻音轨保持同一数据流与音频会话的实体光盘播放探针。
+- 可跨相邻音轨保持同一数据流与音频会话的实体光盘播放后台组件。
+- CD-TEXT、MusicBrainz、GnuDB 与 iTunes 多源元数据补全，并显示本次实际命中的来源。
 - 基础自动测试。
 
 ## 构建
+
+在普通 PowerShell 中可用 Makefile 一键配置、构建完整 Debug 程序并运行测试：
+
+```powershell
+make
+```
+
+构建并测试 Release 版本：
+
+```powershell
+make release
+```
+
+其他常用入口包括 `make run`、`make run-release`、`make clean` 和 `make help`。
+Makefile 会通过 Visual Studio Installer 自带的 `vswhere` 自动定位 MSVC；本机路径不会写入仓库。
+`make`、`cmake` 和 `ctest` 需位于 `PATH`，也可以通过同名 Make 变量显式指定其路径。
 
 推荐在 **Developer PowerShell for VS 2026** 中使用 Ninja：
 
@@ -52,8 +69,8 @@ ctest --preset ninja-msvc-debug
 .\out\build\ninja-msvc-x64\apps\cd404\CD.404.exe
 ```
 
-当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/停止、进度定位、刷新和弹出。播放仍通过同一构建目录中的流式播放组件完成。
-元数据优先使用光盘内嵌 CD-TEXT，并在后台通过 MusicBrainz TOC 匹配补全缺失字段；匹配版本的正面封面来自 Cover Art Archive，缓存位于当前用户的本地应用数据目录，不会写入仓库。
+当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/停止、进度定位、刷新和弹出。播放由同一构建目录中 `apps/playback` 生成的正式后台组件完成。
+元数据优先使用光盘内嵌 CD-TEXT；后台并行查询 MusicBrainz 与 GnuDB，再以可信的专辑/艺术家结果查询 iTunes，并通过音轨数、编号和 TOC 时长差严格校验后补全空字段。来源胶囊只显示本次实际命中的服务。正面封面仅使用 Cover Art Archive 的 1200px 缩略图，缓存位于当前用户的本地应用数据目录，不会写入仓库，也不会下载或复用 iTunes 宣传图。
 
 也可以直接生成 Visual Studio 工程：
 
@@ -66,36 +83,42 @@ ctest --preset vs2026-debug
 枚举光驱并读取当前光盘 TOC：
 
 ```powershell
-.\out\build\ninja-msvc-x64\apps\drive_probe\cd404_drive_probe.exe
+.\out\build\ninja-msvc-x64\tools\probes\drive\cd404_drive_probe.exe
 ```
 
 读取当前光盘的原始 CDDA 扇区并计算诊断哈希：
 
 ```powershell
-.\out\build\ninja-msvc-x64\apps\cdda_probe\cd404_cdda_probe.exe
+.\out\build\ninja-msvc-x64\tools\probes\cdda\cd404_cdda_probe.exe
+```
+
+显示当前光盘命中的在线元数据来源及合并结果：
+
+```powershell
+.\out\build\ninja-msvc-x64\tools\probes\metadata\cd404_metadata_probe.exe
 ```
 
 播放当前音频 CD 的首个音轨，默认播放 15 秒：
 
 ```powershell
-.\out\build\ninja-msvc-x64\apps\play_probe\cd404_play_probe.exe
+.\out\build\ninja-msvc-x64\apps\playback\CD.404.Playback.exe
 ```
 
 也可以指定音轨和最长播放秒数：
 
 ```powershell
-.\out\build\ninja-msvc-x64\apps\play_probe\cd404_play_probe.exe --track 2 --seconds 30
+.\out\build\ninja-msvc-x64\apps\playback\CD.404.Playback.exe --track 2 --seconds 30
 ```
 
 连续播放当前音频轨区间，或从所选音轨内部偏移位置开始诊断：
 
 ```powershell
-.\out\build\ninja-msvc-x64\apps\play_probe\cd404_play_probe.exe --track 1 --all
-.\out\build\ninja-msvc-x64\apps\play_probe\cd404_play_probe.exe --track 1 --offset-seconds 170 --seconds 20
+.\out\build\ninja-msvc-x64\apps\playback\CD.404.Playback.exe --track 1 --all
+.\out\build\ninja-msvc-x64\apps\playback\CD.404.Playback.exe --track 1 --offset-seconds 170 --seconds 20
 ```
 
 播放过程中可按 `Ctrl+C` 停止；该路径会同时中断待处理的光驱重叠 I/O 和 WASAPI
-事件等待。播放探针会在独立线程持续读取光盘，以固定容量环形缓冲向 WASAPI 供给
+事件等待。播放后台组件会在独立线程持续读取光盘，以固定容量环形缓冲向 WASAPI 供给
 PCM；相邻音轨之间不会重建光盘数据源、连续流或音频会话。
 混合模式光盘遇到数据轨时会结束当前连续音频区间，避免把数据扇区当作声音播放。
 
@@ -105,4 +128,5 @@ PCM；相邻音轨之间不会重建光盘数据源、连续流或音频会话�
 当前默认使用兼容性更好的 WASAPI 共享模式，Windows 可能将音频 CD 的原生格式转换到
 设备混音格式。独占模式和端到端位精确输出仍属于后续工作。
 
-构建产物位于 `out/`，不会加入 Git。
+所有正式构建产物统一位于 `out/build/<preset>/`，不会加入 Git。根目录不保留编译中间文件；
+`make clean` 会删除整个 `out/`、旧版 `build/` 目录及 SDK 探测残留，随后可直接用 `make` 重新生成。
