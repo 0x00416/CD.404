@@ -2,6 +2,7 @@
 #include <cd404/audio/cdda_sector_source.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
+#include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/cd_text.hpp>
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -120,12 +122,23 @@ public:
     {
         using namespace cd404::audio;
 
+        if (forced_status_ != ReadStatus::ok) {
+            const ReadStatus status = std::exchange(forced_status_, ReadStatus::ok);
+            return {status, 0, 995};
+        }
+
         if (failures_remaining_ != 0) {
             --failures_remaining_;
             return {ReadStatus::io_error, 0, 123};
         }
 
         auto result = pattern_.read_sectors(start_lba, destination);
+        if (result.status == ReadStatus::ok && short_reads_remaining_ != 0) {
+            --short_reads_remaining_;
+            result.sectors_read = result.sectors_read == 0
+                ? 0
+                : result.sectors_read - 1;
+        }
         if (result.status == ReadStatus::ok && corruption_remaining_ != 0 &&
             start_lba == corruption_start_lba_ && !destination.empty()) {
             destination.front() ^= std::byte{0xff};
@@ -146,11 +159,23 @@ public:
         corruption_remaining_ = 1;
     }
 
+    void return_next_status(const cd404::audio::ReadStatus status) noexcept
+    {
+        forced_status_ = status;
+    }
+
+    void shorten_next_reads(const std::size_t count) noexcept
+    {
+        short_reads_remaining_ = count;
+    }
+
 private:
     PatternSectorSource pattern_;
     std::size_t failures_remaining_{};
     cd404::core::Sector corruption_start_lba_{};
     std::size_t corruption_remaining_{};
+    std::size_t short_reads_remaining_{};
+    cd404::audio::ReadStatus forced_status_{cd404::audio::ReadStatus::ok};
 };
 
 void expect(const bool condition, const std::string_view description)
@@ -556,6 +581,126 @@ void test_reliable_cdda_sector_source()
             bounded_source.statistics().device_reads == 2 &&
             bounded_source.statistics().retries == 1,
         "reliable source stops after the configured attempt limit");
+
+    FaultInjectingSectorSource short_source(0, 4);
+    short_source.shorten_next_reads(1);
+    audio::ReliableCddaSectorSource short_reliable(short_source);
+    std::array<std::byte, 2 * kSectorBytes> short_block{};
+    const auto short_result = short_reliable.read_sectors(0, short_block);
+    expect(
+        short_result.status == audio::ReadStatus::ok &&
+            short_result.sectors_read == 2 &&
+            short_reliable.statistics().device_reads == 2 &&
+            short_reliable.statistics().retries == 1,
+        "short successful device reads are rejected and retried");
+
+    FaultInjectingSectorSource cancelled_source(0, 4);
+    cancelled_source.return_next_status(audio::ReadStatus::cancelled);
+    audio::ReliableCddaSectorSource cancelled_reliable(cancelled_source);
+    std::array<std::byte, kSectorBytes> cancelled_block{};
+    const auto cancelled_result = cancelled_reliable.read_sectors(0, cancelled_block);
+    expect(
+        cancelled_result.status == audio::ReadStatus::cancelled &&
+            cancelled_reliable.statistics().device_reads == 1 &&
+            cancelled_reliable.statistics().retries == 0,
+        "cancellation is propagated immediately without retry");
+
+    FaultInjectingSectorSource unordered_source(0, 8);
+    audio::ReliableCddaSectorSource unordered_reliable(unordered_source);
+    std::array<std::byte, kSectorBytes> unordered_block{};
+    static_cast<void>(unordered_reliable.read_sectors(0, unordered_block));
+    static_cast<void>(unordered_reliable.read_sectors(4, unordered_block));
+    expect(
+        unordered_reliable.statistics().overlap_checks == 0 &&
+            unordered_reliable.statistics().device_reads == 2,
+        "non-sequential seeks do not compare unrelated overlap sectors");
+
+    FaultInjectingSectorSource unchecked_source(0, 4);
+    audio::ReliableCddaSectorSource unchecked_reliable(
+        unchecked_source,
+        audio::ReliableReadPolicy{3, false});
+    std::array<std::byte, kSectorBytes> unchecked_block{};
+    static_cast<void>(unchecked_reliable.read_sectors(0, unchecked_block));
+    static_cast<void>(unchecked_reliable.read_sectors(1, unchecked_block));
+    expect(
+        unchecked_reliable.statistics().overlap_checks == 0 &&
+            unchecked_reliable.statistics().device_reads == 2,
+        "overlap verification can be disabled explicitly");
+
+    FaultInjectingSectorSource invalid_source(0, 4);
+    audio::ReliableCddaSectorSource invalid_reliable(invalid_source);
+    const auto invalid_result = invalid_reliable.read_sectors(0, {});
+    expect(
+        invalid_result.status == audio::ReadStatus::invalid_request &&
+            invalid_reliable.statistics().logical_reads == 1 &&
+            invalid_reliable.statistics().device_reads == 0,
+        "invalid logical reads never reach the device source");
+}
+
+void test_playback_state_machine()
+{
+    using namespace cd404::audio;
+
+    PlaybackStateMachine completed;
+    expect(completed.state() == PlaybackState::idle, "playback starts idle");
+    expect(
+        !completed.apply(PlaybackEvent::prebuffer_ready) &&
+            completed.state() == PlaybackState::idle,
+        "invalid playback event leaves state unchanged");
+    expect(
+        completed.apply(PlaybackEvent::open) &&
+            completed.apply(PlaybackEvent::source_ready) &&
+            completed.apply(PlaybackEvent::prebuffer_ready) &&
+            completed.apply(PlaybackEvent::stream_ended) &&
+            completed.apply(PlaybackEvent::drain_completed) &&
+            completed.state() == PlaybackState::completed,
+        "normal playback reaches completed through buffering and draining");
+    expect(
+        completed.apply(PlaybackEvent::reset) &&
+            completed.state() == PlaybackState::idle,
+        "completed playback can reset for reuse");
+
+    PlaybackStateMachine cancelled;
+    expect(
+        cancelled.apply(PlaybackEvent::open) &&
+            cancelled.apply(PlaybackEvent::source_ready) &&
+            cancelled.apply(PlaybackEvent::stop_requested) &&
+            cancelled.apply(PlaybackEvent::cancellation_completed) &&
+            cancelled.state() == PlaybackState::cancelled,
+        "buffering playback stops through the explicit cancellation path");
+
+    PlaybackStateMachine playing_cancelled;
+    expect(
+        playing_cancelled.apply(PlaybackEvent::open) &&
+            playing_cancelled.apply(PlaybackEvent::source_ready) &&
+            playing_cancelled.apply(PlaybackEvent::prebuffer_ready) &&
+            playing_cancelled.apply(PlaybackEvent::stop_requested) &&
+            playing_cancelled.apply(PlaybackEvent::cancellation_completed) &&
+            playing_cancelled.state() == PlaybackState::cancelled,
+        "active playback can be cancelled without entering drain");
+
+    PlaybackStateMachine draining_cancelled;
+    expect(
+        draining_cancelled.apply(PlaybackEvent::open) &&
+            draining_cancelled.apply(PlaybackEvent::source_ready) &&
+            draining_cancelled.apply(PlaybackEvent::prebuffer_ready) &&
+            draining_cancelled.apply(PlaybackEvent::stream_ended) &&
+            draining_cancelled.apply(PlaybackEvent::stop_requested) &&
+            draining_cancelled.apply(PlaybackEvent::cancellation_completed) &&
+            draining_cancelled.state() == PlaybackState::cancelled,
+        "endpoint drain remains cancellable");
+
+    PlaybackStateMachine failed;
+    expect(
+        failed.apply(PlaybackEvent::open) &&
+            failed.apply(PlaybackEvent::failure) &&
+            failed.state() == PlaybackState::failed &&
+            !failed.apply(PlaybackEvent::drain_completed),
+        "opening failure is terminal until reset");
+    expect(
+        failed.apply(PlaybackEvent::reset) &&
+            failed.state() == PlaybackState::idle,
+        "failed playback can reset for a later session");
 }
 
 void test_cdda_pcm_conversion()
@@ -740,6 +885,7 @@ int main()
     test_gnudb_identity_and_entry();
     test_continuous_cdda_stream();
     test_reliable_cdda_sector_source();
+    test_playback_state_machine();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();
 

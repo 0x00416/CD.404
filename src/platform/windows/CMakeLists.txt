@@ -3,6 +3,7 @@ add_library(cd404_windows STATIC)
 target_sources(
     cd404_windows
     PRIVATE
+        src/cdda_playback_engine.cpp
         src/optical_drive.cpp
         src/http_client.cpp
         src/gnudb_client.cpp
@@ -15,6 +16,7 @@ target_sources(
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
+            include/cd404/platform/windows/cdda_playback_engine.hpp
             include/cd404/platform/windows/optical_drive.hpp
             include/cd404/platform/windows/gnudb_client.hpp
             include/cd404/platform/windows/itunes_client.hpp

@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 
 #include <cd404/core/cd_time.hpp>
+#include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/ui/main_window.hpp>
@@ -23,6 +24,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -39,6 +41,7 @@ constexpr wchar_t kWindowClassName[] = L"CD404.MainWindow";
 constexpr wchar_t kWindowTitle[] = L"CD.404";
 constexpr UINT kDiscReadyMessage = WM_APP + 1;
 constexpr UINT kMetadataReadyMessage = WM_APP + 2;
+constexpr UINT kPlaybackReadyMessage = WM_APP + 3;
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT kAnimationIntervalMs = 50;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
@@ -439,6 +442,9 @@ private:
             receive_online_metadata(
                 std::unique_ptr<OnlineMetadataSnapshot>(
                     reinterpret_cast<OnlineMetadataSnapshot*>(lparam)));
+            return 0;
+        case kPlaybackReadyMessage:
+            receive_playback_result(static_cast<std::uint64_t>(wparam));
             return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
@@ -2005,71 +2011,60 @@ private:
     void start_playback(const unsigned int offset_seconds)
     {
         if (selected_track_ >= disc_.tracks.size() ||
-            !disc_.tracks[selected_track_].is_audio) {
+            !disc_.tracks[selected_track_].is_audio || !disc_.drive) {
             return;
         }
         stop_playback();
 
-        const std::filesystem::path probe_path = playback_probe_path();
-        if (!std::filesystem::exists(probe_path)) {
-            ui_message_ = L"找不到播放组件，请重新构建完整程序";
-            ui_message_is_error_ = true;
-            return;
-        }
+        platform::windows::CddaPlaybackRequest request;
+        request.drive = disc_.drive;
+        request.track_number = disc_.tracks[selected_track_].number;
+        request.offset_frames =
+            static_cast<core::SampleFrame>(offset_seconds) *
+            core::kCdSampleFramesPerSecond;
+        request.maximum_frames.reset();
 
-        std::wstring command = std::format(
-            L"\"{}\" --track {} --all",
-            probe_path.wstring(),
-            disc_.tracks[selected_track_].number);
-        if (offset_seconds != 0) {
-            command += std::format(L" --offset-seconds {}", offset_seconds);
+        const std::uint64_t generation = playback_generation_;
+        const HWND target_window = window_;
+        {
+            std::scoped_lock lock(playback_result_mutex_);
+            playback_result_.reset();
         }
-
-        STARTUPINFOW startup{};
-        startup.cb = sizeof(startup);
-        startup.dwFlags = STARTF_USESHOWWINDOW;
-        startup.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION process{};
-        if (CreateProcessW(
-                nullptr,
-                command.data(),
-                nullptr,
-                nullptr,
-                FALSE,
-                CREATE_NO_WINDOW,
-                nullptr,
-                probe_path.parent_path().c_str(),
-                &startup,
-                &process) == FALSE) {
-            ui_message_ = L"无法启动播放组件：" +
-                          platform::windows::format_system_error(GetLastError());
-            ui_message_is_error_ = true;
-            return;
-        }
-
-        CloseHandle(process.hThread);
-        playback_process_ = process.hProcess;
         playback_active_ = true;
         playback_start_track_ = selected_track_;
-        playback_start_offset_seconds_ = offset_seconds;
-        playback_started_at_ = GetTickCount64();
+        playback_start_offset_frames_ = request.offset_frames;
         playback_track_seconds_ = static_cast<double>(offset_seconds);
         ui_message_.clear();
         ui_message_is_error_ = false;
+        playback_worker_ = std::jthread([
+            this,
+            target_window,
+            request = std::move(request),
+            generation] {
+            auto result = playback_engine_.play(request);
+            {
+                std::scoped_lock lock(playback_result_mutex_);
+                playback_result_ = std::move(result);
+            }
+            static_cast<void>(PostMessageW(
+                target_window,
+                kPlaybackReadyMessage,
+                static_cast<WPARAM>(generation),
+                0));
+        });
         InvalidateRect(window_, nullptr, FALSE);
     }
 
     void stop_playback()
     {
-        if (playback_process_ != nullptr) {
-            DWORD exit_code{};
-            if (GetExitCodeProcess(playback_process_, &exit_code) != FALSE &&
-                exit_code == STILL_ACTIVE) {
-                static_cast<void>(TerminateProcess(playback_process_, 130));
-                static_cast<void>(WaitForSingleObject(playback_process_, 1'000));
-            }
-            CloseHandle(playback_process_);
-            playback_process_ = nullptr;
+        ++playback_generation_;
+        if (playback_worker_.joinable()) {
+            playback_engine_.request_stop();
+            playback_worker_.join();
+        }
+        {
+            std::scoped_lock lock(playback_result_mutex_);
+            playback_result_.reset();
         }
         playback_active_ = false;
         playback_track_seconds_ = 0.0;
@@ -2080,40 +2075,96 @@ private:
 
     void update_playback_clock()
     {
-        if (!playback_active_ || playback_process_ == nullptr) {
+        if (!playback_active_) {
             return;
         }
 
-        DWORD exit_code{};
-        if (GetExitCodeProcess(playback_process_, &exit_code) == FALSE ||
-            exit_code != STILL_ACTIVE) {
-            CloseHandle(playback_process_);
-            playback_process_ = nullptr;
-            playback_active_ = false;
-            return;
-        }
-
-        const double elapsed = static_cast<double>(GetTickCount64() - playback_started_at_) /
-                               1'000.0;
-        double disc_seconds = elapsed +
-                              static_cast<double>(playback_start_offset_seconds_);
+        const auto progress = playback_engine_.progress();
+        core::SampleFrame track_frame =
+            playback_start_offset_frames_ + progress.frames_rendered;
         std::size_t track_index = playback_start_track_;
+        std::optional<std::size_t> last_audio_track;
         while (track_index < disc_.tracks.size()) {
             if (!disc_.tracks[track_index].is_audio) {
                 break;
             }
-            const double duration = static_cast<double>(
-                disc_.tracks[track_index].frame_count) /
-                static_cast<double>(core::kCdSampleFramesPerSecond);
-            if (disc_seconds < duration) {
+            last_audio_track = track_index;
+            const core::SampleFrame duration = disc_.tracks[track_index].frame_count;
+            if (track_frame < duration) {
                 selected_track_ = track_index;
-                playback_track_seconds_ = disc_seconds;
+                playback_track_seconds_ = static_cast<double>(track_frame) /
+                    static_cast<double>(core::kCdSampleFramesPerSecond);
                 ensure_selected_track_visible();
                 return;
             }
-            disc_seconds -= duration;
+            track_frame -= duration;
             ++track_index;
         }
+        if (last_audio_track) {
+            selected_track_ = *last_audio_track;
+            playback_track_seconds_ = static_cast<double>(
+                disc_.tracks[*last_audio_track].frame_count) /
+                static_cast<double>(core::kCdSampleFramesPerSecond);
+            ensure_selected_track_visible();
+        }
+    }
+
+    void receive_playback_result(const std::uint64_t generation)
+    {
+        if (generation != playback_generation_) {
+            return;
+        }
+        if (playback_worker_.joinable()) {
+            playback_worker_.join();
+        }
+
+        std::optional<platform::windows::CddaPlaybackResult> result;
+        {
+            std::scoped_lock lock(playback_result_mutex_);
+            result = std::move(playback_result_);
+            playback_result_.reset();
+        }
+        if (!result) {
+            return;
+        }
+
+        update_playback_clock();
+        playback_active_ = false;
+        if (!result->succeeded() &&
+            result->error != platform::windows::CddaPlaybackError::cancelled) {
+            set_playback_error(*result);
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void set_playback_error(
+        const platform::windows::CddaPlaybackResult& result)
+    {
+        using platform::windows::CddaPlaybackError;
+
+        switch (result.error) {
+        case CddaPlaybackError::no_ready_audio_cd:
+            ui_message_ = L"当前光盘已不可用";
+            break;
+        case CddaPlaybackError::source_open_failed:
+        case CddaPlaybackError::read_failed:
+            ui_message_ = L"读取光盘失败：" +
+                platform::windows::format_system_error(result.system_error);
+            break;
+        case CddaPlaybackError::endpoint_underrun:
+            ui_message_ = L"光驱供给不足，播放已停止";
+            break;
+        case CddaPlaybackError::output_open_failed:
+        case CddaPlaybackError::output_failed:
+            ui_message_ = std::format(
+                L"音频设备错误：0x{:08X}",
+                static_cast<std::uint32_t>(result.audio_status));
+            break;
+        default:
+            ui_message_ = L"播放未能完成";
+            break;
+        }
+        ui_message_is_error_ = true;
     }
 
     [[nodiscard]] float playback_progress() const
@@ -2165,21 +2216,6 @@ private:
             ui_message_is_error_ = false;
         }
         InvalidateRect(window_, nullptr, FALSE);
-    }
-
-    [[nodiscard]] std::filesystem::path playback_probe_path() const
-    {
-        std::wstring module_path(32'768, L'\0');
-        const DWORD length = GetModuleFileNameW(
-            nullptr,
-            module_path.data(),
-            static_cast<DWORD>(module_path.size()));
-        module_path.resize(length);
-        const std::filesystem::path app_directory =
-            std::filesystem::path(module_path).parent_path();
-        return app_directory.parent_path() /
-               L"playback" /
-               L"CD.404.Playback.exe";
     }
 
     [[nodiscard]] float pixel_to_dip(const int pixel) const
@@ -2235,11 +2271,14 @@ private:
     int wheel_delta_remainder_{};
     bool scrollbar_dragging_{};
     float scrollbar_drag_offset_{};
-    HANDLE playback_process_{};
+    platform::windows::CddaPlaybackEngine playback_engine_;
+    std::jthread playback_worker_;
+    std::mutex playback_result_mutex_;
+    std::optional<platform::windows::CddaPlaybackResult> playback_result_;
+    std::uint64_t playback_generation_{};
     bool playback_active_{};
     std::size_t playback_start_track_{};
-    unsigned int playback_start_offset_seconds_{};
-    ULONGLONG playback_started_at_{};
+    core::SampleFrame playback_start_offset_frames_{};
     double playback_track_seconds_{};
     std::wstring ui_message_;
     bool ui_message_is_error_{};
