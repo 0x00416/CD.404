@@ -8,9 +8,11 @@ target_sources(
         src/http_client.cpp
         src/gnudb_client.cpp
         src/itunes_client.cpp
+        src/listenbrainz_reporter.cpp
         src/musicbrainz_client.cpp
         src/online_metadata.cpp
         src/raw_cdda_sector_source.cpp
+        src/system_media_controls.cpp
         src/wasapi_output.cpp
     PUBLIC
         FILE_SET HEADERS
@@ -20,9 +22,11 @@ target_sources(
             include/cd404/platform/windows/optical_drive.hpp
             include/cd404/platform/windows/gnudb_client.hpp
             include/cd404/platform/windows/itunes_client.hpp
+            include/cd404/platform/windows/listenbrainz_reporter.hpp
             include/cd404/platform/windows/musicbrainz_client.hpp
             include/cd404/platform/windows/online_metadata.hpp
             include/cd404/platform/windows/raw_cdda_sector_source.hpp
+            include/cd404/platform/windows/system_media_controls.hpp
             include/cd404/platform/windows/wasapi_output.hpp
 )
 
@@ -33,8 +37,10 @@ target_link_libraries(
     PUBLIC
         cd404::audio
         cd404::disc
+        cd404::listenbrainz
     PRIVATE
         kernel32
+        advapi32
         ole32
         shell32
         shlwapi

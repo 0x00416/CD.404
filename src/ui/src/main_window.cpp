@@ -5,13 +5,17 @@
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <commctrl.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
 #include <cd404/core/cd_time.hpp>
+#include <cd404/listenbrainz/playback_tracker.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
+#include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
+#include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/ui/main_window.hpp>
 
 #include <algorithm>
@@ -42,6 +46,10 @@ constexpr wchar_t kWindowTitle[] = L"CD.404";
 constexpr UINT kDiscReadyMessage = WM_APP + 1;
 constexpr UINT kMetadataReadyMessage = WM_APP + 2;
 constexpr UINT kPlaybackReadyMessage = WM_APP + 3;
+constexpr UINT kSystemMediaRequestMessage = WM_APP + 4;
+constexpr UINT kSettingsSaveMessage = WM_APP + 5;
+constexpr UINT kSettingsCloseMessage = WM_APP + 6;
+constexpr int kSettingsTokenEditId = 1'001;
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT kAnimationIntervalMs = 50;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
@@ -79,6 +87,12 @@ constexpr float kMinimumHeight = 600.0F;
 {
     const auto seconds = frame_count / core::kCdSampleFramesPerSecond;
     return std::format(L"{}:{:02}", seconds / 60, seconds % 60);
+}
+
+[[nodiscard]] std::int64_t unix_time_now() noexcept
+{
+    return static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now()));
 }
 
 [[nodiscard]] std::wstring to_wstring(const std::u16string_view text)
@@ -204,24 +218,46 @@ struct Layout final {
     float height{};
     D2D1_RECT_F refresh_button{};
     D2D1_RECT_F eject_button{};
+    D2D1_RECT_F settings_button{};
     D2D1_RECT_F cover{};
     D2D1_RECT_F track_list{};
     D2D1_RECT_F progress_hit{};
     D2D1_RECT_F previous_button{};
     D2D1_RECT_F play_button{};
     D2D1_RECT_F next_button{};
+    D2D1_RECT_F volume_hit{};
+    D2D1_RECT_F settings_page{};
+    D2D1_RECT_F settings_listenbrainz_card{};
+    D2D1_RECT_F settings_audio_card{};
+    D2D1_RECT_F settings_back{};
+    D2D1_RECT_F settings_edit{};
+    D2D1_RECT_F settings_save{};
+    D2D1_RECT_F settings_clear{};
 };
 
 class MainWindow final {
 public:
-    explicit MainWindow(HINSTANCE instance) noexcept : instance_(instance) {}
+    explicit MainWindow(HINSTANCE instance)
+        : instance_(instance),
+          listenbrainz_tracker_([this](const listenbrainz::Submission& submission) {
+              listenbrainz_reporter_.submit(submission);
+          })
+    {
+    }
 
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator=(const MainWindow&) = delete;
 
     ~MainWindow()
     {
+        close_settings();
         stop_playback();
+        if (settings_font_ != nullptr) {
+            DeleteObject(settings_font_);
+        }
+        if (settings_edit_brush_ != nullptr) {
+            DeleteObject(settings_edit_brush_);
+        }
     }
 
     [[nodiscard]] bool create(const int show_command)
@@ -274,6 +310,16 @@ public:
         if (window_ == nullptr) {
             return false;
         }
+
+        static_cast<void>(system_media_controls_.initialize(
+            window_,
+            [target_window = window_](const platform::windows::SystemMediaRequest request) {
+                static_cast<void>(PostMessageW(
+                    target_window,
+                    kSystemMediaRequestMessage,
+                    static_cast<WPARAM>(request.command),
+                    static_cast<LPARAM>(request.position_milliseconds)));
+            }));
 
         apply_window_materials();
         ShowWindow(window_, show_command);
@@ -367,6 +413,10 @@ private:
             return 0;
         }
         case WM_MOUSEMOVE:
+            if (volume_dragging_) {
+                set_volume_from_point(pixel_to_dip(GET_X_LPARAM(lparam)));
+                return 0;
+            }
             if (scrollbar_dragging_) {
                 update_scrollbar_drag(D2D1::Point2F(
                     pixel_to_dip(GET_X_LPARAM(lparam)),
@@ -384,6 +434,9 @@ private:
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_MOUSEWHEEL:
+            if (active_page_ == AppPage::settings) {
+                return 0;
+            }
             handle_mouse_wheel(
                 GET_WHEEL_DELTA_WPARAM(wparam),
                 GET_X_LPARAM(lparam),
@@ -391,6 +444,20 @@ private:
             return 0;
         case WM_LBUTTONDOWN:
             SetFocus(window_);
+            if (active_page_ == AppPage::settings) {
+                handle_settings_click(D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))));
+                return 0;
+            }
+            if (contains(layout_.volume_hit, D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))))) {
+                volume_dragging_ = true;
+                SetCapture(window_);
+                set_volume_from_point(pixel_to_dip(GET_X_LPARAM(lparam)));
+                return 0;
+            }
             if (handle_scrollbar_press(D2D1::Point2F(
                     pixel_to_dip(GET_X_LPARAM(lparam)),
                     pixel_to_dip(GET_Y_LPARAM(lparam))))) {
@@ -401,6 +468,11 @@ private:
                 pixel_to_dip(GET_Y_LPARAM(lparam))));
             return 0;
         case WM_LBUTTONUP:
+            if (volume_dragging_) {
+                volume_dragging_ = false;
+                ReleaseCapture();
+                return 0;
+            }
             if (scrollbar_dragging_) {
                 scrollbar_dragging_ = false;
                 ReleaseCapture();
@@ -408,15 +480,30 @@ private:
             }
             break;
         case WM_CAPTURECHANGED:
+            volume_dragging_ = false;
             scrollbar_dragging_ = false;
             return 0;
         case WM_LBUTTONDBLCLK:
+            if (active_page_ == AppPage::settings) {
+                handle_settings_click(D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))));
+                return 0;
+            }
             handle_double_click(D2D1::Point2F(
                 pixel_to_dip(GET_X_LPARAM(lparam)),
                 pixel_to_dip(GET_Y_LPARAM(lparam))));
             return 0;
         case WM_KEYDOWN:
             return handle_key_down(wparam);
+        case WM_CTLCOLOREDIT:
+            if (reinterpret_cast<HWND>(lparam) == settings_token_edit_) {
+                const auto device_context = reinterpret_cast<HDC>(wparam);
+                SetTextColor(device_context, RGB(242, 244, 248));
+                SetBkColor(device_context, RGB(29, 33, 42));
+                return reinterpret_cast<LRESULT>(settings_edit_brush_);
+            }
+            break;
         case WM_SETCURSOR:
             if (LOWORD(lparam) == HTCLIENT &&
                 (hovered_track_ || hovered_control_ != HoveredControl::none)) {
@@ -446,6 +533,18 @@ private:
         case kPlaybackReadyMessage:
             receive_playback_result(static_cast<std::uint64_t>(wparam));
             return 0;
+        case kSystemMediaRequestMessage:
+            handle_system_media_request(platform::windows::SystemMediaRequest{
+                static_cast<platform::windows::SystemMediaCommand>(wparam),
+                static_cast<std::uint64_t>(lparam),
+            });
+            return 0;
+        case kSettingsSaveMessage:
+            save_settings();
+            return 0;
+        case kSettingsCloseMessage:
+            close_settings();
+            return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
             stop_playback();
@@ -461,10 +560,17 @@ private:
         none,
         refresh,
         eject,
+        settings,
         previous,
         play,
         next,
         progress,
+        volume,
+    };
+
+    enum class AppPage {
+        player,
+        settings,
     };
 
     enum class ControlIcon {
@@ -472,8 +578,10 @@ private:
         eject,
         previous,
         play,
+        pause,
         stop,
         next,
+        settings,
     };
 
     [[nodiscard]] HRESULT create_independent_resources()
@@ -533,6 +641,12 @@ private:
         }
         if (SUCCEEDED(result)) {
             result = create_text_format(
+                14.0F,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                button_format_);
+        }
+        if (SUCCEEDED(result)) {
+            result = create_text_format(
                 15.0F,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 track_format_);
@@ -567,6 +681,8 @@ private:
 
         icon_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         icon_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        button_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        button_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         caption_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         caption_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         track_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -770,11 +886,16 @@ private:
         const float cover_top = top + 52.0F;
 
         result.refresh_button = D2D1::RectF(
+            size.width - 160.0F,
+            12.0F,
+            size.width - 120.0F,
+            52.0F);
+        result.eject_button = D2D1::RectF(
             size.width - 112.0F,
             12.0F,
             size.width - 72.0F,
             52.0F);
-        result.eject_button = D2D1::RectF(
+        result.settings_button = D2D1::RectF(
             size.width - 64.0F,
             12.0F,
             size.width - 24.0F,
@@ -812,6 +933,49 @@ private:
             controls_y - 20.0F,
             center + 96.0F,
             controls_y + 20.0F);
+        const float volume_right = size.width - 24.0F;
+        const float volume_left = std::max(size.width * 0.77F, volume_right - 164.0F);
+        result.volume_hit = D2D1::RectF(
+            volume_left - 4.0F,
+            controls_y - 16.0F,
+            volume_right + 4.0F,
+            controls_y + 16.0F);
+
+        result.settings_page = D2D1::RectF(
+            margin,
+            84.0F,
+            size.width - margin,
+            size.height - 24.0F);
+        result.settings_back = D2D1::RectF(
+            size.width - margin - 132.0F,
+            88.0F,
+            size.width - margin,
+            128.0F);
+        result.settings_listenbrainz_card = D2D1::RectF(
+            margin,
+            148.0F,
+            size.width - margin,
+            342.0F);
+        result.settings_audio_card = D2D1::RectF(
+            margin,
+            362.0F,
+            size.width - margin,
+            std::min(size.height - 24.0F, 548.0F));
+        result.settings_edit = D2D1::RectF(
+            result.settings_listenbrainz_card.left + 24.0F,
+            result.settings_listenbrainz_card.top + 112.0F,
+            result.settings_listenbrainz_card.right - 224.0F,
+            result.settings_listenbrainz_card.top + 156.0F);
+        result.settings_clear = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 208.0F,
+            result.settings_listenbrainz_card.top + 112.0F,
+            result.settings_listenbrainz_card.right - 112.0F,
+            result.settings_listenbrainz_card.top + 156.0F);
+        result.settings_save = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 104.0F,
+            result.settings_listenbrainz_card.top + 112.0F,
+            result.settings_listenbrainz_card.right - 24.0F,
+            result.settings_listenbrainz_card.top + 156.0F);
         return result;
     }
 
@@ -825,8 +989,13 @@ private:
             render_target_->Clear(color(0x0C0E12));
             layout_ = calculate_layout();
             draw_header();
-            draw_content();
-            draw_transport();
+            if (active_page_ == AppPage::settings) {
+                update_settings_edit_bounds();
+                draw_settings_page();
+            } else {
+                draw_content();
+                draw_transport();
+            }
             const HRESULT result = render_target_->EndDraw();
             if (result == D2DERR_RECREATE_TARGET) {
                 discard_device_resources();
@@ -887,11 +1056,11 @@ private:
 
         const float status_left = device_right + 18.0F;
         if ((disc_loading_ || disc_.tracks.empty()) &&
-            status_left < layout_.width - 130.0F) {
+            status_left < layout_.width - 178.0F) {
             draw_text(
                 disc_loading_ ? L"正在读取目录…" : disc_.status,
                 small_format_.Get(),
-                D2D1::RectF(status_left, 21.0F, layout_.width - 132.0F, 48.0F),
+                D2D1::RectF(status_left, 21.0F, layout_.width - 180.0F, 48.0F),
                 secondary_brush_.Get());
         }
 
@@ -905,6 +1074,12 @@ private:
             ControlIcon::eject,
             hovered_control_ == HoveredControl::eject,
             disc_.drive.has_value());
+        draw_icon_button(
+            layout_.settings_button,
+            ControlIcon::settings,
+            hovered_control_ == HoveredControl::settings ||
+                active_page_ == AppPage::settings,
+            true);
     }
 
     void draw_content()
@@ -1279,6 +1454,28 @@ private:
                     2.0F),
                 accent_brush_.Get());
         }
+        const core::SampleFrame current_track_frames =
+            static_cast<core::SampleFrame>(
+                playback_track_seconds_ *
+                static_cast<double>(core::kCdSampleFramesPerSecond));
+        const core::SampleFrame selected_duration =
+            selected_track_ < disc_.tracks.size()
+                ? disc_.tracks[selected_track_].frame_count
+                : 0;
+        draw_text(
+            format_duration(std::clamp<core::SampleFrame>(
+                current_track_frames,
+                0,
+                selected_duration)),
+            caption_format_.Get(),
+            D2D1::RectF(left, progress_y + 7.0F, left + 90.0F, progress_y + 27.0F),
+            muted_brush_.Get());
+        draw_text(
+            format_duration(selected_duration),
+            caption_format_.Get(),
+            D2D1::RectF(right - 90.0F, progress_y + 7.0F, right, progress_y + 27.0F),
+            muted_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
 
         const float content_center_y =
             (layout_.play_button.top + layout_.play_button.bottom) * 0.5F;
@@ -1317,7 +1514,7 @@ private:
             false);
         draw_round_control(
             layout_.play_button,
-            playback_active_ ? ControlIcon::stop : ControlIcon::play,
+            playback_active_ ? ControlIcon::pause : ControlIcon::play,
             hovered_control_ == HoveredControl::play,
             true);
         draw_round_control(
@@ -1326,8 +1523,8 @@ private:
             hovered_control_ == HoveredControl::next,
             false);
 
-        const float volume_right = layout_.width - 28.0F;
-        const float volume_left = std::max(layout_.width * 0.77F, volume_right - 160.0F);
+        const float volume_left = layout_.volume_hit.left + 4.0F;
+        const float volume_right = layout_.volume_hit.right - 4.0F;
         const float volume_center_y =
             (layout_.play_button.top + layout_.play_button.bottom) * 0.5F;
         draw_text(
@@ -1354,11 +1551,15 @@ private:
                 D2D1::RectF(
                     volume_left,
                     volume_center_y - 2.0F,
-                    volume_left + (volume_right - volume_left) * 0.72F,
+                    volume_left + (volume_right - volume_left) * volume_,
                     volume_center_y + 2.0F),
                 2.0F,
                 2.0F),
-            secondary_brush_.Get());
+            accent_brush_.Get());
+        const float volume_x = volume_left + (volume_right - volume_left) * volume_;
+        render_target_->FillEllipse(
+            D2D1::Ellipse(D2D1::Point2F(volume_x, volume_center_y), 5.0F, 5.0F),
+            text_brush_.Get());
 
         if (!ui_message_.empty()) {
             draw_text(
@@ -1468,6 +1669,28 @@ private:
                     1.5F),
                 brush);
             break;
+        case ControlIcon::pause:
+            render_target_->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(
+                        center.x - 6.5F,
+                        center.y - 7.0F,
+                        center.x - 2.0F,
+                        center.y + 7.0F),
+                    1.0F,
+                    1.0F),
+                brush);
+            render_target_->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(
+                        center.x + 2.0F,
+                        center.y - 7.0F,
+                        center.x + 6.5F,
+                        center.y + 7.0F),
+                    1.0F,
+                    1.0F),
+                brush);
+            break;
         case ControlIcon::previous:
             render_target_->DrawLine(
                 D2D1::Point2F(center.x - 6.5F, center.y - half),
@@ -1539,6 +1762,30 @@ private:
                 brush);
             break;
         }
+        case ControlIcon::settings:
+            render_target_->DrawEllipse(
+                D2D1::Ellipse(center, 6.0F, 6.0F),
+                brush,
+                2.0F);
+            render_target_->DrawEllipse(
+                D2D1::Ellipse(center, 2.0F, 2.0F),
+                brush,
+                1.5F);
+            for (int tooth = 0; tooth < 8; ++tooth) {
+                const float angle = static_cast<float>(tooth) * 3.14159265F / 4.0F;
+                const float cosine = std::cos(angle);
+                const float sine = std::sin(angle);
+                render_target_->DrawLine(
+                    D2D1::Point2F(
+                        center.x + cosine * 7.5F,
+                        center.y + sine * 7.5F),
+                    D2D1::Point2F(
+                        center.x + cosine * 10.0F,
+                        center.y + sine * 10.0F),
+                    brush,
+                    2.0F);
+            }
+            break;
         }
     }
 
@@ -1625,6 +1872,7 @@ private:
         selected_track_ = first_audio_track();
         scroll_row_ = 0;
         InvalidateRect(window_, nullptr, FALSE);
+        sync_system_media(true);
         start_online_metadata_lookup();
     }
 
@@ -1715,6 +1963,7 @@ private:
                 disc_.tracks[index].artist = metadata.track_artists[index];
             }
         }
+        sync_system_media(true);
         InvalidateRect(window_, nullptr, FALSE);
     }
 
@@ -1739,6 +1988,17 @@ private:
             tracking_mouse_ = TrackMouseEvent(&tracking) != FALSE;
         }
 
+        if (active_page_ == AppPage::settings) {
+            const bool changed = hovered_track_.has_value() ||
+                hovered_control_ != HoveredControl::none;
+            hovered_track_.reset();
+            hovered_control_ = HoveredControl::none;
+            if (changed) {
+                InvalidateRect(window_, nullptr, FALSE);
+            }
+            return;
+        }
+
         const auto previous_track = hovered_track_;
         const auto previous_control = hovered_control_;
         hovered_track_.reset();
@@ -1758,10 +2018,12 @@ private:
     {
         if (contains(layout_.refresh_button, point)) return HoveredControl::refresh;
         if (contains(layout_.eject_button, point)) return HoveredControl::eject;
+        if (contains(layout_.settings_button, point)) return HoveredControl::settings;
         if (contains(layout_.previous_button, point)) return HoveredControl::previous;
         if (contains(layout_.play_button, point)) return HoveredControl::play;
         if (contains(layout_.next_button, point)) return HoveredControl::next;
         if (contains(layout_.progress_hit, point)) return HoveredControl::progress;
+        if (contains(layout_.volume_hit, point)) return HoveredControl::volume;
         return HoveredControl::none;
     }
 
@@ -1771,6 +2033,7 @@ private:
             if (contains(hit.rectangle, point)) {
                 selected_track_ = hit.track_index;
                 ensure_selected_track_visible();
+                sync_system_media(true);
                 InvalidateRect(window_, nullptr, FALSE);
                 return;
             }
@@ -1783,6 +2046,9 @@ private:
         case HoveredControl::eject:
             eject_disc();
             break;
+        case HoveredControl::settings:
+            open_settings();
+            break;
         case HoveredControl::previous:
             select_relative_track(-1);
             break;
@@ -1794,6 +2060,9 @@ private:
             break;
         case HoveredControl::progress:
             seek_from_point(point.x);
+            break;
+        case HoveredControl::volume:
+            set_volume_from_point(point.x);
             break;
         case HoveredControl::none:
             break;
@@ -1813,6 +2082,14 @@ private:
 
     LRESULT handle_key_down(const WPARAM key)
     {
+        if (active_page_ == AppPage::settings) {
+            if (key == VK_ESCAPE) {
+                close_settings();
+            } else if (key == VK_RETURN) {
+                save_settings();
+            }
+            return 0;
+        }
         switch (key) {
         case VK_SPACE:
         case VK_RETURN:
@@ -1827,6 +2104,7 @@ private:
         case VK_HOME:
             selected_track_ = first_audio_track();
             ensure_selected_track_visible();
+            sync_system_media(true);
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case VK_END:
@@ -1870,6 +2148,12 @@ private:
         const D2D1_POINT_2F point = D2D1::Point2F(
             pixel_to_dip(client_point.x),
             pixel_to_dip(client_point.y));
+        if (contains(layout_.volume_hit, point)) {
+            const float steps = static_cast<float>(wheel_delta) /
+                static_cast<float>(WHEEL_DELTA);
+            set_volume(volume_ + steps * 0.05F);
+            return;
+        }
         if (!contains(layout_.track_list, point)) {
             return;
         }
@@ -1967,6 +2251,7 @@ private:
                 stop_playback();
                 selected_track_ = static_cast<std::size_t>(index);
                 ensure_selected_track_visible();
+                sync_system_media(true);
                 InvalidateRect(window_, nullptr, FALSE);
                 return;
             }
@@ -1980,6 +2265,7 @@ private:
                 stop_playback();
                 selected_track_ = index - 1;
                 ensure_selected_track_visible();
+                sync_system_media(true);
                 InvalidateRect(window_, nullptr, FALSE);
                 return;
             }
@@ -2002,19 +2288,27 @@ private:
     void toggle_playback()
     {
         if (playback_active_) {
-            stop_playback();
+            pause_playback();
         } else {
-            start_playback(0);
+            const unsigned int offset = playback_paused_
+                ? static_cast<unsigned int>(playback_track_seconds_)
+                : 0U;
+            start_playback(offset);
         }
     }
 
-    void start_playback(const unsigned int offset_seconds)
+    void start_playback(
+        const unsigned int offset_seconds,
+        const bool preserve_listen_session = false)
     {
         if (selected_track_ >= disc_.tracks.size() ||
             !disc_.tracks[selected_track_].is_audio || !disc_.drive) {
             return;
         }
-        stop_playback();
+        const bool resume_session =
+            (playback_paused_ || preserve_listen_session) &&
+            listenbrainz_tracker_.active();
+        stop_playback(resume_session, resume_session);
 
         platform::windows::CddaPlaybackRequest request;
         request.drive = disc_.drive;
@@ -2023,6 +2317,9 @@ private:
             static_cast<core::SampleFrame>(offset_seconds) *
             core::kCdSampleFramesPerSecond;
         request.maximum_frames.reset();
+        if (resume_session) {
+            listenbrainz_tracker_.seek(request.offset_frames);
+        }
 
         const std::uint64_t generation = playback_generation_;
         const HWND target_window = window_;
@@ -2031,11 +2328,16 @@ private:
             playback_result_.reset();
         }
         playback_active_ = true;
+        playback_paused_ = false;
         playback_start_track_ = selected_track_;
         playback_start_offset_frames_ = request.offset_frames;
         playback_track_seconds_ = static_cast<double>(offset_seconds);
         ui_message_.clear();
         ui_message_is_error_ = false;
+        playback_engine_.set_volume(volume_);
+        system_media_controls_.set_playback_state(
+            platform::windows::SystemMediaPlaybackState::playing);
+        sync_system_media(true);
         playback_worker_ = std::jthread([
             this,
             target_window,
@@ -2055,8 +2357,16 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
-    void stop_playback()
+    void stop_playback(
+        const bool preserve_position = false,
+        const bool preserve_listen_session = false)
     {
+        if (playback_active_) {
+            update_playback_clock();
+        }
+        if (!preserve_listen_session) {
+            listenbrainz_tracker_.end();
+        }
         ++playback_generation_;
         if (playback_worker_.joinable()) {
             playback_engine_.request_stop();
@@ -2067,7 +2377,15 @@ private:
             playback_result_.reset();
         }
         playback_active_ = false;
-        playback_track_seconds_ = 0.0;
+        if (!preserve_position) {
+            playback_paused_ = false;
+            playback_track_seconds_ = 0.0;
+        }
+        system_media_controls_.set_playback_state(
+            preserve_position
+                ? platform::windows::SystemMediaPlaybackState::paused
+                : platform::windows::SystemMediaPlaybackState::stopped);
+        sync_system_media(true);
         if (window_ != nullptr) {
             InvalidateRect(window_, nullptr, FALSE);
         }
@@ -2095,6 +2413,8 @@ private:
                 playback_track_seconds_ = static_cast<double>(track_frame) /
                     static_cast<double>(core::kCdSampleFramesPerSecond);
                 ensure_selected_track_visible();
+                update_listenbrainz_tracker(track_index, track_frame, progress.state);
+                sync_system_media(false);
                 return;
             }
             track_frame -= duration;
@@ -2106,7 +2426,12 @@ private:
                 disc_.tracks[*last_audio_track].frame_count) /
                 static_cast<double>(core::kCdSampleFramesPerSecond);
             ensure_selected_track_visible();
+            update_listenbrainz_tracker(
+                *last_audio_track,
+                disc_.tracks[*last_audio_track].frame_count,
+                progress.state);
         }
+        sync_system_media(false);
     }
 
     void receive_playback_result(const std::uint64_t generation)
@@ -2129,7 +2454,12 @@ private:
         }
 
         update_playback_clock();
+        listenbrainz_tracker_.end();
         playback_active_ = false;
+        playback_paused_ = false;
+        system_media_controls_.set_playback_state(
+            platform::windows::SystemMediaPlaybackState::stopped);
+        sync_system_media(true);
         if (!result->succeeded() &&
             result->error != platform::windows::CddaPlaybackError::cancelled) {
             set_playback_error(*result);
@@ -2194,7 +2524,549 @@ private:
             core::kCdSampleFramesPerSecond);
         const unsigned int offset = static_cast<unsigned int>(
             std::floor(static_cast<float>(total_seconds) * ratio));
-        start_playback(std::min(offset, total_seconds > 0 ? total_seconds - 1 : 0));
+        start_playback(
+            std::min(offset, total_seconds > 0 ? total_seconds - 1 : 0),
+            true);
+    }
+
+    void set_volume(const float volume)
+    {
+        volume_ = std::clamp(volume, 0.0F, 1.0F);
+        playback_engine_.set_volume(volume_);
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void set_volume_from_point(const float x)
+    {
+        const float left = layout_.volume_hit.left + 4.0F;
+        const float right = layout_.volume_hit.right - 4.0F;
+        if (right <= left) {
+            return;
+        }
+        set_volume((x - left) / (right - left));
+    }
+
+    void pause_playback()
+    {
+        if (!playback_active_) {
+            return;
+        }
+        stop_playback(true, true);
+        playback_paused_ = true;
+        system_media_controls_.set_playback_state(
+            platform::windows::SystemMediaPlaybackState::paused);
+    }
+
+    void handle_system_media_request(
+        const platform::windows::SystemMediaRequest request)
+    {
+        using platform::windows::SystemMediaCommand;
+
+        switch (request.command) {
+        case SystemMediaCommand::play:
+            if (!playback_active_) {
+                const unsigned int offset = playback_paused_
+                    ? static_cast<unsigned int>(playback_track_seconds_)
+                    : 0U;
+                start_playback(offset);
+            }
+            break;
+        case SystemMediaCommand::pause:
+            pause_playback();
+            break;
+        case SystemMediaCommand::stop:
+            stop_playback();
+            break;
+        case SystemMediaCommand::previous:
+            select_relative_track(-1);
+            start_playback(0);
+            break;
+        case SystemMediaCommand::next:
+            select_relative_track(1);
+            start_playback(0);
+            break;
+        case SystemMediaCommand::seek:
+            start_playback(static_cast<unsigned int>(
+                std::min<std::uint64_t>(
+                    request.position_milliseconds / 1'000U,
+                    86'400U)),
+                true);
+            break;
+        }
+    }
+
+    [[nodiscard]] listenbrainz::TrackMetadata listen_metadata(
+        const std::size_t track_index) const
+    {
+        if (track_index >= disc_.tracks.size()) {
+            return {};
+        }
+        const auto& track = disc_.tracks[track_index];
+        return {
+            track.number,
+            track.title,
+            track.artist.empty() ? disc_.album_artist : track.artist,
+            disc_.album_title,
+            track.frame_count,
+        };
+    }
+
+    void update_listenbrainz_tracker(
+        const std::size_t track_index,
+        const core::SampleFrame position_frames,
+        const audio::PlaybackState playback_state)
+    {
+        if (playback_state != audio::PlaybackState::playing &&
+            playback_state != audio::PlaybackState::draining) {
+            return;
+        }
+        auto metadata = listen_metadata(track_index);
+        if (!listenbrainz_tracker_.active()) {
+            listenbrainz_tracker_.begin(
+                std::move(metadata),
+                position_frames,
+                unix_time_now());
+        } else {
+            listenbrainz_tracker_.update(
+                std::move(metadata),
+                position_frames,
+                unix_time_now());
+        }
+    }
+
+    void sync_system_media(const bool force)
+    {
+        if (!system_media_controls_.available()) {
+            return;
+        }
+        if (selected_track_ >= disc_.tracks.size() ||
+            !disc_.tracks[selected_track_].is_audio) {
+            system_media_controls_.clear();
+            system_media_track_ = std::numeric_limits<std::size_t>::max();
+            return;
+        }
+
+        const auto& track = disc_.tracks[selected_track_];
+        if (force || system_media_track_ != selected_track_) {
+            system_media_controls_.update_metadata(
+                track.title,
+                track.artist.empty() ? disc_.album_artist : track.artist,
+                disc_.album_title);
+            system_media_track_ = selected_track_;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (force || now - last_system_timeline_update_ >= 5'000U) {
+            system_media_controls_.update_timeline(
+                static_cast<std::uint64_t>(playback_track_seconds_ * 1'000.0),
+                static_cast<std::uint64_t>(
+                    track.frame_count * 1'000 /
+                    core::kCdSampleFramesPerSecond));
+            last_system_timeline_update_ = now;
+        }
+    }
+
+    static LRESULT CALLBACK settings_edit_window_proc(
+        const HWND edit,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        auto* self = reinterpret_cast<MainWindow*>(
+            GetWindowLongPtrW(edit, GWLP_USERDATA));
+        if (self != nullptr && message == WM_KEYDOWN) {
+            if (wparam == VK_RETURN) {
+                PostMessageW(self->window_, kSettingsSaveMessage, 0, 0);
+                return 0;
+            }
+            if (wparam == VK_ESCAPE) {
+                PostMessageW(self->window_, kSettingsCloseMessage, 0, 0);
+                return 0;
+            }
+        }
+        if (self != nullptr && message == WM_GETDLGCODE) {
+            return DLGC_WANTALLKEYS;
+        }
+        return self != nullptr && self->settings_edit_original_proc_ != nullptr
+            ? CallWindowProcW(
+                  self->settings_edit_original_proc_,
+                  edit,
+                  message,
+                  wparam,
+                  lparam)
+            : DefWindowProcW(edit, message, wparam, lparam);
+    }
+
+    void open_settings()
+    {
+        if (active_page_ == AppPage::settings) {
+            if (settings_token_edit_ != nullptr) {
+                SetFocus(settings_token_edit_);
+            }
+            return;
+        }
+
+        active_page_ = AppPage::settings;
+        settings_save_failed_ = false;
+        settings_saved_ = false;
+        settings_input_required_ = false;
+        if (settings_font_ == nullptr) {
+            settings_font_ = CreateFontW(
+                -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
+                0,
+                0,
+                0,
+                FW_NORMAL,
+                FALSE,
+                FALSE,
+                FALSE,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE,
+                L"Segoe UI");
+        }
+        if (settings_edit_brush_ == nullptr) {
+            settings_edit_brush_ = CreateSolidBrush(RGB(29, 33, 42));
+        }
+        settings_token_edit_ = CreateWindowExW(
+            0,
+            L"EDIT",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
+            0,
+            0,
+            1,
+            1,
+            window_,
+            reinterpret_cast<HMENU>(
+                static_cast<std::intptr_t>(kSettingsTokenEditId)),
+            instance_,
+            nullptr);
+        if (settings_token_edit_ != nullptr) {
+            SendMessageW(
+                settings_token_edit_,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(settings_font_),
+                TRUE);
+            SendMessageW(settings_token_edit_, EM_SETLIMITTEXT, 512, 0);
+            SendMessageW(
+                settings_token_edit_,
+                EM_SETCUEBANNER,
+                TRUE,
+                reinterpret_cast<LPARAM>(L"粘贴 ListenBrainz User Token"));
+            SetWindowLongPtrW(
+                settings_token_edit_,
+                GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(this));
+            settings_edit_original_proc_ = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(
+                    settings_token_edit_,
+                    GWLP_WNDPROC,
+                    reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
+            update_settings_edit_bounds();
+            SetFocus(settings_token_edit_);
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void close_settings()
+    {
+        if (settings_token_edit_ != nullptr) {
+            DestroyWindow(settings_token_edit_);
+            settings_token_edit_ = nullptr;
+            settings_edit_original_proc_ = nullptr;
+        }
+        if (active_page_ == AppPage::settings) {
+            active_page_ = AppPage::player;
+            settings_save_failed_ = false;
+            settings_saved_ = false;
+            settings_input_required_ = false;
+            if (window_ != nullptr) {
+                SetFocus(window_);
+                InvalidateRect(window_, nullptr, FALSE);
+            }
+        }
+    }
+
+    void save_settings()
+    {
+        if (active_page_ != AppPage::settings || settings_token_edit_ == nullptr) {
+            return;
+        }
+        const int length = GetWindowTextLengthW(settings_token_edit_);
+        std::wstring token(static_cast<std::size_t>(length) + 1U, L'\0');
+        const int written = GetWindowTextW(
+            settings_token_edit_,
+            token.data(),
+            length + 1);
+        token.resize(static_cast<std::size_t>(std::max(written, 0)));
+        const auto first = token.find_first_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) {
+            token.clear();
+        } else {
+            const auto last = token.find_last_not_of(L" \t\r\n");
+            token = token.substr(first, last - first + 1U);
+        }
+
+        if (token.empty()) {
+            settings_input_required_ = true;
+            settings_save_failed_ = false;
+            settings_saved_ = false;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+
+        if (!platform::windows::save_listenbrainz_token(token)) {
+            settings_save_failed_ = true;
+            settings_input_required_ = false;
+            settings_saved_ = false;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+        listenbrainz_reporter_.reload_token();
+        SetWindowTextW(settings_token_edit_, L"");
+        settings_save_failed_ = false;
+        settings_input_required_ = false;
+        settings_saved_ = true;
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void clear_settings_token()
+    {
+        if (!platform::windows::save_listenbrainz_token(L"")) {
+            settings_save_failed_ = true;
+            settings_input_required_ = false;
+            settings_saved_ = false;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+        listenbrainz_reporter_.reload_token();
+        if (settings_token_edit_ != nullptr) {
+            SetWindowTextW(settings_token_edit_, L"");
+        }
+        settings_save_failed_ = false;
+        settings_input_required_ = false;
+        settings_saved_ = true;
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void handle_settings_click(const D2D1_POINT_2F point)
+    {
+        if (contains(layout_.settings_save, point)) {
+            save_settings();
+        } else if (contains(layout_.settings_clear, point)) {
+            clear_settings_token();
+        } else if (contains(layout_.settings_back, point) ||
+                   contains(layout_.settings_button, point)) {
+            close_settings();
+        }
+    }
+
+    void update_settings_edit_bounds()
+    {
+        if (settings_token_edit_ == nullptr) {
+            return;
+        }
+        const float scale = static_cast<float>(GetDpiForWindow(window_)) / 96.0F;
+        const auto to_pixel = [scale](const float value) {
+            return static_cast<int>(std::lround(value * scale));
+        };
+        SetWindowPos(
+            settings_token_edit_,
+            HWND_TOP,
+            to_pixel(layout_.settings_edit.left + 13.0F),
+            to_pixel(layout_.settings_edit.top + 8.0F),
+            to_pixel(layout_.settings_edit.right - layout_.settings_edit.left - 26.0F),
+            to_pixel(layout_.settings_edit.bottom - layout_.settings_edit.top - 16.0F),
+            SWP_NOACTIVATE);
+    }
+
+    void draw_settings_page()
+    {
+        draw_text(
+            L"设置",
+            heading_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_page.left,
+                84.0F,
+                layout_.settings_back.left - 20.0F,
+                116.0F),
+            text_brush_.Get());
+        draw_text(
+            L"管理在线服务、播放和 Windows 集成",
+            small_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_page.left,
+                116.0F,
+                layout_.settings_back.left - 20.0F,
+                140.0F),
+            secondary_brush_.Get());
+
+        const auto back = D2D1::RoundedRect(layout_.settings_back, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(back, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(back, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"←  返回播放器",
+            button_format_.Get(),
+            layout_.settings_back,
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto listenbrainz_card = D2D1::RoundedRect(
+            layout_.settings_listenbrainz_card,
+            16.0F,
+            16.0F);
+        render_target_->FillRoundedRectangle(listenbrainz_card, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(listenbrainz_card, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"ListenBrainz",
+            heading_format_.Get(),
+            D2D1::RectF(
+                listenbrainz_card.rect.left + 24.0F,
+                listenbrainz_card.rect.top + 20.0F,
+                listenbrainz_card.rect.right - 200.0F,
+                listenbrainz_card.rect.top + 52.0F),
+            text_brush_.Get());
+        draw_text(
+            L"将正在播放状态和达到阈值的播放记录同步到个人账户",
+            small_format_.Get(),
+            D2D1::RectF(
+                listenbrainz_card.rect.left + 24.0F,
+                listenbrainz_card.rect.top + 54.0F,
+                listenbrainz_card.rect.right - 24.0F,
+                listenbrainz_card.rect.top + 82.0F),
+            secondary_brush_.Get());
+        draw_text(
+            listenbrainz_reporter_.enabled() ? L"●  已配置" : L"○  未配置",
+            small_format_.Get(),
+            D2D1::RectF(
+                listenbrainz_card.rect.right - 164.0F,
+                listenbrainz_card.rect.top + 22.0F,
+                listenbrainz_card.rect.right - 24.0F,
+                listenbrainz_card.rect.top + 50.0F),
+            listenbrainz_reporter_.enabled()
+                ? success_brush_.Get()
+                : muted_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(
+            L"USER TOKEN",
+            caption_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_edit.left,
+                layout_.settings_edit.top - 24.0F,
+                layout_.settings_edit.right,
+                layout_.settings_edit.top - 2.0F),
+            muted_brush_.Get());
+
+        const auto edit = D2D1::RoundedRect(layout_.settings_edit, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(edit, elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            edit,
+            settings_save_failed_ || settings_input_required_
+                ? error_brush_.Get()
+                : border_brush_.Get(),
+            settings_save_failed_ || settings_input_required_ ? 2.0F : 1.0F);
+        if (settings_save_failed_ || settings_input_required_ || settings_saved_) {
+            draw_text(
+                settings_saved_
+                    ? L"设置已更新"
+                    : (settings_input_required_
+                        ? L"请输入 User Token；移除已有凭据请使用“清除”"
+                        : L"保存失败，请检查 Windows 凭据管理器权限"),
+                caption_format_.Get(),
+                D2D1::RectF(
+                    layout_.settings_edit.left,
+                    layout_.settings_edit.bottom + 6.0F,
+                    layout_.settings_listenbrainz_card.right - 24.0F,
+                    layout_.settings_edit.bottom + 28.0F),
+                settings_saved_ ? success_brush_.Get() : error_brush_.Get());
+        }
+
+        const auto clear = D2D1::RoundedRect(layout_.settings_clear, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(clear, elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(clear, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"清除",
+            button_format_.Get(),
+            layout_.settings_clear,
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto save = D2D1::RoundedRect(layout_.settings_save, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(save, accent_brush_.Get());
+        draw_text(
+            L"保存",
+            button_format_.Get(),
+            layout_.settings_save,
+            accent_text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto audio_card = D2D1::RoundedRect(
+            layout_.settings_audio_card,
+            16.0F,
+            16.0F);
+        render_target_->FillRoundedRectangle(audio_card, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(audio_card, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"播放与系统集成",
+            heading_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.left + 24.0F,
+                audio_card.rect.top + 20.0F,
+                audio_card.rect.right - 24.0F,
+                audio_card.rect.top + 52.0F),
+            text_brush_.Get());
+        draw_text(
+            L"播放音量",
+            body_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.left + 24.0F,
+                audio_card.rect.top + 72.0F,
+                audio_card.rect.left + 200.0F,
+                audio_card.rect.top + 102.0F),
+            text_brush_.Get());
+        draw_text(
+            std::format(L"{}%", static_cast<int>(std::lround(volume_ * 100.0F))),
+            body_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.right - 120.0F,
+                audio_card.rect.top + 72.0F,
+                audio_card.rect.right - 24.0F,
+                audio_card.rect.top + 102.0F),
+            secondary_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+        render_target_->DrawLine(
+            D2D1::Point2F(
+                audio_card.rect.left + 24.0F,
+                audio_card.rect.top + 112.0F),
+            D2D1::Point2F(
+                audio_card.rect.right - 24.0F,
+                audio_card.rect.top + 112.0F),
+            border_brush_.Get(),
+            1.0F);
+        draw_text(
+            L"Windows 媒体控制",
+            body_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.left + 24.0F,
+                audio_card.rect.top + 126.0F,
+                audio_card.rect.left + 260.0F,
+                audio_card.rect.top + 156.0F),
+            text_brush_.Get());
+        draw_text(
+            system_media_controls_.available() ? L"已启用" : L"不可用",
+            body_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.right - 120.0F,
+                audio_card.rect.top + 126.0F,
+                audio_card.rect.right - 24.0F,
+                audio_card.rect.top + 156.0F),
+            system_media_controls_.available()
+                ? success_brush_.Get()
+                : muted_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
     void eject_disc()
@@ -2214,6 +3086,7 @@ private:
             disc_.status = L"光盘已弹出";
             ui_message_ = L"光盘已安全弹出";
             ui_message_is_error_ = false;
+            sync_system_media(true);
         }
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -2251,6 +3124,7 @@ private:
     ComPtr<IDWriteTextFormat> album_format_;
     ComPtr<IDWriteTextFormat> heading_format_;
     ComPtr<IDWriteTextFormat> body_format_;
+    ComPtr<IDWriteTextFormat> button_format_;
     ComPtr<IDWriteTextFormat> track_format_;
     ComPtr<IDWriteTextFormat> track_duration_format_;
     ComPtr<IDWriteTextFormat> small_format_;
@@ -2271,12 +3145,28 @@ private:
     int wheel_delta_remainder_{};
     bool scrollbar_dragging_{};
     float scrollbar_drag_offset_{};
+    bool volume_dragging_{};
+    float volume_{0.72F};
+    AppPage active_page_{AppPage::player};
+    bool settings_save_failed_{};
+    bool settings_saved_{};
+    bool settings_input_required_{};
+    HWND settings_token_edit_{};
+    WNDPROC settings_edit_original_proc_{};
+    HFONT settings_font_{};
+    HBRUSH settings_edit_brush_{};
     platform::windows::CddaPlaybackEngine playback_engine_;
+    platform::windows::ListenBrainzReporter listenbrainz_reporter_;
+    listenbrainz::PlaybackTracker listenbrainz_tracker_;
+    platform::windows::SystemMediaControls system_media_controls_;
+    std::size_t system_media_track_{std::numeric_limits<std::size_t>::max()};
+    ULONGLONG last_system_timeline_update_{};
     std::jthread playback_worker_;
     std::mutex playback_result_mutex_;
     std::optional<platform::windows::CddaPlaybackResult> playback_result_;
     std::uint64_t playback_generation_{};
     bool playback_active_{};
+    bool playback_paused_{};
     std::size_t playback_start_track_{};
     core::SampleFrame playback_start_offset_frames_{};
     double playback_track_seconds_{};

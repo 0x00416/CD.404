@@ -2,12 +2,14 @@
 #include <cd404/audio/cdda_sector_source.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
+#include <cd404/audio/pcm16_volume.hpp>
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/gnudb.hpp>
 #include <cd404/disc/toc.hpp>
+#include <cd404/listenbrainz/playback_tracker.hpp>
 
 #include <algorithm>
 #include <array>
@@ -874,6 +876,134 @@ void test_pcm16_spsc_ring_buffer()
         "concurrent ring transfer preserves every stereo frame in order");
 }
 
+void test_pcm16_volume()
+{
+    using cd404::audio::apply_pcm16_volume;
+
+    std::array<std::int16_t, 5> unity{-32'768, -1, 0, 1, 32'767};
+    const auto original = unity;
+    apply_pcm16_volume(unity, 1.0F);
+    expect(unity == original, "unity volume preserves every PCM16 sample exactly");
+
+    std::array<std::int16_t, 5> half{-32'768, -10'001, 0, 10'001, 32'767};
+    apply_pcm16_volume(half, 0.5F);
+    expect(
+        half == std::array<std::int16_t, 5>{-16'384, -5'000, 0, 5'000, 16'383},
+        "half volume scales signed PCM16 values deterministically");
+
+    std::array<std::int16_t, 3> muted{-32'768, 123, 32'767};
+    apply_pcm16_volume(muted, -1.0F);
+    expect(
+        muted == std::array<std::int16_t, 3>{0, 0, 0},
+        "volume below zero clamps to mute");
+
+    std::array<std::int16_t, 2> over{123, -456};
+    apply_pcm16_volume(over, 2.0F);
+    expect(
+        over == std::array<std::int16_t, 2>{123, -456},
+        "volume above one clamps to exact unity");
+}
+
+void test_listenbrainz_playback_tracker()
+{
+    using namespace cd404;
+    using listenbrainz::SubmissionType;
+
+    std::vector<listenbrainz::Submission> submissions;
+    listenbrainz::PlaybackTracker tracker(
+        [&](const auto& submission) { submissions.push_back(submission); });
+    const listenbrainz::TrackMetadata short_track{
+        1,
+        L"Track One",
+        L"Artist",
+        L"Album",
+        120 * core::kCdSampleFramesPerSecond,
+    };
+
+    tracker.begin(short_track, 0, 1'700'000'000);
+    expect(
+        submissions.size() == 1 &&
+            submissions.front().type == SubmissionType::playing_now &&
+            submissions.front().listened_at == 0,
+        "ListenBrainz playing_now is emitted without a timestamp");
+    tracker.update(
+        short_track,
+        59 * core::kCdSampleFramesPerSecond,
+        1'700'000'059);
+    tracker.end();
+    expect(
+        submissions.size() == 1,
+        "less than half of a short track is not submitted as a listen");
+
+    tracker.begin(short_track, 0, 1'700'001'000);
+    tracker.update(
+        short_track,
+        60 * core::kCdSampleFramesPerSecond,
+        1'700'001'060);
+    expect(
+        submissions.size() == 3 &&
+            submissions.back().type == SubmissionType::single,
+        "ListenBrainz single is emitted immediately at the playback threshold");
+    tracker.end();
+    expect(
+        submissions.size() == 3 &&
+            submissions.back().type == SubmissionType::single &&
+            submissions.back().listened_at == 1'700'001'000 &&
+            submissions.back().duration_played_seconds == 60,
+        "half of a short track produces one timestamped single listen");
+
+    const listenbrainz::TrackMetadata long_track{
+        2,
+        L"Long Track",
+        L"Artist",
+        L"Album",
+        600 * core::kCdSampleFramesPerSecond,
+    };
+    tracker.begin(long_track, 0, 1'700'002'000);
+    tracker.update(
+        long_track,
+        240 * core::kCdSampleFramesPerSecond,
+        1'700'002'240);
+    tracker.update(short_track, 0, 1'700'002'241);
+    expect(
+        submissions.size() == 6 &&
+            submissions[submissions.size() - 2].type == SubmissionType::single &&
+            submissions.back().type == SubmissionType::playing_now,
+        "four minutes completes a long track before a track transition");
+    tracker.end();
+
+    listenbrainz::PlaybackTracker late_metadata_tracker(
+        [&](const auto& submission) { submissions.push_back(submission); });
+    auto unknown_track = short_track;
+    unknown_track.artist.clear();
+    const std::size_t before_late_metadata = submissions.size();
+    late_metadata_tracker.begin(unknown_track, 0, 1'700'003'000);
+    late_metadata_tracker.update(short_track, core::kCdSampleFramesPerSecond, 1'700'003'001);
+    expect(
+        submissions.size() == before_late_metadata + 1 &&
+            submissions.back().type == SubmissionType::playing_now,
+        "playing_now waits until required metadata becomes available");
+    late_metadata_tracker.end();
+
+    std::vector<listenbrainz::Submission> seek_submissions;
+    listenbrainz::PlaybackTracker seek_tracker(
+        [&](const auto& submission) { seek_submissions.push_back(submission); });
+    seek_tracker.begin(short_track, 0, 1'700'004'000);
+    seek_tracker.update(
+        short_track,
+        30 * core::kCdSampleFramesPerSecond,
+        1'700'004'030);
+    seek_tracker.seek(100 * core::kCdSampleFramesPerSecond);
+    seek_tracker.update(
+        short_track,
+        110 * core::kCdSampleFramesPerSecond,
+        1'700'004'040);
+    seek_tracker.end();
+    expect(
+        seek_submissions.size() == 1,
+        "ListenBrainz seeking forward does not count skipped frames as playback");
+}
+
 } // namespace
 
 int main()
@@ -888,6 +1018,8 @@ int main()
     test_playback_state_machine();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();
+    test_pcm16_volume();
+    test_listenbrainz_playback_tracker();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed.\n";

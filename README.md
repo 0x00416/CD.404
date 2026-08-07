@@ -37,6 +37,9 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - 可复用的阻塞式 CDDA 播放引擎、可查询提交/实际渲染采样帧进度及经过测试的正式状态机。
 - 可跨相邻音轨保持同一数据流与音频会话的实体光盘播放后台组件。
 - 图形界面在工作线程中直接调用进程内播放引擎，停止时使用协作取消，不再创建或强制终止播放子进程。
+- Windows 系统媒体控制（SMTC）、媒体键、系统播放状态及时间轴同步。
+- 曲内已播放/总时长显示，以及直接作用于 PCM 消费端的实时音量控制；100% 音量保持样本不变。
+- ListenBrainz `playing_now` 和符合“半曲或 4 分钟取较短者”规则的 `single` 上报。
 - CD-TEXT、MusicBrainz、GnuDB 与 iTunes 多源元数据补全，并显示本次实际命中的来源。
 - 基础自动测试。
 
@@ -72,8 +75,23 @@ ctest --preset ninja-msvc-debug
 .\out\build\ninja-msvc-x64\apps\cd404\CD.404.exe
 ```
 
-当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/停止、进度定位、刷新和弹出。图形界面在工作线程中直接运行 `CddaPlaybackEngine`，并根据已经离开 WASAPI 端点缓冲的采样帧更新曲目和进度；`apps/playback` 仅保留为命令行诊断入口。
+当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/暂停、进度定位、音量、刷新和弹出。图形界面在工作线程中直接运行 `CddaPlaybackEngine`，并根据已经离开 WASAPI 端点缓冲的采样帧更新曲目、曲内时长和进度；`apps/playback` 仅保留为命令行诊断入口。Windows 音量浮层、媒体键和支持 SMTC 的外设可以控制播放、暂停、停止、切轨和定位，应用会向系统同步当前曲目及时间轴。
 元数据优先使用光盘内嵌 CD-TEXT；后台并行查询 MusicBrainz 与 GnuDB，再以可信的专辑/艺术家结果查询 iTunes，并通过音轨数、编号和 TOC 时长差严格校验后补全空字段。来源胶囊只显示本次实际命中的服务。正面封面仅使用 Cover Art Archive 的 1200px 缩略图，缓存位于当前用户的本地应用数据目录，不会写入仓库，也不会下载或复用 iTunes 宣传图。
+
+## ListenBrainz 配置
+
+点击播放器右上角的设置按钮会进入独立设置页，可输入、替换或清除 ListenBrainz User Token；输入框会隐藏内容，保存后写入 Windows 凭据管理器并立即生效。设置页同时展示当前播放音量和 Windows 媒体控制状态，并为后续播放器选项预留统一入口。播放器优先读取通用凭据 `CD.404/ListenBrainz`，也可读取当前进程的 `CD404_LISTENBRAINZ_TOKEN` 环境变量。Token 不会写入仓库、配置文件或日志。
+
+推荐打开“控制面板 → 凭据管理器 → Windows 凭据 → 添加通用凭据”，将网络地址填写为 `CD.404/ListenBrainz`，用户名可填写 `ListenBrainz`，密码填写个人 User Token。重新启动播放器后生效。
+
+用于临时测试时，也可在启动播放器的同一 PowerShell 会话中设置：
+
+```powershell
+$env:CD404_LISTENBRAINZ_TOKEN = '<个人 User Token>'
+make run-release
+```
+
+开始实际播放且曲名、艺术家可用时提交一次 `playing_now`；实际渲染达到曲目时长的一半或 4 分钟（取较短者）后立即提交一次带起播时间的 `single`。网络请求在后台执行，不会阻塞播放。持久化离线队列和失败补报仍属于后续工作。
 
 也可以直接生成 Visual Studio 工程：
 

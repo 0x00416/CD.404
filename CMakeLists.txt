@@ -16,6 +16,7 @@ include(CompilerWarnings)
 add_subdirectory(src/core)
 add_subdirectory(src/disc)
 add_subdirectory(src/audio)
+add_subdirectory(src/listenbrainz)
 
 if(WIN32)
     add_subdirectory(src/platform/windows)

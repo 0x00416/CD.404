@@ -86,11 +86,14 @@ public:
 
     [[nodiscard]] CddaPlaybackResult play(const CddaPlaybackRequest& request);
     void request_stop() noexcept;
+    void set_volume(float volume) noexcept;
+    [[nodiscard]] float volume() const noexcept;
     [[nodiscard]] CddaPlaybackProgress progress() const noexcept;
 
 private:
     std::atomic_bool active_{};
     std::atomic_bool stop_requested_{};
+    std::atomic<float> volume_{1.0F};
     std::atomic<audio::PlaybackState> state_{audio::PlaybackState::idle};
     std::atomic<core::SampleFrame> target_frames_{};
     std::atomic<core::SampleFrame> frames_produced_{};

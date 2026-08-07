@@ -1,5 +1,15 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <objbase.h>
+
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
+#include <cd404/platform/windows/listenbrainz_reporter.hpp>
+#include <cd404/platform/windows/system_media_controls.hpp>
+
+#include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Foundation.Collections.h>
 
 #include <array>
 #include <chrono>
@@ -79,6 +89,121 @@ void test_invalid_requests_without_device_access()
             empty_result.frames_submitted == 0 &&
             empty_result.frames_rendered == 0,
         "invalid request cannot publish stale progress from the prior session");
+}
+
+void test_volume_control_boundaries()
+{
+    using cd404::platform::windows::CddaPlaybackEngine;
+
+    CddaPlaybackEngine engine;
+    engine.set_volume(0.42F);
+    expect(
+        engine.volume() > 0.419F && engine.volume() < 0.421F,
+        "playback engine retains an in-range volume");
+    engine.set_volume(-1.0F);
+    expect(engine.volume() == 0.0F, "playback engine clamps volume to mute");
+    engine.set_volume(2.0F);
+    expect(engine.volume() == 1.0F, "playback engine clamps volume to unity");
+}
+
+void test_listenbrainz_payload_contract()
+{
+    using namespace cd404;
+    using namespace winrt::Windows::Data::Json;
+
+    listenbrainz::Submission playing_now;
+    playing_now.type = listenbrainz::SubmissionType::playing_now;
+    playing_now.listened_at = 1'700'000'000;
+    playing_now.track_name = L"Track";
+    playing_now.artist_name = L"Artist";
+    playing_now.release_name = L"Album";
+    playing_now.duration_milliseconds = 123'000;
+
+    const auto now_root = JsonObject::Parse(
+        platform::windows::build_listenbrainz_payload(playing_now));
+    const auto now_listen = now_root.GetNamedArray(L"payload")
+                                .GetObjectAt(0);
+    expect(
+        now_root.GetNamedString(L"listen_type") == L"playing_now" &&
+            !now_listen.HasKey(L"listened_at"),
+        "playing_now payload omits listened_at as required by ListenBrainz");
+    expect(
+        now_listen.GetNamedObject(L"track_metadata")
+                .GetNamedString(L"track_name") == L"Track",
+        "playing_now payload contains required track metadata");
+
+    auto single = playing_now;
+    single.type = listenbrainz::SubmissionType::single;
+    single.duration_played_seconds = 61;
+    const auto single_root = JsonObject::Parse(
+        platform::windows::build_listenbrainz_payload(single));
+    const auto single_listen = single_root.GetNamedArray(L"payload")
+                                   .GetObjectAt(0);
+    const auto additional = single_listen.GetNamedObject(L"track_metadata")
+                                .GetNamedObject(L"additional_info");
+    expect(
+        single_root.GetNamedString(L"listen_type") == L"single" &&
+            single_listen.GetNamedNumber(L"listened_at") == 1'700'000'000.0,
+        "single payload includes the playback-start Unix timestamp");
+    expect(
+        additional.GetNamedNumber(L"duration_ms") == 123'000.0 &&
+            additional.GetNamedNumber(L"duration_played") == 61.0,
+        "single payload includes duration diagnostics");
+}
+
+void test_system_media_controls_safe_fallback()
+{
+    cd404::platform::windows::SystemMediaControls controls;
+    expect(
+        !controls.initialize(nullptr, {}),
+        "SMTC rejects a null HWND without exposing a partial session");
+    expect(!controls.available(), "SMTC remains unavailable after null initialization");
+    controls.clear();
+}
+
+void test_system_media_controls_with_window()
+{
+    using namespace cd404::platform::windows;
+
+    constexpr wchar_t class_name[] = L"CD404.SystemMediaControlsTest";
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = DefWindowProcW;
+    window_class.hInstance = GetModuleHandleW(nullptr);
+    window_class.lpszClassName = class_name;
+    const ATOM atom = RegisterClassW(&window_class);
+    expect(
+        atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS,
+        "SMTC test window class registers");
+    const HWND window = CreateWindowExW(
+        0,
+        class_name,
+        L"CD.404 SMTC test",
+        WS_OVERLAPPED,
+        0,
+        0,
+        320,
+        200,
+        nullptr,
+        nullptr,
+        window_class.hInstance,
+        nullptr);
+    expect(window != nullptr, "SMTC test creates a real top-level HWND");
+    if (window == nullptr) {
+        return;
+    }
+
+    SystemMediaControls controls;
+    const bool initialized = controls.initialize(window, [](const auto&) {});
+    expect(initialized && controls.available(), "SMTC binds to a desktop HWND");
+    if (initialized) {
+        controls.update_metadata(L"Track", L"Artist", L"Album");
+        controls.update_timeline(30'000, 180'000);
+        controls.set_playback_state(SystemMediaPlaybackState::playing);
+        controls.set_playback_state(SystemMediaPlaybackState::paused);
+        controls.clear();
+    }
+    DestroyWindow(window);
+    UnregisterClassW(class_name, window_class.hInstance);
 }
 
 void test_diagnostic_names()
@@ -162,8 +287,13 @@ void test_hardware_cancellation()
 
 int main(const int argument_count, char** arguments)
 {
+    const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
     test_invalid_requests_without_device_access();
+    test_volume_control_boundaries();
+    test_listenbrainz_payload_contract();
+    test_system_media_controls_safe_fallback();
+    test_system_media_controls_with_window();
     test_diagnostic_names();
     if (argument_count == 2 &&
         std::string_view(arguments[1]) == "--hardware-cancel") {
@@ -171,10 +301,16 @@ int main(const int argument_count, char** arguments)
     }
 
     if (failures != 0) {
+        if (SUCCEEDED(com_result)) {
+            CoUninitialize();
+        }
         std::cerr << failures << " Windows playback test(s) failed.\n";
         return 1;
     }
 
+    if (SUCCEEDED(com_result)) {
+        CoUninitialize();
+    }
     std::cout << "All CD.404 Windows playback tests passed.\n";
     return 0;
 }

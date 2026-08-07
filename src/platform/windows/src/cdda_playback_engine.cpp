@@ -3,6 +3,7 @@
 #include <cd404/audio/cdda_pcm.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
+#include <cd404/audio/pcm16_volume.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/raw_cdda_sector_source.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
@@ -430,6 +432,10 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
             continue;
         }
         stream_state.changed.notify_one();
+        audio::apply_pcm16_volume(
+            destination.first(
+                pop_result.frames_transferred * audio::kPcm16StereoChannelCount),
+            volume_.load(std::memory_order_acquire));
 
         const auto submit_result = submit_frames(
             output,
@@ -518,6 +524,17 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
 void CddaPlaybackEngine::request_stop() noexcept
 {
     stop_requested_.store(true, std::memory_order_release);
+}
+
+void CddaPlaybackEngine::set_volume(const float volume) noexcept
+{
+    const float finite_volume = std::isfinite(volume) ? volume : 1.0F;
+    volume_.store(std::clamp(finite_volume, 0.0F, 1.0F), std::memory_order_release);
+}
+
+float CddaPlaybackEngine::volume() const noexcept
+{
+    return volume_.load(std::memory_order_acquire);
 }
 
 CddaPlaybackProgress CddaPlaybackEngine::progress() const noexcept
