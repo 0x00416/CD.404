@@ -9,6 +9,7 @@ CTEST ?= ctest
 VSWHERE ?= C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe
 VS_INSTALLATION := $(strip $(shell "$(VSWHERE)" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>NUL))
 VSDEVCMD ?= $(VS_INSTALLATION)/Common7/Tools/VsDevCmd.bat
+MSVC_CODE_PAGE ?= $(strip $(shell powershell.exe -NoProfile -Command "[Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage"))
 
 DEBUG_CONFIGURE_PRESET := ninja-msvc-x64
 DEBUG_BUILD_PRESET := ninja-msvc-debug
@@ -29,11 +30,11 @@ check:
 
 configure: check
 	@echo [CD.404] Configuring Debug with Ninja and MSVC...
-	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && set VSLANG=1033 && "$(CMAKE)" --preset $(DEBUG_CONFIGURE_PRESET)
+	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && chcp $(MSVC_CODE_PAGE) >NUL && set "VSLANG=1033" && "$(CMAKE)" --preset $(DEBUG_CONFIGURE_PRESET)
 
 debug: configure
 	@echo [CD.404] Building the complete Debug application...
-	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && set VSLANG=1033 && "$(CMAKE)" --build --preset $(DEBUG_BUILD_PRESET)
+	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && chcp $(MSVC_CODE_PAGE) >NUL && set "VSLANG=1033" && "$(CMAKE)" --build --preset $(DEBUG_BUILD_PRESET)
 
 test: debug
 	@echo [CD.404] Running Debug tests...
@@ -41,9 +42,9 @@ test: debug
 
 release: check
 	@echo [CD.404] Configuring Release with Ninja and MSVC...
-	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && set VSLANG=1033 && "$(CMAKE)" --preset $(RELEASE_CONFIGURE_PRESET)
+	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && chcp $(MSVC_CODE_PAGE) >NUL && set "VSLANG=1033" && "$(CMAKE)" --preset $(RELEASE_CONFIGURE_PRESET)
 	@echo [CD.404] Building the complete Release application...
-	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && set VSLANG=1033 && "$(CMAKE)" --build --preset $(RELEASE_BUILD_PRESET)
+	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && chcp $(MSVC_CODE_PAGE) >NUL && set "VSLANG=1033" && "$(CMAKE)" --build --preset $(RELEASE_BUILD_PRESET)
 	@echo [CD.404] Running Release tests...
 	@"$(CTEST)" --preset $(RELEASE_BUILD_PRESET) --output-on-failure
 
@@ -77,3 +78,4 @@ help:
 	@echo Override tool discovery when needed:
 	@echo   make CMAKE=C:/path/cmake.exe CTEST=C:/path/ctest.exe
 	@echo   make VSDEVCMD=C:/path/Common7/Tools/VsDevCmd.bat
+	@echo   make MSVC_CODE_PAGE=936

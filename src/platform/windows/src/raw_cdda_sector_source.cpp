@@ -45,6 +45,10 @@ audio::SectorReadResult RawCddaSectorSource::read_sectors(
     const core::Sector start_lba,
     const std::span<std::byte> destination)
 {
+    if (cancel_requested_.load(std::memory_order_acquire)) {
+        return {audio::ReadStatus::cancelled, 0, ERROR_OPERATION_ABORTED};
+    }
+
     const auto bytes_per_sector =
         static_cast<std::size_t>(core::kCdBytesPerSector);
     if (destination.empty() || destination.size() % bytes_per_sector != 0 ||
@@ -90,7 +94,13 @@ audio::SectorReadResult RawCddaSectorSource::read_sectors(
     if (started == FALSE) {
         const DWORD error = GetLastError();
         if (error != ERROR_IO_PENDING) {
-            return {audio::ReadStatus::io_error, 0, error};
+            return {
+                error == ERROR_OPERATION_ABORTED
+                    ? audio::ReadStatus::cancelled
+                    : audio::ReadStatus::io_error,
+                0,
+                error,
+            };
         }
         if (WaitForSingleObject(event_handle, INFINITE) != WAIT_OBJECT_0) {
             return {audio::ReadStatus::io_error, 0, GetLastError()};
@@ -103,7 +113,14 @@ audio::SectorReadResult RawCddaSectorSource::read_sectors(
             &overlapped,
             &bytes_returned,
             FALSE) == FALSE) {
-        return {audio::ReadStatus::io_error, 0, GetLastError()};
+        const DWORD error = GetLastError();
+        return {
+            error == ERROR_OPERATION_ABORTED
+                ? audio::ReadStatus::cancelled
+                : audio::ReadStatus::io_error,
+            0,
+            error,
+        };
     }
 
     if (bytes_returned != destination.size()) {
@@ -115,6 +132,7 @@ audio::SectorReadResult RawCddaSectorSource::read_sectors(
 
 void RawCddaSectorSource::request_cancel() noexcept
 {
+    cancel_requested_.store(true, std::memory_order_release);
     if (native_handle_ != nullptr && native_handle_ != INVALID_HANDLE_VALUE) {
         static_cast<void>(CancelIoEx(static_cast<HANDLE>(native_handle_), nullptr));
     }

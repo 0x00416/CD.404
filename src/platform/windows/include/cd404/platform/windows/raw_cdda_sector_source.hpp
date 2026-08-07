@@ -3,6 +3,7 @@
 #include <cd404/audio/cdda_sector_source.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 
+#include <atomic>
 #include <memory>
 
 namespace cd404::platform::windows {
@@ -31,6 +32,7 @@ private:
     void* native_io_event_{};
     core::Sector first_lba_{};
     core::Sector end_lba_{};
+    std::atomic_bool cancel_requested_{};
 };
 
 struct RawCddaOpenResult final {

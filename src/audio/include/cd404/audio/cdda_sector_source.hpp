@@ -12,6 +12,8 @@ enum class ReadStatus {
     end_of_stream,
     invalid_request,
     io_error,
+    verification_error,
+    cancelled,
 };
 
 struct SectorReadResult final {

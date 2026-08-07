@@ -3,6 +3,7 @@
 #include <cd404/audio/cdda_pcm.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
+#include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/platform/windows/raw_cdda_sector_source.hpp>
@@ -38,7 +39,7 @@ constexpr std::size_t kReadBlockFrames =
 constexpr std::size_t kRingCapacityFrames =
     6 * static_cast<std::size_t>(cd404::core::kCdSampleFramesPerSecond);
 constexpr std::size_t kPrebufferFrames =
-    static_cast<std::size_t>(cd404::core::kCdSampleFramesPerSecond);
+    3 * static_cast<std::size_t>(cd404::core::kCdSampleFramesPerSecond);
 constexpr auto kQueueWait = std::chrono::milliseconds(50);
 
 std::atomic_bool g_cancel_requested{};
@@ -104,6 +105,12 @@ struct ProducerContext final {
 struct SubmitResult final {
     std::int32_t status{};
     std::uint32_t frames_submitted{};
+};
+
+struct PlaybackStatistics final {
+    std::uint64_t producer_starvation_events{};
+    std::uint64_t endpoint_underruns{};
+    std::size_t minimum_queued_frames{std::numeric_limits<std::size_t>::max()};
 };
 
 [[nodiscard]] bool parse_unsigned(
@@ -185,6 +192,25 @@ void print_hresult(const wchar_t* operation, const std::int32_t status)
                << L".\n";
 }
 
+void print_statistics(
+    const cd404::audio::ReliableReadStatistics& read,
+    const PlaybackStatistics& playback)
+{
+    const std::size_t minimum_queued =
+        playback.minimum_queued_frames == std::numeric_limits<std::size_t>::max()
+            ? 0
+            : playback.minimum_queued_frames;
+    std::wcout << L"Read statistics: " << read.logical_reads << L" logical, "
+               << read.device_reads << L" device, " << read.retries
+               << L" retries, " << read.overlap_checks << L" overlap checks, "
+               << read.overlap_mismatches << L" mismatches, "
+               << read.sectors_delivered << L" sectors delivered.\n"
+               << L"Buffer statistics: " << playback.producer_starvation_events
+               << L" producer starvation event(s), "
+               << playback.endpoint_underruns << L" endpoint underrun(s), "
+               << minimum_queued << L" minimum queued frame(s) after start.\n";
+}
+
 void request_stop(
     StreamState& state,
     cd404::platform::windows::RawCddaSectorSource& source)
@@ -257,9 +283,9 @@ void produce_pcm(ProducerContext context)
         if (read_result.status != audio::ReadStatus::ok ||
             read_result.frames_read != wanted_frames) {
             context.state.terminal_status =
-                read_result.status == audio::ReadStatus::end_of_stream
-                    ? audio::ReadStatus::end_of_stream
-                    : audio::ReadStatus::io_error;
+                read_result.status == audio::ReadStatus::ok
+                    ? audio::ReadStatus::io_error
+                    : read_result.status;
             context.state.native_error = read_result.native_error;
             break;
         }
@@ -376,8 +402,9 @@ int wmain(const int argument_count, wchar_t** arguments)
         return 1;
     }
 
+    audio::ReliableCddaSectorSource reliable_source(*source_result.source);
     audio::ContinuousCddaStream stream(
-        *source_result.source,
+        reliable_source,
         selected_track.start_lba,
         final_track.end_lba);
     if (!stream.valid()) {
@@ -472,13 +499,24 @@ int wmain(const int argument_count, wchar_t** arguments)
     SampleFrame submitted_frames{};
     bool output_started{};
     bool underrun_detected{};
+    bool waiting_for_producer{};
+    PlaybackStatistics playback_statistics;
     std::int32_t playback_status{S_OK};
 
     while (!g_cancel_requested.load(std::memory_order_acquire)) {
         const std::size_t readable = ring.readable_frames();
+        if (output_started && (readable != 0 || !ring.drained())) {
+            playback_statistics.minimum_queued_frames = std::min(
+                playback_statistics.minimum_queued_frames,
+                readable);
+        }
         if (readable == 0) {
             if (ring.drained()) {
                 break;
+            }
+            if (output_started && !waiting_for_producer) {
+                ++playback_statistics.producer_starvation_events;
+                waiting_for_producer = true;
             }
             if (output_started && submitted_frames < target_frames) {
                 std::uint32_t padding{};
@@ -491,6 +529,7 @@ int wmain(const int argument_count, wchar_t** arguments)
                 }
                 if (padding == 0) {
                     underrun_detected = true;
+                    ++playback_statistics.endpoint_underruns;
                     request_stop(state, *source_result.source);
                     break;
                 }
@@ -502,6 +541,7 @@ int wmain(const int argument_count, wchar_t** arguments)
             });
             continue;
         }
+        waiting_for_producer = false;
 
         std::size_t frames_to_pop = std::min(readable, consumer_capacity);
         if (!output_started) {
@@ -552,6 +592,7 @@ int wmain(const int argument_count, wchar_t** arguments)
     static_cast<void>(output.stop());
     cancel_watcher.request_stop();
     cancel_watcher.join();
+    print_statistics(reliable_source.statistics(), playback_statistics);
 
     if (cancelled || g_cancel_requested.load(std::memory_order_acquire)) {
         std::wcout << L"Playback cancelled after " << submitted_frames
@@ -569,9 +610,13 @@ int wmain(const int argument_count, wchar_t** arguments)
     }
     if (read_failed) {
         std::wcout << L"CDDA streaming stopped after " << state.frames_produced
-                   << L" frame(s): "
-                   << platform::windows::format_system_error(state.native_error)
-                   << L"\n";
+                   << L" frame(s): ";
+        if (state.terminal_status == audio::ReadStatus::verification_error) {
+            std::wcout << L"sequential sector overlap verification failed.\n";
+        } else {
+            std::wcout << platform::windows::format_system_error(state.native_error)
+                       << L"\n";
+        }
         return 1;
     }
     if (!completed) {

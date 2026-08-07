@@ -2,6 +2,7 @@
 #include <cd404/audio/cdda_sector_source.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
+#include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/gnudb.hpp>
@@ -92,6 +93,64 @@ public:
 private:
     cd404::core::Sector first_lba_{};
     cd404::core::Sector end_lba_{};
+};
+
+class FaultInjectingSectorSource final : public cd404::audio::CddaSectorSource {
+public:
+    FaultInjectingSectorSource(
+        const cd404::core::Sector first_lba,
+        const cd404::core::Sector end_lba)
+        : pattern_(first_lba, end_lba)
+    {
+    }
+
+    [[nodiscard]] cd404::core::Sector first_lba() const noexcept override
+    {
+        return pattern_.first_lba();
+    }
+
+    [[nodiscard]] cd404::core::Sector end_lba() const noexcept override
+    {
+        return pattern_.end_lba();
+    }
+
+    [[nodiscard]] cd404::audio::SectorReadResult read_sectors(
+        const cd404::core::Sector start_lba,
+        const std::span<std::byte> destination) override
+    {
+        using namespace cd404::audio;
+
+        if (failures_remaining_ != 0) {
+            --failures_remaining_;
+            return {ReadStatus::io_error, 0, 123};
+        }
+
+        auto result = pattern_.read_sectors(start_lba, destination);
+        if (result.status == ReadStatus::ok && corruption_remaining_ != 0 &&
+            start_lba == corruption_start_lba_ && !destination.empty()) {
+            destination.front() ^= std::byte{0xff};
+            --corruption_remaining_;
+        }
+        return result;
+    }
+
+    void fail_next_reads(const std::size_t count) noexcept
+    {
+        failures_remaining_ = count;
+    }
+
+    void corrupt_next_read_starting_at(
+        const cd404::core::Sector start_lba) noexcept
+    {
+        corruption_start_lba_ = start_lba;
+        corruption_remaining_ = 1;
+    }
+
+private:
+    PatternSectorSource pattern_;
+    std::size_t failures_remaining_{};
+    cd404::core::Sector corruption_start_lba_{};
+    std::size_t corruption_remaining_{};
 };
 
 void expect(const bool condition, const std::string_view description)
@@ -439,6 +498,66 @@ void test_continuous_cdda_stream()
     expect(!overflowing_stream.valid(), "stream rejects an overflowing LBA range");
 }
 
+void test_reliable_cdda_sector_source()
+{
+    using namespace cd404;
+
+    constexpr std::size_t kSectorBytes =
+        static_cast<std::size_t>(core::kCdBytesPerSector);
+    FaultInjectingSectorSource source(0, 8);
+    source.fail_next_reads(2);
+    audio::ReliableCddaSectorSource reliable(
+        source,
+        audio::ReliableReadPolicy{3, true});
+
+    std::array<std::byte, 2 * kSectorBytes> first_block{};
+    const auto first_result = reliable.read_sectors(0, first_block);
+    expect(
+        first_result.status == audio::ReadStatus::ok &&
+            first_result.sectors_read == 2,
+        "reliable source recovers after two bounded I/O retries");
+    expect(
+        read_pattern_frame(first_block, 0) == 0 &&
+            read_pattern_frame(
+                first_block,
+                2 * static_cast<std::size_t>(core::kCdSampleFramesPerSector) - 1) ==
+                2 * static_cast<std::size_t>(core::kCdSampleFramesPerSector) - 1,
+        "retried block preserves the exact source frames");
+
+    source.corrupt_next_read_starting_at(1);
+    std::array<std::byte, 2 * kSectorBytes> second_block{};
+    const auto second_result = reliable.read_sectors(2, second_block);
+    const auto& statistics = reliable.statistics();
+    expect(
+        second_result.status == audio::ReadStatus::ok &&
+            second_result.sectors_read == 2,
+        "overlap mismatch is retried and a matching block is delivered");
+    expect(
+        read_pattern_frame(second_block, 0) ==
+            2 * static_cast<std::size_t>(core::kCdSampleFramesPerSector),
+        "overlap verification does not duplicate the verification sector");
+    expect(
+        statistics.logical_reads == 2 && statistics.device_reads == 5 &&
+            statistics.retries == 3 && statistics.overlap_checks == 2 &&
+            statistics.overlap_mismatches == 1 &&
+            statistics.sectors_delivered == 4,
+        "reliable source exposes retry and overlap statistics");
+
+    FaultInjectingSectorSource failing_source(0, 4);
+    failing_source.fail_next_reads(3);
+    audio::ReliableCddaSectorSource bounded_source(
+        failing_source,
+        audio::ReliableReadPolicy{2, true});
+    std::array<std::byte, kSectorBytes> failed_block{};
+    const auto failed_result = bounded_source.read_sectors(0, failed_block);
+    expect(
+        failed_result.status == audio::ReadStatus::io_error &&
+            failed_result.sectors_read == 0 &&
+            bounded_source.statistics().device_reads == 2 &&
+            bounded_source.statistics().retries == 1,
+        "reliable source stops after the configured attempt limit");
+}
+
 void test_cdda_pcm_conversion()
 {
     using namespace cd404::audio;
@@ -620,6 +739,7 @@ int main()
     test_cd_text_parsing();
     test_gnudb_identity_and_entry();
     test_continuous_cdda_stream();
+    test_reliable_cdda_sector_source();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();
 

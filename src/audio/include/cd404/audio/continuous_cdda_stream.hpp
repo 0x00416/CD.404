@@ -33,7 +33,7 @@ public:
 private:
     [[nodiscard]] SectorReadResult fill_cache();
 
-    static constexpr std::size_t kCacheSectorCount = 16;
+    static constexpr std::size_t kCacheSectorCount = 32;
     static constexpr std::size_t kCacheByteCount =
         kCacheSectorCount * static_cast<std::size_t>(core::kCdBytesPerSector);
 
