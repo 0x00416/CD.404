@@ -9,9 +9,11 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <cd404/audio/playback_recovery.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/listenbrainz/playback_tracker.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
+#include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
@@ -518,8 +520,13 @@ private:
             }
             break;
         case WM_DEVICECHANGE:
-            refresh_disc();
-            return 0;
+        case WM_POWERBROADCAST:
+            handle_device_lifecycle(
+                platform::windows::classify_device_lifecycle_message(
+                    message,
+                    wparam,
+                    reinterpret_cast<const void*>(lparam)));
+            return message == WM_POWERBROADCAST ? TRUE : 0;
         case WM_TIMER:
             if (wparam == kAnimationTimer) {
                 update_playback_clock();
@@ -1852,11 +1859,22 @@ private:
 
     void refresh_disc()
     {
+        const auto actions = playback_recovery_.request_disc_refresh();
+        if (!actions.refresh_disc) {
+            return;
+        }
+        begin_disc_refresh(true);
+    }
+
+    void begin_disc_refresh(const bool stop_first)
+    {
+        if (stop_first) {
+            persist_playback_position();
+            stop_playback();
+        }
         if (disc_loading_ || disc_worker_.joinable()) {
             return;
         }
-        persist_playback_position();
-        stop_playback();
         disc_loading_ = true;
         ui_message_.clear();
         InvalidateRect(window_, nullptr, FALSE);
@@ -1880,6 +1898,18 @@ private:
             disc_worker_.join();
         }
         disc_loading_ = false;
+        const std::wstring snapshot_key = snapshot->toc
+            ? platform::windows::make_disc_settings_key(*snapshot->toc)
+            : std::wstring{};
+        const auto recovery_actions = playback_recovery_.complete_disc_refresh(
+            snapshot_key,
+            snapshot->toc.has_value());
+        if (recovery_actions.discard_disc_snapshot) {
+            if (recovery_actions.refresh_disc) {
+                refresh_disc();
+            }
+            return;
+        }
         ++disc_generation_;
         disc_ = std::move(*snapshot);
         selected_track_ = first_audio_track();
@@ -1888,6 +1918,53 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
         sync_system_media(true);
         start_online_metadata_lookup();
+        if (recovery_actions.restart_playback) {
+            start_playback(playback_track_frame_);
+        }
+    }
+
+    void handle_device_lifecycle(
+        const platform::windows::DeviceLifecycleEvent event)
+    {
+        using platform::windows::DeviceLifecycleEvent;
+
+        switch (event) {
+        case DeviceLifecycleEvent::optical_media_changed: {
+            const auto actions = playback_recovery_.media_changed(playback_active_);
+            if (actions.stop_playback) {
+                persist_playback_position();
+                stop_playback();
+            }
+            if (actions.refresh_disc) {
+                begin_disc_refresh(!actions.stop_playback);
+            }
+            return;
+        }
+        case DeviceLifecycleEvent::suspending: {
+            const auto actions = playback_recovery_.suspend(
+                playback_active_,
+                playback_paused_,
+                current_disc_key_);
+            if (actions.stop_playback) {
+                persist_playback_position();
+                stop_playback(true);
+                ui_message_ = L"播放已暂停，等待系统唤醒";
+                ui_message_is_error_ = false;
+            }
+            return;
+        }
+        case DeviceLifecycleEvent::resumed: {
+            const auto actions = playback_recovery_.resume();
+            if (actions.refresh_disc) {
+                ui_message_ = L"正在重新检查光盘和音频设备";
+                ui_message_is_error_ = false;
+                begin_disc_refresh(false);
+            }
+            return;
+        }
+        case DeviceLifecycleEvent::none:
+            return;
+        }
     }
 
     void start_online_metadata_lookup()
@@ -2349,11 +2426,15 @@ private:
 
     void start_playback(
         const core::SampleFrame offset_frames,
-        const bool preserve_listen_session = false)
+        const bool preserve_listen_session = false,
+        const bool endpoint_recovery = false)
     {
         if (selected_track_ >= disc_.tracks.size() ||
             !disc_.tracks[selected_track_].is_audio || !disc_.drive) {
             return;
+        }
+        if (!endpoint_recovery) {
+            playback_recovery_.begin_playback_intent();
         }
         const bool resume_session =
             (playback_paused_ || preserve_listen_session) &&
@@ -2463,6 +2544,9 @@ private:
         }
 
         const auto progress = playback_engine_.progress();
+        if (progress.frames_rendered >= core::kCdSampleFramesPerSecond) {
+            playback_recovery_.playback_became_stable();
+        }
         core::SampleFrame track_frame =
             playback_start_offset_frames_ + progress.frames_rendered;
         std::size_t track_index = playback_start_track_;
@@ -2519,6 +2603,21 @@ private:
         }
 
         update_playback_clock();
+        if (platform::windows::is_recoverable_default_endpoint_failure(*result)) {
+            const auto recovery_actions =
+                playback_recovery_.endpoint_failed(playback_active_);
+            if (recovery_actions.restart_playback) {
+                const core::SampleFrame restart_offset = playback_track_frame_;
+                playback_active_ = false;
+                playback_paused_ = false;
+                ui_message_ = L"默认音频设备已失效，正在切换并恢复播放";
+                ui_message_is_error_ = false;
+                start_playback(restart_offset, true, true);
+                return;
+            }
+        }
+        const bool media_unavailable =
+            platform::windows::is_media_unavailable_failure(*result);
         const bool had_listenbrainz_session = listenbrainz_tracker_.active();
         listenbrainz_tracker_.end();
         if (had_listenbrainz_session) {
@@ -2543,6 +2642,12 @@ private:
             result->error != platform::windows::CddaPlaybackError::cancelled) {
             set_playback_error(*result);
         }
+        if (media_unavailable) {
+            const auto recovery_actions = playback_recovery_.media_changed(false);
+            if (recovery_actions.refresh_disc) {
+                begin_disc_refresh(false);
+            }
+        }
         InvalidateRect(window_, nullptr, FALSE);
     }
 
@@ -2565,9 +2670,15 @@ private:
             break;
         case CddaPlaybackError::output_open_failed:
         case CddaPlaybackError::output_failed:
-            ui_message_ = std::format(
-                L"音频设备错误：0x{:08X}",
-                static_cast<std::uint32_t>(result.audio_status));
+            if (platform::windows::is_recoverable_default_endpoint_failure(result)) {
+                ui_message_ = std::format(
+                    L"默认音频设备恢复失败：0x{:08X}，请检查输出设备",
+                    static_cast<std::uint32_t>(result.audio_status));
+            } else {
+                ui_message_ = std::format(
+                    L"音频设备错误：0x{:08X}",
+                    static_cast<std::uint32_t>(result.audio_status));
+            }
             break;
         default:
             ui_message_ = L"播放未能完成";
@@ -3382,6 +3493,7 @@ private:
     HFONT settings_font_{};
     HBRUSH settings_edit_brush_{};
     platform::windows::CddaPlaybackEngine playback_engine_;
+    audio::PlaybackRecoveryCoordinator playback_recovery_;
     platform::windows::ListenBrainzReporter listenbrainz_reporter_;
     listenbrainz::PlaybackTracker listenbrainz_tracker_;
     platform::windows::SystemMediaControls system_media_controls_;

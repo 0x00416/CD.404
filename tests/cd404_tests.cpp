@@ -3,6 +3,7 @@
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
 #include <cd404/audio/pcm16_volume.hpp>
+#include <cd404/audio/playback_recovery.hpp>
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
@@ -716,6 +717,75 @@ void test_playback_state_machine()
         "failed playback can reset for a later session");
 }
 
+void test_playback_recovery_coordinator()
+{
+    using cd404::audio::PlaybackRecoveryCoordinator;
+
+    PlaybackRecoveryCoordinator refresh;
+    const auto initial_refresh = refresh.request_disc_refresh();
+    expect(
+        initial_refresh.refresh_disc && !initial_refresh.discard_disc_snapshot,
+        "first disc refresh starts immediately");
+    const auto coalesced_refresh = refresh.request_disc_refresh();
+    expect(
+        !coalesced_refresh.refresh_disc,
+        "disc changes are coalesced while a refresh is active");
+    const auto stale_completion = refresh.complete_disc_refresh(L"disc-a", true);
+    expect(
+        stale_completion.refresh_disc && stale_completion.discard_disc_snapshot,
+        "a coalesced change discards the stale snapshot and refreshes again");
+    const auto current_completion = refresh.complete_disc_refresh(L"disc-b", true);
+    expect(
+        !current_completion.refresh_disc &&
+            !current_completion.discard_disc_snapshot,
+        "the newest disc snapshot completes the refresh sequence");
+
+    PlaybackRecoveryCoordinator same_disc_resume;
+    const auto suspend = same_disc_resume.suspend(true, false, L"disc-a");
+    expect(
+        suspend.stop_playback,
+        "suspend requests ordered playback shutdown");
+    const auto resume = same_disc_resume.resume();
+    expect(
+        resume.refresh_disc,
+        "resume revalidates the optical drive before playback");
+    const auto same_disc = same_disc_resume.complete_disc_refresh(L"disc-a", true);
+    expect(
+        same_disc.restart_playback,
+        "playing audio resumes only after the same disc is revalidated");
+
+    PlaybackRecoveryCoordinator changed_disc_resume;
+    static_cast<void>(changed_disc_resume.suspend(true, false, L"disc-a"));
+    static_cast<void>(changed_disc_resume.resume());
+    const auto changed_disc =
+        changed_disc_resume.complete_disc_refresh(L"disc-b", true);
+    expect(
+        !changed_disc.restart_playback,
+        "resume never autoplays a replacement disc");
+
+    PlaybackRecoveryCoordinator paused_resume;
+    static_cast<void>(paused_resume.suspend(true, true, L"disc-a"));
+    static_cast<void>(paused_resume.resume());
+    const auto remained_paused =
+        paused_resume.complete_disc_refresh(L"disc-a", true);
+    expect(
+        !remained_paused.restart_playback,
+        "a session paused before sleep remains stopped after wake");
+
+    PlaybackRecoveryCoordinator endpoint;
+    endpoint.begin_playback_intent();
+    expect(
+        endpoint.endpoint_failed(true).restart_playback,
+        "the first default-endpoint invalidation retries playback");
+    expect(
+        !endpoint.endpoint_failed(true).restart_playback,
+        "an immediate second endpoint failure cannot form a retry loop");
+    endpoint.playback_became_stable();
+    expect(
+        endpoint.endpoint_failed(true).restart_playback,
+        "a later endpoint invalidation may recover after stable playback");
+}
+
 void test_cdda_pcm_conversion()
 {
     using namespace cd404::audio;
@@ -1032,6 +1102,7 @@ int main()
     test_continuous_cdda_stream();
     test_reliable_cdda_sector_source();
     test_playback_state_machine();
+    test_playback_recovery_coordinator();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();
     test_pcm16_volume();

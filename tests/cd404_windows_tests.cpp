@@ -1,10 +1,13 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <audioclient.h>
+#include <dbt.h>
 #include <objbase.h>
 
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
+#include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
@@ -51,6 +54,83 @@ void test_result_semantics()
     expect(
         !result.succeeded(),
         "non-terminal playback is not reported as successful");
+}
+
+void test_device_failure_classification()
+{
+    using namespace cd404::platform::windows;
+
+    CddaPlaybackResult endpoint;
+    endpoint.error = CddaPlaybackError::output_failed;
+    endpoint.audio_status = AUDCLNT_E_DEVICE_INVALIDATED;
+    expect(
+        is_recoverable_default_endpoint_failure(endpoint),
+        "WASAPI device invalidation requests default-endpoint recovery");
+    endpoint.audio_status = E_ACCESSDENIED;
+    expect(
+        !is_recoverable_default_endpoint_failure(endpoint),
+        "unrelated WASAPI failures are not silently retried");
+    endpoint.error = CddaPlaybackError::read_failed;
+    endpoint.audio_status = AUDCLNT_E_DEVICE_INVALIDATED;
+    expect(
+        !is_recoverable_default_endpoint_failure(endpoint),
+        "a disc read failure cannot be misclassified as an endpoint change");
+
+    CddaPlaybackResult media;
+    media.error = CddaPlaybackError::read_failed;
+    media.system_error = ERROR_MEDIA_CHANGED;
+    expect(
+        is_media_unavailable_failure(media),
+        "media-change read errors request a disc refresh");
+    media.system_error = ERROR_CRC;
+    expect(
+        !is_media_unavailable_failure(media),
+        "strict read failures remain visible instead of looking like removal");
+    media.error = CddaPlaybackError::no_ready_audio_cd;
+    expect(
+        is_media_unavailable_failure(media),
+        "a no-disc playback result refreshes stale UI state");
+}
+
+void test_device_lifecycle_message_classification()
+{
+    using namespace cd404::platform::windows;
+
+    DEV_BROADCAST_VOLUME media{};
+    media.dbcv_size = sizeof(media);
+    media.dbcv_devicetype = DBT_DEVTYP_VOLUME;
+    media.dbcv_flags = DBTF_MEDIA;
+    expect(
+        classify_device_lifecycle_message(
+            WM_DEVICECHANGE,
+            DBT_DEVICEARRIVAL,
+            &media) == DeviceLifecycleEvent::optical_media_changed,
+        "optical volume arrival is injectable as a media-change event");
+
+    DEV_BROADCAST_VOLUME unrelated_volume = media;
+    unrelated_volume.dbcv_flags = 0;
+    expect(
+        classify_device_lifecycle_message(
+            WM_DEVICECHANGE,
+            DBT_DEVICEARRIVAL,
+            &unrelated_volume) == DeviceLifecycleEvent::none,
+        "an unrelated volume arrival does not interrupt CD playback");
+    expect(
+        classify_device_lifecycle_message(
+            WM_DEVICECHANGE,
+            DBT_DEVNODES_CHANGED,
+            nullptr) == DeviceLifecycleEvent::none,
+        "an unscoped device-node change does not interrupt CD playback");
+    expect(
+        classify_device_lifecycle_message(
+            WM_POWERBROADCAST,
+            PBT_APMSUSPEND,
+            nullptr) == DeviceLifecycleEvent::suspending &&
+            classify_device_lifecycle_message(
+                WM_POWERBROADCAST,
+                PBT_APMRESUMEAUTOMATIC,
+                nullptr) == DeviceLifecycleEvent::resumed,
+        "power broadcasts map to deterministic suspend and resume events");
 }
 
 void test_invalid_requests_without_device_access()
@@ -443,6 +523,8 @@ int main(const int argument_count, char** arguments)
 {
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
+    test_device_failure_classification();
+    test_device_lifecycle_message_classification();
     test_invalid_requests_without_device_access();
     test_volume_control_boundaries();
     test_listenbrainz_payload_contract();

@@ -8,6 +8,7 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 ## 文档
 
 - [产品与工程规划](docs/PRODUCT_PLAN.md)
+- [公开测试版执行计划](docs/PUBLIC_BETA_PLAN.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 
 ## 预定技术栈

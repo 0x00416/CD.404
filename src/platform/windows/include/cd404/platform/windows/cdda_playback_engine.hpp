@@ -74,6 +74,13 @@ struct CddaPlaybackResult final {
     [[nodiscard]] bool succeeded() const noexcept;
 };
 
+// These classifiers keep Win32/WASAPI error details at the platform boundary
+// and expose deterministic recovery decisions to the UI and synthetic tests.
+[[nodiscard]] bool is_recoverable_default_endpoint_failure(
+    const CddaPlaybackResult& result) noexcept;
+[[nodiscard]] bool is_media_unavailable_failure(
+    const CddaPlaybackResult& result) noexcept;
+
 // A reusable blocking playback session. Call play() on a worker thread when it
 // is used by a UI. request_stop() is thread-safe and interrupts pending raw-CD
 // and WASAPI operations through the session's cancellation watcher.

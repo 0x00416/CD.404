@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <audioclient.h>
 
 #include <cd404/audio/cdda_pcm.hpp>
 #include <cd404/audio/continuous_cdda_stream.hpp>
@@ -197,6 +198,47 @@ bool CddaPlaybackResult::succeeded() const noexcept
 {
     return error == CddaPlaybackError::none &&
            final_state == audio::PlaybackState::completed;
+}
+
+bool is_recoverable_default_endpoint_failure(
+    const CddaPlaybackResult& result) noexcept
+{
+    if (result.error != CddaPlaybackError::output_open_failed &&
+        result.error != CddaPlaybackError::output_failed) {
+        return false;
+    }
+
+    switch (static_cast<HRESULT>(result.audio_status)) {
+    case AUDCLNT_E_DEVICE_INVALIDATED:
+    case AUDCLNT_E_RESOURCES_INVALIDATED:
+    case AUDCLNT_E_SERVICE_NOT_RUNNING:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_media_unavailable_failure(const CddaPlaybackResult& result) noexcept
+{
+    if (result.error == CddaPlaybackError::no_ready_audio_cd) {
+        return true;
+    }
+    if (result.error != CddaPlaybackError::source_open_failed &&
+        result.error != CddaPlaybackError::read_failed) {
+        return false;
+    }
+
+    switch (result.system_error) {
+    case ERROR_NOT_READY:
+    case ERROR_MEDIA_CHANGED:
+    case ERROR_NO_MEDIA_IN_DRIVE:
+    case ERROR_DEVICE_NOT_CONNECTED:
+    case ERROR_DEV_NOT_EXIST:
+    case ERROR_INVALID_HANDLE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
@@ -535,6 +577,7 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     static_cast<void>(output.stop());
     cancel_watcher.request_stop();
     cancel_watcher.join();
+    output.close();
 
     if (cancelled || stop_requested_.load(std::memory_order_acquire)) {
         return finish_cancelled();
