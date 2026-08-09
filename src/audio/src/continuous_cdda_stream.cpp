@@ -111,6 +111,18 @@ bool ContinuousCddaStream::seek(const core::SampleFrame frame) noexcept
     return true;
 }
 
+bool reposition_cdda_stream(
+    ContinuousCddaStream& stream,
+    Pcm16SpscRingBuffer& ring,
+    const core::SampleFrame frame) noexcept
+{
+    if (!stream.seek(frame)) {
+        return false;
+    }
+    ring.reset();
+    return true;
+}
+
 SectorReadResult ContinuousCddaStream::fill_cache()
 {
     cache_offset_ = 0;

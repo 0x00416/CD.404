@@ -4,11 +4,16 @@ target_sources(
     cd404_windows
     PRIVATE
         src/cdda_playback_engine.cpp
+        src/device_lifecycle.cpp
+        src/diagnostics.cpp
         src/optical_drive.cpp
         src/http_client.cpp
         src/gnudb_client.cpp
         src/itunes_client.cpp
+        src/listenbrainz_credentials.cpp
         src/listenbrainz_reporter.cpp
+        src/listenbrainz_queue.cpp
+        src/metadata_store.cpp
         src/musicbrainz_client.cpp
         src/online_metadata.cpp
         src/raw_cdda_sector_source.cpp
@@ -20,10 +25,15 @@ target_sources(
         BASE_DIRS include
         FILES
             include/cd404/platform/windows/cdda_playback_engine.hpp
+            include/cd404/platform/windows/device_lifecycle.hpp
+            include/cd404/platform/windows/diagnostics.hpp
             include/cd404/platform/windows/optical_drive.hpp
             include/cd404/platform/windows/gnudb_client.hpp
+            include/cd404/platform/windows/http_client.hpp
             include/cd404/platform/windows/itunes_client.hpp
             include/cd404/platform/windows/listenbrainz_reporter.hpp
+            include/cd404/platform/windows/listenbrainz_queue.hpp
+            include/cd404/platform/windows/metadata_store.hpp
             include/cd404/platform/windows/musicbrainz_client.hpp
             include/cd404/platform/windows/online_metadata.hpp
             include/cd404/platform/windows/raw_cdda_sector_source.hpp
@@ -44,6 +54,7 @@ target_link_libraries(
         kernel32
         advapi32
         ole32
+        propsys
         shell32
         shlwapi
         uuid

@@ -3,11 +3,13 @@
 #include <cd404/audio/continuous_cdda_stream.hpp>
 #include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
 #include <cd404/audio/pcm16_volume.hpp>
+#include <cd404/audio/playback_recovery.hpp>
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/gnudb.hpp>
+#include <cd404/disc/musicbrainz_disc_id.hpp>
 #include <cd404/disc/toc.hpp>
 #include <cd404/listenbrainz/playback_tracker.hpp>
 
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -413,6 +416,41 @@ void test_gnudb_identity_and_entry()
         "GnuDB UTF-8 entry joins repeated fields and separates compilation artists");
 }
 
+void test_musicbrainz_disc_id()
+{
+    using namespace cd404;
+
+    // Official MusicBrainz Disc ID calculation example, expressed as LBA.
+    constexpr std::array entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 15'213, true},
+        disc::RawTocEntry{3, 32'164, true},
+        disc::RawTocEntry{4, 46'442, true},
+        disc::RawTocEntry{5, 63'264, true},
+        disc::RawTocEntry{6, 80'339, true},
+    };
+    disc::TocError error{};
+    const auto toc = disc::Toc::create(entries, 95'312, error);
+    expect(toc.has_value(), "MusicBrainz example TOC is valid");
+    if (!toc) {
+        return;
+    }
+    const auto identity = disc::make_musicbrainz_disc_identity(*toc);
+    expect(
+        identity && identity->disc_id == "49HHV7Eb8UKF3aQiNmu1GR8vKTY-" &&
+            identity->toc == "1 6 95462 150 15363 32314 46592 63414 80489",
+        "MusicBrainz Disc ID matches the official SHA-1 and modified Base64 vector");
+
+    constexpr std::array mixed_entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 10'000, false},
+    };
+    const auto mixed = disc::Toc::create(mixed_entries, 20'000, error);
+    expect(
+        mixed && !disc::make_musicbrainz_disc_identity(*mixed),
+        "a multisession TOC without session lead-out data cannot fabricate an exact Disc ID");
+}
+
 [[nodiscard]] std::uint32_t read_pattern_frame(
     const std::span<const std::byte> bytes,
     const std::size_t frame)
@@ -523,6 +561,92 @@ void test_continuous_cdda_stream()
         extreme_source.first_lba(),
         extreme_source.end_lba());
     expect(!overflowing_stream.valid(), "stream rejects an overflowing LBA range");
+}
+
+void test_repeated_cross_track_repositioning()
+{
+    using namespace cd404;
+
+    PatternSectorSource source(0, 24);
+    audio::ContinuousCddaStream stream(source, 0, 24);
+    audio::Pcm16SpscRingBuffer ring(16);
+    const core::SampleFrame boundary =
+        12 * core::kCdSampleFramesPerSector;
+
+    for (std::size_t iteration = 0; iteration < 128; ++iteration) {
+        const std::array<std::int16_t, 4> stale_samples{
+            static_cast<std::int16_t>(iteration),
+            -1,
+            static_cast<std::int16_t>(iteration),
+            -1,
+        };
+        expect(
+            ring.push(stale_samples).frames_transferred == 2,
+            "reposition stress queues old-timeline samples");
+
+        const core::SampleFrame jitter = static_cast<core::SampleFrame>(
+            static_cast<int>(iteration % 11) - 5);
+        const core::SampleFrame target = boundary + jitter;
+        expect(
+            audio::reposition_cdda_stream(stream, ring, target),
+            "reposition stress accepts exact cross-track targets");
+        expect(
+            ring.readable_frames() == 0 && !ring.closed(),
+            "reposition stress discards every old-timeline frame");
+
+        std::array<std::byte, 3 * core::kCdBytesPerSampleFrame> bytes{};
+        const auto read = stream.read_frames(bytes);
+        expect(
+            read.status == audio::ReadStatus::ok && read.frames_read == 3 &&
+                read_pattern_frame(bytes, 0) == target &&
+                read_pattern_frame(bytes, 1) == target + 1 &&
+                read_pattern_frame(bytes, 2) == target + 2,
+            "reposition stress resumes with three exact consecutive frames");
+    }
+
+    constexpr std::uint64_t kSeed = 0xCD4045EEDULL;
+    std::mt19937_64 random(kSeed);
+    PatternSectorSource long_source(0, 96);
+    audio::ContinuousCddaStream long_stream(long_source, 0, 96);
+    audio::Pcm16SpscRingBuffer long_ring(32);
+    const auto total_frames = long_stream.total_frames();
+
+    bool all_exact = true;
+    for (std::size_t iteration = 0; iteration < 4'096 && all_exact; ++iteration) {
+        const auto read_frames = static_cast<std::size_t>(1 + random() % 16);
+        const auto target = static_cast<core::SampleFrame>(
+            random() % static_cast<std::uint64_t>(total_frames - read_frames));
+        const std::array<std::int16_t, 4> stale_samples{
+            static_cast<std::int16_t>(iteration),
+            static_cast<std::int16_t>(~iteration),
+            static_cast<std::int16_t>(iteration),
+            static_cast<std::int16_t>(~iteration),
+        };
+        const auto queued = long_ring.push(stale_samples);
+        const bool repositioned =
+            audio::reposition_cdda_stream(long_stream, long_ring, target);
+        std::vector<std::byte> bytes(
+            read_frames * static_cast<std::size_t>(core::kCdBytesPerSampleFrame));
+        const auto read = long_stream.read_frames(bytes);
+
+        bool exact = queued.frames_transferred == 2 && repositioned &&
+            long_ring.readable_frames() == 0 && !long_ring.closed() &&
+            read.status == audio::ReadStatus::ok &&
+            read.frames_read == read_frames;
+        for (std::size_t frame = 0; exact && frame < read_frames; ++frame) {
+            exact = read_pattern_frame(bytes, frame) ==
+                static_cast<std::uint64_t>(target) + frame;
+        }
+        if (!exact) {
+            std::cerr << "reposition seed=0xCD4045EED iteration=" << iteration
+                      << " target=" << target << " frames=" << read_frames
+                      << '\n';
+            all_exact = false;
+        }
+    }
+    expect(
+        all_exact,
+        "seed 0xCD4045EED random reposition preserves exact frames and clears stale data");
 }
 
 void test_reliable_cdda_sector_source()
@@ -714,6 +838,75 @@ void test_playback_state_machine()
         failed.apply(PlaybackEvent::reset) &&
             failed.state() == PlaybackState::idle,
         "failed playback can reset for a later session");
+}
+
+void test_playback_recovery_coordinator()
+{
+    using cd404::audio::PlaybackRecoveryCoordinator;
+
+    PlaybackRecoveryCoordinator refresh;
+    const auto initial_refresh = refresh.request_disc_refresh();
+    expect(
+        initial_refresh.refresh_disc && !initial_refresh.discard_disc_snapshot,
+        "first disc refresh starts immediately");
+    const auto coalesced_refresh = refresh.request_disc_refresh();
+    expect(
+        !coalesced_refresh.refresh_disc,
+        "disc changes are coalesced while a refresh is active");
+    const auto stale_completion = refresh.complete_disc_refresh(L"disc-a", true);
+    expect(
+        stale_completion.refresh_disc && stale_completion.discard_disc_snapshot,
+        "a coalesced change discards the stale snapshot and refreshes again");
+    const auto current_completion = refresh.complete_disc_refresh(L"disc-b", true);
+    expect(
+        !current_completion.refresh_disc &&
+            !current_completion.discard_disc_snapshot,
+        "the newest disc snapshot completes the refresh sequence");
+
+    PlaybackRecoveryCoordinator same_disc_resume;
+    const auto suspend = same_disc_resume.suspend(true, false, L"disc-a");
+    expect(
+        suspend.stop_playback,
+        "suspend requests ordered playback shutdown");
+    const auto resume = same_disc_resume.resume();
+    expect(
+        resume.refresh_disc,
+        "resume revalidates the optical drive before playback");
+    const auto same_disc = same_disc_resume.complete_disc_refresh(L"disc-a", true);
+    expect(
+        same_disc.restart_playback,
+        "playing audio resumes only after the same disc is revalidated");
+
+    PlaybackRecoveryCoordinator changed_disc_resume;
+    static_cast<void>(changed_disc_resume.suspend(true, false, L"disc-a"));
+    static_cast<void>(changed_disc_resume.resume());
+    const auto changed_disc =
+        changed_disc_resume.complete_disc_refresh(L"disc-b", true);
+    expect(
+        !changed_disc.restart_playback,
+        "resume never autoplays a replacement disc");
+
+    PlaybackRecoveryCoordinator paused_resume;
+    static_cast<void>(paused_resume.suspend(true, true, L"disc-a"));
+    static_cast<void>(paused_resume.resume());
+    const auto remained_paused =
+        paused_resume.complete_disc_refresh(L"disc-a", true);
+    expect(
+        !remained_paused.restart_playback,
+        "a session paused before sleep remains stopped after wake");
+
+    PlaybackRecoveryCoordinator endpoint;
+    endpoint.begin_playback_intent();
+    expect(
+        endpoint.endpoint_failed(true).restart_playback,
+        "the first default-endpoint invalidation retries playback");
+    expect(
+        !endpoint.endpoint_failed(true).restart_playback,
+        "an immediate second endpoint failure cannot form a retry loop");
+    endpoint.playback_became_stable();
+    expect(
+        endpoint.endpoint_failed(true).restart_playback,
+        "a later endpoint invalidation may recover after stable playback");
 }
 
 void test_cdda_pcm_conversion()
@@ -1001,6 +1194,36 @@ void test_listenbrainz_playback_tracker()
         "playing_now waits until required metadata becomes available");
     late_metadata_tracker.end();
 
+    std::vector<listenbrainz::Submission> identity_updates;
+    listenbrainz::PlaybackTracker identity_tracker(
+        [&](const auto& submission) { identity_updates.push_back(submission); });
+    auto identity_late = short_track;
+    identity_late.recording_mbid = L"recording-id";
+    identity_tracker.begin(short_track, 0, 1'700'003'100);
+    identity_tracker.update(
+        identity_late,
+        core::kCdSampleFramesPerSecond,
+        1'700'003'101);
+    identity_late.release_mbid = L"release-id";
+    identity_tracker.update(
+        identity_late,
+        2 * core::kCdSampleFramesPerSecond,
+        1'700'003'102);
+    identity_tracker.update(
+        identity_late,
+        60 * core::kCdSampleFramesPerSecond,
+        1'700'003'160);
+    expect(
+        identity_updates.size() == 3U &&
+            identity_updates[0].type == SubmissionType::playing_now &&
+            identity_updates[0].recording_mbid.empty() &&
+            identity_updates[1].type == SubmissionType::playing_now &&
+            identity_updates[1].recording_mbid == L"recording-id" &&
+            identity_updates[2].type == SubmissionType::single &&
+            identity_updates[2].release_mbid == L"release-id",
+        "late MusicBrainz identity sends one playing_now correction and one formal listen");
+    identity_tracker.end();
+
     std::vector<listenbrainz::Submission> seek_submissions;
     listenbrainz::PlaybackTracker seek_tracker(
         [&](const auto& submission) { seek_submissions.push_back(submission); });
@@ -1029,9 +1252,12 @@ int main()
     test_invalid_toc();
     test_cd_text_parsing();
     test_gnudb_identity_and_entry();
+    test_musicbrainz_disc_id();
     test_continuous_cdda_stream();
+    test_repeated_cross_track_repositioning();
     test_reliable_cdda_sector_source();
     test_playback_state_machine();
+    test_playback_recovery_coordinator();
     test_cdda_pcm_conversion();
     test_pcm16_spsc_ring_buffer();
     test_pcm16_volume();

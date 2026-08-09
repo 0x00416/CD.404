@@ -4,7 +4,10 @@
 
 #include <optional>
 #include <filesystem>
+#include <cstdint>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cd404::platform::windows {
@@ -20,14 +23,33 @@ struct MusicBrainzMetadata final {
     std::vector<std::wstring> recording_ids;
     std::vector<std::vector<std::wstring>> track_artist_ids;
     std::filesystem::path cover_art_path;
+    bool exact_disc_id_match{};
 };
 
 struct MusicBrainzLookupResult final {
     std::optional<MusicBrainzMetadata> metadata;
     unsigned long system_error{};
     unsigned long http_status{};
+    std::vector<MusicBrainzMetadata> candidates;
+    bool used_fuzzy_fallback{};
 };
 
-[[nodiscard]] MusicBrainzLookupResult lookup_musicbrainz(const disc::Toc& toc);
+struct MusicBrainzLookupPaths final {
+    std::wstring exact;
+    std::wstring fuzzy;
+};
+
+[[nodiscard]] std::optional<MusicBrainzLookupPaths>
+make_musicbrainz_lookup_paths(const disc::Toc& toc);
+
+// Exposed for deterministic tests and alternate HTTP transports.
+[[nodiscard]] std::vector<MusicBrainzMetadata> parse_musicbrainz_candidates(
+    std::span<const std::uint8_t> body,
+    std::span<const std::uint64_t> expected_lengths,
+    bool exact_disc_id_match);
+
+[[nodiscard]] MusicBrainzLookupResult lookup_musicbrainz(
+    const disc::Toc& toc,
+    std::wstring_view preferred_release_id = {});
 
 } // namespace cd404::platform::windows

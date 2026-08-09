@@ -24,6 +24,7 @@ using namespace winrt::Windows::Data::Json;
 constexpr std::uint64_t kFnvOffset = 14'695'981'039'346'656'037ULL;
 constexpr std::uint64_t kFnvPrime = 1'099'511'628'211ULL;
 constexpr std::uintmax_t kMaximumSettingsBytes = 1U * 1'024U * 1'024U;
+constexpr std::size_t kMaximumEndpointIdCharacters = 4'096;
 
 void hash_value(std::uint64_t& hash, std::uint64_t value) noexcept
 {
@@ -125,13 +126,28 @@ std::wstring make_disc_settings_key(const disc::Toc& toc)
 std::wstring encode_user_settings(const UserSettings& settings)
 {
     JsonObject root;
-    root.Insert(L"version", JsonValue::CreateNumberValue(1));
+    root.Insert(L"version", JsonValue::CreateNumberValue(3));
     root.Insert(
         L"volume",
         JsonValue::CreateNumberValue(std::clamp(settings.volume, 0.0F, 1.0F)));
     root.Insert(
         L"listenbrainz_reporting_enabled",
         JsonValue::CreateBooleanValue(settings.listenbrainz_reporting_enabled));
+    root.Insert(
+        L"audio_output_engine",
+        JsonValue::CreateStringValue(L"wasapi"));
+    if (!settings.audio_endpoint_id.empty() &&
+        settings.audio_endpoint_id.size() <= kMaximumEndpointIdCharacters) {
+        root.Insert(
+            L"audio_endpoint_id",
+            JsonValue::CreateStringValue(settings.audio_endpoint_id));
+    }
+    root.Insert(
+        L"audio_exclusive_mode",
+        JsonValue::CreateBooleanValue(settings.audio_exclusive_mode));
+    root.Insert(
+        L"audio_allow_shared_fallback",
+        JsonValue::CreateBooleanValue(settings.audio_allow_shared_fallback));
 
     JsonObject positions;
     for (const auto& [disc_key, position] : settings.playback_positions) {
@@ -168,6 +184,24 @@ UserSettings decode_user_settings(const std::wstring& json) noexcept
         settings.listenbrainz_reporting_enabled = root.GetNamedBoolean(
             L"listenbrainz_reporting_enabled",
             settings.listenbrainz_reporting_enabled);
+        const std::wstring output_engine = root.GetNamedString(
+            L"audio_output_engine",
+            L"wasapi").c_str();
+        settings.audio_output_engine = output_engine == L"wasapi"
+            ? AudioOutputEngine::wasapi
+            : AudioOutputEngine::wasapi;
+        settings.audio_endpoint_id = root.GetNamedString(
+            L"audio_endpoint_id",
+            L"").c_str();
+        if (settings.audio_endpoint_id.size() > kMaximumEndpointIdCharacters) {
+            settings.audio_endpoint_id.clear();
+        }
+        settings.audio_exclusive_mode = root.GetNamedBoolean(
+            L"audio_exclusive_mode",
+            false);
+        settings.audio_allow_shared_fallback = root.GetNamedBoolean(
+            L"audio_allow_shared_fallback",
+            false);
 
         const JsonObject positions = root.GetNamedObject(
             L"playback_positions",

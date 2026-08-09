@@ -5,6 +5,7 @@ target_sources(
     PRIVATE
         src/cd_text.cpp
         src/gnudb.cpp
+        src/musicbrainz_disc_id.cpp
         src/toc.cpp
     PUBLIC
         FILE_SET HEADERS
@@ -12,6 +13,7 @@ target_sources(
         FILES
             include/cd404/disc/cd_text.hpp
             include/cd404/disc/gnudb.hpp
+            include/cd404/disc/musicbrainz_disc_id.hpp
             include/cd404/disc/toc.hpp
 )
 

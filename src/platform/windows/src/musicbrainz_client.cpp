@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <cd404/platform/windows/musicbrainz_client.hpp>
+#include <cd404/disc/musicbrainz_disc_id.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -51,7 +52,7 @@ private:
     HINTERNET handle_{};
 };
 
-[[nodiscard]] std::wstring make_lookup_path(const disc::Toc& toc)
+[[nodiscard]] std::wstring make_fuzzy_lookup_path(const disc::Toc& toc)
 {
     const auto tracks = toc.tracks();
     if (tracks.empty()) {
@@ -250,7 +251,7 @@ private:
 
 struct XmlState final {
     MusicBrainzMetadata candidate;
-    std::optional<MusicBrainzMetadata> best_match;
+    std::vector<std::pair<std::uint64_t, MusicBrainzMetadata>> matches;
     std::vector<std::wstring> element_stack;
     std::vector<std::uint64_t> track_lengths;
     std::wstring text;
@@ -261,7 +262,6 @@ struct XmlState final {
     std::vector<std::wstring> current_track_artist_ids;
     std::wstring track_pending_join_phrase;
     std::optional<std::uint64_t> current_track_length;
-    std::uint64_t best_score{std::numeric_limits<std::uint64_t>::max()};
     std::size_t release_depth{std::numeric_limits<std::size_t>::max()};
     std::size_t medium_depth{std::numeric_limits<std::size_t>::max()};
     std::size_t track_list_depth{std::numeric_limits<std::size_t>::max()};
@@ -404,9 +404,8 @@ void end_element(
             const bool durations_match =
                 maximum_difference <= kMaximumSingleTrackDifferenceMilliseconds &&
                 score <= kMaximumAverageTrackDifferenceMilliseconds * expected_tracks;
-            if (durations_match && score < state.best_score) {
-                state.best_score = score;
-                state.best_match = state.candidate;
+            if (durations_match) {
+                state.matches.emplace_back(score, state.candidate);
             }
         }
         state.medium_depth = std::numeric_limits<std::size_t>::max();
@@ -430,17 +429,17 @@ void end_element(
     state.text.clear();
 }
 
-[[nodiscard]] std::optional<MusicBrainzMetadata> parse_response(
+[[nodiscard]] std::vector<MusicBrainzMetadata> parse_response(
     const std::span<const std::uint8_t> body,
     const std::span<const std::uint64_t> expected_lengths)
 {
     if (body.empty() || body.size() > std::numeric_limits<UINT>::max()) {
-        return std::nullopt;
+        return {};
     }
 
     ComPtr<IStream> stream(SHCreateMemStream(body.data(), static_cast<UINT>(body.size())));
     if (!stream) {
-        return std::nullopt;
+        return {};
     }
     ComPtr<IXmlReader> reader;
     if (FAILED(CreateXmlReader(
@@ -448,7 +447,7 @@ void end_element(
             reinterpret_cast<void**>(reader.ReleaseAndGetAddressOf()),
             nullptr)) ||
         FAILED(reader->SetInput(stream.Get()))) {
-        return std::nullopt;
+        return {};
     }
     static_cast<void>(reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit));
 
@@ -458,7 +457,7 @@ void end_element(
         if (node_type == XmlNodeType_Element) {
             const wchar_t* local_name{};
             if (FAILED(reader->GetLocalName(&local_name, nullptr)) || local_name == nullptr) {
-                return std::nullopt;
+                return {};
             }
             begin_element(state, *reader.Get(), local_name, expected_lengths.size());
             if (reader->IsEmptyElement() != FALSE) {
@@ -474,20 +473,66 @@ void end_element(
         } else if (node_type == XmlNodeType_EndElement) {
             const wchar_t* local_name{};
             if (FAILED(reader->GetLocalName(&local_name, nullptr)) || local_name == nullptr) {
-                return std::nullopt;
+                return {};
             }
             end_element(state, local_name, expected_lengths);
         }
     }
-    return state.best_match;
+    std::ranges::sort(state.matches, {}, &decltype(state.matches)::value_type::first);
+    std::vector<MusicBrainzMetadata> candidates;
+    for (auto& [score, candidate] : state.matches) {
+        static_cast<void>(score);
+        if (candidate.release_id.empty() ||
+            std::ranges::find(
+                candidates,
+                candidate.release_id,
+                &MusicBrainzMetadata::release_id) != candidates.end()) {
+            continue;
+        }
+        candidates.push_back(std::move(candidate));
+    }
+    return candidates;
 }
 
 } // namespace
 
-MusicBrainzLookupResult lookup_musicbrainz(const disc::Toc& toc)
+std::optional<MusicBrainzLookupPaths> make_musicbrainz_lookup_paths(
+    const disc::Toc& toc)
 {
-    const std::wstring path = make_lookup_path(toc);
-    if (path.empty()) {
+    const auto identity = disc::make_musicbrainz_disc_identity(toc);
+    const std::wstring fuzzy = make_fuzzy_lookup_path(toc);
+    if (!identity || fuzzy.empty()) {
+        return std::nullopt;
+    }
+    const std::wstring disc_id(
+        identity->disc_id.begin(),
+        identity->disc_id.end());
+    constexpr std::wstring_view includes =
+        L"inc=recordings+artist-credits+release-groups&cdstubs=no";
+    return MusicBrainzLookupPaths{
+        L"/ws/2/discid/" + disc_id + L"?" + std::wstring(includes),
+        fuzzy,
+    };
+}
+
+std::vector<MusicBrainzMetadata> parse_musicbrainz_candidates(
+    const std::span<const std::uint8_t> body,
+    const std::span<const std::uint64_t> expected_lengths,
+    const bool exact_disc_id_match)
+{
+    auto candidates = parse_response(body, expected_lengths);
+    for (auto& candidate : candidates) {
+        candidate.exact_disc_id_match = exact_disc_id_match;
+    }
+    return candidates;
+}
+
+MusicBrainzLookupResult lookup_musicbrainz(
+    const disc::Toc& toc,
+    const std::wstring_view preferred_release_id)
+{
+    const auto paths = make_musicbrainz_lookup_paths(toc);
+    if (!paths) {
         return MusicBrainzLookupResult{std::nullopt, ERROR_INVALID_PARAMETER, 0};
     }
 
@@ -510,63 +555,91 @@ MusicBrainzLookupResult lookup_musicbrainz(const disc::Toc& toc)
     if (connection.get() == nullptr) {
         return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
     }
-    InternetHandle request(WinHttpOpenRequest(
-        connection.get(),
-        L"GET",
-        path.c_str(),
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE));
-    if (request.get() == nullptr) {
-        return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
-    }
-
-    if (WinHttpSendRequest(
-            request.get(),
-            WINHTTP_NO_ADDITIONAL_HEADERS,
-            0,
-            WINHTTP_NO_REQUEST_DATA,
-            0,
-            0,
-            0) == FALSE ||
-        WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
-        return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
-    }
-
-    DWORD status{};
-    DWORD status_size = sizeof(status);
-    if (WinHttpQueryHeaders(
-            request.get(),
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &status,
-            &status_size,
-            WINHTTP_NO_HEADER_INDEX) == FALSE) {
-        return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
-    }
-    if (status != 200) {
-        return MusicBrainzLookupResult{std::nullopt, ERROR_SUCCESS, status};
-    }
-
-    std::vector<std::uint8_t> body;
-    if (!read_response(request.get(), body)) {
-        return MusicBrainzLookupResult{std::nullopt, GetLastError(), status};
-    }
     std::vector<std::uint64_t> expected_lengths;
     expected_lengths.reserve(toc.tracks().size());
     for (const auto& track : toc.tracks()) {
         expected_lengths.push_back(static_cast<std::uint64_t>(
             track.frame_count * 1'000 / core::kCdSampleFramesPerSecond));
     }
-    auto metadata = parse_response(body, expected_lengths);
-    if (metadata) {
-        metadata->cover_art_path = download_cover_art(metadata->release_id);
+    unsigned long last_http_status{};
+    for (const std::wstring* path : {&paths->exact, &paths->fuzzy}) {
+        InternetHandle request(WinHttpOpenRequest(
+            connection.get(),
+            L"GET",
+            path->c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE));
+        if (request.get() == nullptr) {
+            return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
+        }
+        if (WinHttpSendRequest(
+                request.get(),
+                WINHTTP_NO_ADDITIONAL_HEADERS,
+                0,
+                WINHTTP_NO_REQUEST_DATA,
+                0,
+                0,
+                0) == FALSE ||
+            WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
+            return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
+        }
+
+        DWORD status{};
+        DWORD status_size = sizeof(status);
+        if (WinHttpQueryHeaders(
+                request.get(),
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &status,
+                &status_size,
+                WINHTTP_NO_HEADER_INDEX) == FALSE) {
+            return MusicBrainzLookupResult{std::nullopt, GetLastError(), 0};
+        }
+        last_http_status = status;
+        if (status != 200) {
+            if (path == &paths->exact && status == 404) {
+                continue;
+            }
+            return MusicBrainzLookupResult{std::nullopt, ERROR_SUCCESS, status};
+        }
+        std::vector<std::uint8_t> body;
+        if (!read_response(request.get(), body)) {
+            return MusicBrainzLookupResult{std::nullopt, GetLastError(), status};
+        }
+        auto candidates = parse_musicbrainz_candidates(
+            body,
+            expected_lengths,
+            path == &paths->exact);
+        if (candidates.empty() && path == &paths->exact) {
+            continue;
+        }
+        const bool exact = path == &paths->exact;
+        const auto preferred = std::ranges::find(
+            candidates,
+            preferred_release_id,
+            &MusicBrainzMetadata::release_id);
+        const std::size_t selected = preferred == candidates.end()
+            ? 0U
+            : static_cast<std::size_t>(std::distance(candidates.begin(), preferred));
+        std::optional<MusicBrainzMetadata> metadata;
+        if (!candidates.empty()) {
+            metadata = candidates[selected];
+            metadata->cover_art_path = download_cover_art(metadata->release_id);
+        }
+        MusicBrainzLookupResult lookup;
+        lookup.metadata = std::move(metadata);
+        lookup.system_error = lookup.metadata ? ERROR_SUCCESS : ERROR_NOT_FOUND;
+        lookup.http_status = status;
+        lookup.candidates = std::move(candidates);
+        lookup.used_fuzzy_fallback = !exact;
+        return lookup;
     }
     return MusicBrainzLookupResult{
-        std::move(metadata),
-        static_cast<unsigned long>(metadata ? ERROR_SUCCESS : ERROR_NOT_FOUND),
-        status,
+        std::nullopt,
+        ERROR_NOT_FOUND,
+        last_http_status,
     };
 }
 

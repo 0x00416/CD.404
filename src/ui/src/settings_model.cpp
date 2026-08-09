@@ -1,0 +1,90 @@
+#include <cd404/ui/settings_model.hpp>
+
+#include <algorithm>
+
+namespace cd404::ui {
+
+std::size_t find_audio_endpoint_index(
+    const std::span<const platform::windows::WasapiEndpoint> endpoints,
+    const std::wstring_view endpoint_id) noexcept
+{
+    const auto selected = std::ranges::find(
+        endpoints,
+        endpoint_id,
+        &platform::windows::WasapiEndpoint::id);
+    return selected == endpoints.end()
+        ? 0U
+        : static_cast<std::size_t>(selected - endpoints.begin());
+}
+
+bool select_next_audio_endpoint(
+    const std::span<const platform::windows::WasapiEndpoint> endpoints,
+    std::size_t& selected_index,
+    platform::windows::UserSettings& settings)
+{
+    if (endpoints.empty()) {
+        return false;
+    }
+    selected_index = (selected_index + 1U) % endpoints.size();
+    settings.audio_endpoint_id = endpoints[selected_index].id;
+    return true;
+}
+
+bool select_audio_endpoint(
+    const std::span<const platform::windows::WasapiEndpoint> endpoints,
+    const std::size_t requested_index,
+    std::size_t& selected_index,
+    platform::windows::UserSettings& settings)
+{
+    if (requested_index >= endpoints.size()) {
+        return false;
+    }
+    selected_index = requested_index;
+    settings.audio_endpoint_id = endpoints[selected_index].id;
+    return true;
+}
+
+std::size_t audio_output_engine_count() noexcept
+{
+    return 1U;
+}
+
+std::optional<platform::windows::AudioOutputEngine>
+audio_output_engine_at(const std::size_t index) noexcept
+{
+    return index == 0U
+        ? std::optional{platform::windows::AudioOutputEngine::wasapi}
+        : std::nullopt;
+}
+
+std::wstring_view audio_output_engine_label(
+    const platform::windows::AudioOutputEngine engine) noexcept
+{
+    switch (engine) {
+    case platform::windows::AudioOutputEngine::wasapi:
+        return L"WASAPI（Windows 音频）";
+    }
+    return L"WASAPI（Windows 音频）";
+}
+
+void toggle_exclusive_output(
+    platform::windows::UserSettings& settings) noexcept
+{
+    settings.audio_exclusive_mode = !settings.audio_exclusive_mode;
+    if (!settings.audio_exclusive_mode) {
+        settings.audio_allow_shared_fallback = false;
+    }
+}
+
+bool toggle_shared_fallback(
+    platform::windows::UserSettings& settings) noexcept
+{
+    if (!settings.audio_exclusive_mode) {
+        return false;
+    }
+    settings.audio_allow_shared_fallback =
+        !settings.audio_allow_shared_fallback;
+    return true;
+}
+
+} // namespace cd404::ui

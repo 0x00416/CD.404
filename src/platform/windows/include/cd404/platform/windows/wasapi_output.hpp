@@ -2,8 +2,74 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace cd404::platform::windows {
+
+enum class WasapiShareMode {
+    shared,
+    exclusive,
+};
+
+struct WasapiPcmFormat final {
+    std::uint32_t sample_rate{44'100};
+    std::uint16_t channel_count{2};
+    std::uint16_t bits_per_sample{16};
+};
+
+struct WasapiEndpoint final {
+    std::wstring id;
+    std::wstring name;
+    bool is_default{};
+};
+
+struct WasapiOpenOptions final {
+    // Empty selects the current multimedia render endpoint.
+    std::wstring endpoint_id;
+    WasapiShareMode mode{WasapiShareMode::shared};
+    // This is deliberately false unless the user enabled visible fallback.
+    bool allow_shared_fallback{};
+};
+
+struct WasapiOpenResult final {
+    std::int32_t status{};
+    WasapiShareMode requested_mode{WasapiShareMode::shared};
+    WasapiShareMode actual_mode{WasapiShareMode::shared};
+    bool fallback_attempted{};
+    std::int32_t fallback_reason{};
+
+    [[nodiscard]] bool succeeded() const noexcept { return status >= 0; }
+};
+
+// Injectable boundary for deterministic format and fallback tests. Production
+// uses an MMDevice/IAudioClient implementation owned by WasapiOutput.
+class IWasapiSessionBackend {
+public:
+    virtual ~IWasapiSessionBackend() = default;
+    [[nodiscard]] virtual std::int32_t query_format_support(
+        std::wstring_view endpoint_id,
+        WasapiShareMode mode,
+        const WasapiPcmFormat& format) noexcept = 0;
+    [[nodiscard]] virtual std::int32_t initialize(
+        std::wstring_view endpoint_id,
+        WasapiShareMode mode,
+        const WasapiPcmFormat& format) noexcept = 0;
+};
+
+[[nodiscard]] WasapiOpenResult open_wasapi_session(
+    IWasapiSessionBackend& backend,
+    const WasapiOpenOptions& options) noexcept;
+
+[[nodiscard]] std::vector<WasapiEndpoint> enumerate_wasapi_render_endpoints(
+    std::int32_t* status = nullptr) noexcept;
+[[nodiscard]] std::wstring describe_wasapi_status(std::int32_t status);
+[[nodiscard]] const wchar_t* to_string(WasapiShareMode mode) noexcept;
+// Shared mode uses event callbacks. Exclusive mode deliberately uses polling
+// so arbitrary exact frame counts never need fabricated full-buffer packets.
+[[nodiscard]] bool uses_event_driven_wasapi_buffering(
+    WasapiShareMode mode) noexcept;
 
 // Result of a possibly partial write. `frames_written` is always safe to retry
 // from; `status` is S_OK only when every requested frame was accepted.
@@ -33,6 +99,11 @@ public:
     // convert the fixed 44.1 kHz / 16-bit / stereo PCM stream to the endpoint's
     // mix format; input to this class always remains native audio-CD PCM.
     [[nodiscard]] std::int32_t open_default_shared() noexcept;
+
+    // Opens the selected/default endpoint according to an explicit policy and
+    // reports both an exclusive failure and a successful shared fallback.
+    [[nodiscard]] WasapiOpenResult open(
+        const WasapiOpenOptions& options) noexcept;
 
     // Writes interleaved stereo samples. The span must contain exactly two
     // samples per frame (or more when frame_count addresses a prefix). Before
@@ -67,6 +138,7 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept;
     [[nodiscard]] std::uint32_t buffer_frame_count() const noexcept;
+    [[nodiscard]] WasapiOpenResult open_result() const noexcept;
 
 private:
     struct Implementation;

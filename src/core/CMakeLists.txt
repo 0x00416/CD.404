@@ -9,6 +9,7 @@ target_sources(
         BASE_DIRS include
         FILES
             include/cd404/core/cd_time.hpp
+            include/cd404/core/version.hpp
 )
 
 target_compile_features(cd404_core PUBLIC cxx_std_20)

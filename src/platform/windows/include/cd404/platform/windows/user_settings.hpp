@@ -8,6 +8,10 @@
 
 namespace cd404::platform::windows {
 
+enum class AudioOutputEngine {
+    wasapi,
+};
+
 struct SavedPlaybackPosition final {
     unsigned int track_number{};
     core::SampleFrame offset_frames{};
@@ -16,6 +20,10 @@ struct SavedPlaybackPosition final {
 struct UserSettings final {
     float volume{1.0F};
     bool listenbrainz_reporting_enabled{true};
+    AudioOutputEngine audio_output_engine{AudioOutputEngine::wasapi};
+    std::wstring audio_endpoint_id;
+    bool audio_exclusive_mode{};
+    bool audio_allow_shared_fallback{};
     std::map<std::wstring, SavedPlaybackPosition> playback_positions;
 };
 

@@ -2,13 +2,18 @@
 
 CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提供可靠的元数据获取、ListenBrainz 播放记录上报，以及可验证的采样级无缝播放。
 
-项目目前处于底层技术验证阶段，已经能够从实体音频 CD 读取原始 CDDA，
-并通过 Windows 默认音频设备完成最小播放。
+当前版本为 `0.2.0-public-beta.1` 公开测试候选开发分支：核心功能、离线/故障自动测试、
+诊断、隐私和每用户分发方案均已落地；发布前仍需完成检查表中的多硬件矩阵与签名步骤。
 
 ## 文档
 
 - [产品与工程规划](docs/PRODUCT_PLAN.md)
+- [公开测试版执行计划](docs/PUBLIC_BETA_PLAN.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
+- [真实硬件验证手册](docs/HARDWARE_VALIDATION.md)
+- [隐私说明](docs/PRIVACY.md)
+- [第三方说明](THIRD_PARTY_NOTICES.md)
+- [公开测试发布检查表](docs/RELEASE_CHECKLIST.md)
 
 ## 预定技术栈
 
@@ -63,6 +68,22 @@ make release
 其他常用入口包括 `make run`、`make run-release`、`make clean` 和 `make help`。
 Makefile 会通过 Visual Studio Installer 自带的 `vswhere` 自动定位 MSVC；本机路径不会写入仓库。
 `make`、`cmake` 和 `ctest` 需位于 `PATH`，也可以通过同名 Make 变量显式指定其路径。
+`make release` 会先执行 `tools/release-check.ps1`，检查版本同步、发布文件、工作树空白错误、
+本机路径以及误提交的数据库/日志/二进制产物。
+
+## 每用户安装包
+
+Release 使用静态 MSVC 运行库，安装包无需先以管理员权限安装 VC Redistributable。
+安装 Inno Setup 6 后执行：
+
+```powershell
+powershell -File tools/build-installer.ps1
+```
+
+脚本会先重新运行完整 `make release`，再生成安装到
+`%LOCALAPPDATA%\Programs\CD.404` 的 x64 安装包和 SHA-256 文件。签名构建需在受控构建机
+设置 `CD404_SIGNING_THUMBPRINT` 并显式加 `-Sign`；证书、私钥和 Token 均不得进入仓库。
+未安装 Inno Setup 或没有签名证书时，只能验证方案，不能声称安装包已生成或已签名。
 
 推荐在 **Developer PowerShell for VS 2026** 中使用 Ninja：
 
@@ -79,13 +100,20 @@ ctest --preset ninja-msvc-debug
 ```
 
 当前界面会自动读取可用音频 CD 的 TOC，支持曲目选择、滚动、上一首、下一首、播放/暂停、进度定位、音量、刷新和弹出。暂停会停止而不重置当前 WASAPI 客户端，恢复后继续消费同一端点缓冲；播放中切换曲目会自动继续播放目标曲目。图形界面在工作线程中直接运行 `CddaPlaybackEngine`，并根据已经离开 WASAPI 端点缓冲的采样帧更新曲目、曲内时长和进度；`apps/playback` 仅保留为命令行诊断入口。Windows 音量浮层、媒体键和支持 SMTC 的外设可以控制播放、暂停、停止、切轨和定位，应用会向系统同步当前曲目及时间轴。
-元数据优先使用光盘内嵌 CD-TEXT；后台并行查询 MusicBrainz 与 GnuDB，再以可信的专辑/艺术家结果查询 iTunes，并通过音轨数、编号和 TOC 时长差严格校验后补全空字段。来源胶囊只显示本次实际命中的服务。正面封面仅使用 Cover Art Archive 的 1200px 缩略图，缓存位于当前用户的本地应用数据目录，不会写入仓库，也不会下载或复用 iTunes 宣传图。
+界面跟随 Windows 应用浅色/深色主题和系统高对比度颜色，并在主题变化时即时重建资源。
+窗口通过 MSAA 暴露随所选曲目更新的可访问名称；所有主要播放和设置操作都有键盘入口，
+按 `F1` 可打开由屏幕阅读器直接读取的原生快捷键帮助。
+元数据优先使用光盘内嵌 CD-TEXT；后台先按标准 MusicBrainz Disc ID 精确查询，未关联时才使用 TOC 模糊后备，同时并行查询 GnuDB，再以可信的专辑/艺术家结果查询 iTunes。多个 MusicBrainz 发行版可按 `M` 切换并按光盘记忆。专辑下方每个来源胶囊只显示一个本次实际命中的获取来源，例如 `CD-TEXT`、`MusicBrainz`、`GnuDB` 或 `iTunes`；空间不足时自动换行。`F2`/`Shift+F2` 可修订当前曲目，`Ctrl+F2`/`Ctrl+Shift+F2` 可修订专辑，编辑提示会显示当前字段来源；用户值不会被刷新覆盖。文本元数据使用当前用户目录下的版本化持久缓存支持离线启动；正面封面仅使用 Cover Art Archive 的 1200px 缩略图，不会写入仓库，也不会下载或复用 iTunes 宣传图。
 
 首次启动的音量为 100%。应用会在 `%LOCALAPPDATA%\CD.404\settings.json` 保存音量、ListenBrainz 上报选项，以及按 TOC 区分的光盘播放位置；进度使用 44.1 kHz 采样帧而非整秒记录。播放位置记忆和 Windows 媒体控制始终启用，不在设置页显示。该文件是当前用户的本机配置，不属于仓库内容，也不包含 ListenBrainz Token。
 
 ## ListenBrainz 配置
 
 点击播放器右上角的设置按钮会进入独立 ListenBrainz 设置页，可输入、替换或清除 User Token，并开关播放记录上报；输入框会隐藏内容，保存后写入 Windows 凭据管理器并立即生效。播放器优先读取通用凭据 `CD.404/ListenBrainz`，也可读取当前进程的 `CD404_LISTENBRAINZ_TOKEN` 环境变量。Token 不会写入仓库、配置文件或日志。
+
+设置页可按 `G` 或点击“导出脱敏诊断”保存有界运行事件。日志只记录组件、状态码、
+计数和模式，不记录曲名、专辑或账户名；Token、本机绝对路径和稳定音频端点 ID 在写入
+及导出时各脱敏一次。导出位置由用户通过 Windows 保存对话框明确选择。
 
 推荐打开“控制面板 → 凭据管理器 → Windows 凭据 → 添加通用凭据”，将网络地址填写为 `CD.404/ListenBrainz`，用户名可填写 `ListenBrainz`，密码填写个人 User Token。重新启动播放器后生效。
 
@@ -96,7 +124,7 @@ $env:CD404_LISTENBRAINZ_TOKEN = '<个人 User Token>'
 make run-release
 ```
 
-用户单击曲目并创建播放会话时，只要曲名和艺术家可用就立即提交一次 `playing_now`，无需等待光驱预缓冲完成；实际渲染达到曲目时长的一半或 4 分钟（取较短者）后，才将带起播时间的 `single` 写入本地 SQLite 队列并由后台线程上报。设置页会显示已验证账户、待同步、重试和凭据状态；播放主界面不显示上报进度。网络失败按指数退避重试，HTTP 429 优先遵循 ListenBrainz 的 `X-RateLimit-Reset-In`，应用退出后未完成的正式记录仍会保留。
+用户单击曲目并创建播放会话时，只要曲名和艺术家可用就立即提交一次 `playing_now`，无需等待光驱预缓冲完成；若 MusicBrainz 身份随后到达，只补发一次带身份的修正。实际渲染达到曲目时长的一半或 4 分钟（取较短者）后，才将带起播时间的 `single` 写入本地 SQLite 队列并由后台线程上报。设置页会显示已验证账户、待同步、重试和凭据状态，并可只清理当前账户的待同步队列；播放主界面不显示上报进度。网络失败按指数退避重试，HTTP 429 优先遵循 ListenBrainz 的 `X-RateLimit-Reset-In`，401 暂停发送且不删除队列，应用退出后未完成的正式记录仍会保留。
 
 待同步记录位于 `%LOCALAPPDATA%\CD.404\listenbrainz.db`。数据库不保存 User Token，并以不可逆的本地凭据指纹隔离不同账户的队列；Token 始终只保存在 Windows 凭据管理器中。
 
@@ -126,6 +154,17 @@ ctest --preset vs2026-debug
 .\out\build\ninja-msvc-x64\tools\probes\metadata\cd404_metadata_probe.exe
 ```
 
+枚举音频端点，以及显式执行共享回环或独占标记音验证：
+
+```powershell
+.\out\build\ninja-msvc-x64\tools\probes\wasapi\cd404_wasapi_probe.exe --list
+.\out\build\ninja-msvc-x64\tools\probes\wasapi\cd404_wasapi_probe.exe --loopback-shared
+.\out\build\ninja-msvc-x64\tools\probes\wasapi\cd404_wasapi_probe.exe --render-exclusive
+```
+
+后两条命令会输出一秒低幅 997 Hz 标记音；无活动端点时工具打印 `SKIP` 并返回 2，
+不会把缺少硬件误报为成功。端点选择、外部采集和硬件矩阵见验证手册。
+
 播放当前音频 CD 的首个音轨，默认播放 15 秒：
 
 ```powershell
@@ -149,12 +188,18 @@ ctest --preset vs2026-debug
 事件等待。播放后台组件会在独立线程持续读取光盘，以固定容量环形缓冲向 WASAPI 供给
 PCM；相邻音轨之间不会重建光盘数据源、连续流或音频会话。
 混合模式光盘遇到数据轨时会结束当前连续音频区间，避免把数据扇区当作声音播放。
+图形界面在同一连续音频区间内定位或任意切轨时，会清空旧端点/PCM 缓冲并在同一个
+WASAPI 客户端上继续；跨数据轨时显式走安全重建路径。
 
 播放期间会观察 WASAPI 端点的剩余帧数；若光驱供给中断并耗尽端点缓冲，探针会明确
 报告欠载并以失败结束，不会把插入的静音误报为无缝播放成功。
 
 当前默认使用兼容性更好的 WASAPI 共享模式，Windows 可能将音频 CD 的原生格式转换到
-设备混音格式。独占模式和端到端位精确输出仍属于后续工作。
+设备混音格式。设置页通过下拉菜单选择稳定的输出端点并显式启用独占模式；音频引擎
+也保留为独立下拉项，当前只提供 WASAPI，为后续可选 ASIO 后端预留明确边界。独占模式只接受
+44.1 kHz、16 位、双声道 PCM。格式不支持、设备占用或初始化失败会显示明确原因，且仅在
+用户同时启用“失败后回退共享”时回退，不会静默掩盖独占失败。端到端位精确性仍需按
+发布检查表使用真实端点和外部采集设备验证。
 
 所有正式构建产物统一位于 `out/build/<preset>/`，不会加入 Git。根目录不保留编译中间文件；
 `make clean` 会删除整个 `out/`、旧版 `build/` 目录及 SDK 探测残留，随后可直接用 `make` 重新生成。

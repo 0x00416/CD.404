@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cd404/audio/cdda_sector_source.hpp>
+#include <cd404/audio/pcm16_spsc_ring_buffer.hpp>
 
 #include <array>
 #include <cstddef>
@@ -49,5 +50,12 @@ private:
     std::size_t cache_size_{};
     bool valid_{};
 };
+
+// Repositions a stopped producer and clears every queued sample from the old
+// timeline. The ring is reset only after the exact stream position is valid.
+[[nodiscard]] bool reposition_cdda_stream(
+    ContinuousCddaStream& stream,
+    Pcm16SpscRingBuffer& ring,
+    core::SampleFrame frame) noexcept;
 
 } // namespace cd404::audio
