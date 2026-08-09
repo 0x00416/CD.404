@@ -46,6 +46,7 @@ target_link_libraries(
         kernel32
         advapi32
         ole32
+        propsys
         shell32
         shlwapi
         uuid

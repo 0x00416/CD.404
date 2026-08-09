@@ -16,6 +16,9 @@ struct SavedPlaybackPosition final {
 struct UserSettings final {
     float volume{1.0F};
     bool listenbrainz_reporting_enabled{true};
+    std::wstring audio_endpoint_id;
+    bool audio_exclusive_mode{};
+    bool audio_allow_shared_fallback{};
     std::map<std::wstring, SavedPlaybackPosition> playback_positions;
 };
 

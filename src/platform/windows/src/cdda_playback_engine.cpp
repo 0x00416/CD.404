@@ -279,8 +279,9 @@ void LatestCddaSeekCommand::reset() noexcept
 bool is_recoverable_default_endpoint_failure(
     const CddaPlaybackResult& result) noexcept
 {
-    if (result.error != CddaPlaybackError::output_open_failed &&
-        result.error != CddaPlaybackError::output_failed) {
+    if (!result.used_default_output_endpoint ||
+        (result.error != CddaPlaybackError::output_open_failed &&
+         result.error != CddaPlaybackError::output_failed)) {
         return false;
     }
 
@@ -466,6 +467,7 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
         return finish_failed(CddaPlaybackError::invalid_range);
     }
     result.target_frames = target_frames;
+    result.used_default_output_endpoint = request.output.endpoint_id.empty();
     target_frames_.store(target_frames, std::memory_order_release);
     stream_generation_.store(1, std::memory_order_release);
     base_track_number_.store(selected_track.number, std::memory_order_release);
@@ -474,9 +476,9 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     session_final_track_number_.store(final_track.number, std::memory_order_release);
 
     WasapiOutput output;
-    const std::int32_t open_status = output.open_default_shared();
-    if (open_status < 0) {
-        result.audio_status = open_status;
+    result.output_open_result = output.open(request.output);
+    if (!result.output_open_result.succeeded()) {
+        result.audio_status = result.output_open_result.status;
         return finish_failed(CddaPlaybackError::output_open_failed);
     }
     const std::size_t endpoint_buffer_frames = output.buffer_frame_count();

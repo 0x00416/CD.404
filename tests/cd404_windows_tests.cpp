@@ -11,6 +11,7 @@
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
+#include <cd404/platform/windows/wasapi_output.hpp>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -90,6 +91,115 @@ void test_device_failure_classification()
     expect(
         is_media_unavailable_failure(media),
         "a no-disc playback result refreshes stale UI state");
+}
+
+class ScriptedWasapiBackend final
+    : public cd404::platform::windows::IWasapiSessionBackend {
+public:
+    std::int32_t exclusive_support{S_OK};
+    std::int32_t shared_support{S_OK};
+    std::int32_t exclusive_initialize{S_OK};
+    std::int32_t shared_initialize{S_OK};
+    std::vector<cd404::platform::windows::WasapiShareMode> support_checks;
+    std::vector<cd404::platform::windows::WasapiShareMode> initializations;
+
+    std::int32_t query_format_support(
+        std::wstring_view,
+        const cd404::platform::windows::WasapiShareMode mode,
+        const cd404::platform::windows::WasapiPcmFormat& format) noexcept override
+    {
+        expect(
+            format.sample_rate == 44'100 && format.bits_per_sample == 16 &&
+                format.channel_count == 2,
+            "WASAPI negotiation always requests native audio-CD PCM");
+        support_checks.push_back(mode);
+        return mode == cd404::platform::windows::WasapiShareMode::exclusive
+            ? exclusive_support
+            : shared_support;
+    }
+
+    std::int32_t initialize(
+        std::wstring_view,
+        const cd404::platform::windows::WasapiShareMode mode,
+        const cd404::platform::windows::WasapiPcmFormat&) noexcept override
+    {
+        initializations.push_back(mode);
+        return mode == cd404::platform::windows::WasapiShareMode::exclusive
+            ? exclusive_initialize
+            : shared_initialize;
+    }
+};
+
+void test_wasapi_negotiation_and_fallback()
+{
+    using namespace cd404::platform::windows;
+
+    ScriptedWasapiBackend shared_backend;
+    const auto shared = open_wasapi_session(shared_backend, {});
+    expect(
+        shared.succeeded() && shared.requested_mode == WasapiShareMode::shared &&
+            shared.actual_mode == WasapiShareMode::shared &&
+            !shared.fallback_attempted &&
+            shared_backend.initializations ==
+                std::vector{WasapiShareMode::shared},
+        "shared mode is the compatible default and never reports a fallback");
+
+    WasapiOpenOptions exclusive_options;
+    exclusive_options.endpoint_id = L"stable-endpoint-id";
+    exclusive_options.mode = WasapiShareMode::exclusive;
+    ScriptedWasapiBackend exact_backend;
+    const auto exact = open_wasapi_session(exact_backend, exclusive_options);
+    expect(
+        exact.succeeded() && exact.actual_mode == WasapiShareMode::exclusive &&
+            exact_backend.support_checks ==
+                std::vector{WasapiShareMode::exclusive} &&
+            exact_backend.initializations ==
+                std::vector{WasapiShareMode::exclusive},
+        "explicit exclusive mode initializes only after exact format support");
+
+    ScriptedWasapiBackend unsupported_backend;
+    unsupported_backend.exclusive_support = AUDCLNT_E_UNSUPPORTED_FORMAT;
+    const auto unsupported =
+        open_wasapi_session(unsupported_backend, exclusive_options);
+    expect(
+        !unsupported.succeeded() &&
+            unsupported.status == AUDCLNT_E_UNSUPPORTED_FORMAT &&
+            unsupported_backend.initializations.empty() &&
+            !unsupported.fallback_attempted,
+        "unsupported exclusive PCM is explainable and cannot silently fall back");
+
+    exclusive_options.allow_shared_fallback = true;
+    const auto fallback =
+        open_wasapi_session(unsupported_backend, exclusive_options);
+    expect(
+        fallback.succeeded() && fallback.fallback_attempted &&
+            fallback.fallback_reason == AUDCLNT_E_UNSUPPORTED_FORMAT &&
+            fallback.actual_mode == WasapiShareMode::shared &&
+            unsupported_backend.initializations ==
+                std::vector{WasapiShareMode::shared},
+        "explicit fallback preserves the exclusive failure and reports shared mode");
+
+    ScriptedWasapiBackend occupied_backend;
+    occupied_backend.exclusive_initialize = AUDCLNT_E_DEVICE_IN_USE;
+    const auto occupied =
+        open_wasapi_session(occupied_backend, exclusive_options);
+    expect(
+        occupied.succeeded() && occupied.fallback_attempted &&
+            occupied.fallback_reason == AUDCLNT_E_DEVICE_IN_USE &&
+            occupied_backend.initializations == std::vector{
+                WasapiShareMode::exclusive,
+                WasapiShareMode::shared},
+        "exclusive endpoint occupancy uses the same visible fallback policy");
+
+    ScriptedWasapiBackend missing_backend;
+    missing_backend.shared_initialize = AUDCLNT_E_DEVICE_INVALIDATED;
+    WasapiOpenOptions selected_shared;
+    selected_shared.endpoint_id = L"removed-endpoint";
+    const auto missing = open_wasapi_session(missing_backend, selected_shared);
+    expect(
+        !missing.succeeded() && missing.status == AUDCLNT_E_DEVICE_INVALIDATED &&
+            missing.actual_mode == WasapiShareMode::shared,
+        "a disappeared selected endpoint remains a visible initialization failure");
 }
 
 void test_device_lifecycle_message_classification()
@@ -408,13 +518,19 @@ void test_user_settings_round_trip()
     UserSettings source;
     source.volume = 0.37F;
     source.listenbrainz_reporting_enabled = false;
+    source.audio_endpoint_id = L"endpoint-{stable-id}";
+    source.audio_exclusive_mode = true;
+    source.audio_allow_shared_fallback = true;
     source.playback_positions[disc_key] = {2, 123'456};
     const std::wstring json = encode_user_settings(source);
     const UserSettings decoded = decode_user_settings(json);
     const auto position = decoded.playback_positions.find(disc_key);
     expect(
         decoded.volume > 0.369F && decoded.volume < 0.371F &&
-            !decoded.listenbrainz_reporting_enabled,
+            !decoded.listenbrainz_reporting_enabled &&
+            decoded.audio_endpoint_id == source.audio_endpoint_id &&
+            decoded.audio_exclusive_mode &&
+            decoded.audio_allow_shared_fallback,
         "user settings JSON round-trips persistent options");
     expect(
         position != decoded.playback_positions.end() &&
@@ -428,8 +544,11 @@ void test_user_settings_round_trip()
 
     const UserSettings defaults = decode_user_settings(L"not json");
     expect(
-        defaults.volume == 1.0F && defaults.listenbrainz_reporting_enabled,
-        "malformed settings fall back to safe defaults with 100 percent volume");
+        defaults.volume == 1.0F && defaults.listenbrainz_reporting_enabled &&
+            defaults.audio_endpoint_id.empty() &&
+            !defaults.audio_exclusive_mode &&
+            !defaults.audio_allow_shared_fallback,
+        "malformed settings keep shared default output and safe volume");
 }
 
 void test_diagnostic_names()
@@ -606,6 +725,7 @@ int main(const int argument_count, char** arguments)
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
     test_device_failure_classification();
+    test_wasapi_negotiation_and_fallback();
     test_device_lifecycle_message_classification();
     test_invalid_requests_without_device_access();
     test_playback_session_seek_planning();

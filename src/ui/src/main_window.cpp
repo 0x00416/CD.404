@@ -235,6 +235,10 @@ struct Layout final {
     D2D1_RECT_F next_button{};
     D2D1_RECT_F volume_hit{};
     D2D1_RECT_F settings_page{};
+    D2D1_RECT_F settings_audio_card{};
+    D2D1_RECT_F settings_audio_endpoint{};
+    D2D1_RECT_F settings_audio_exclusive_toggle{};
+    D2D1_RECT_F settings_audio_fallback_toggle{};
     D2D1_RECT_F settings_listenbrainz_card{};
     D2D1_RECT_F settings_back{};
     D2D1_RECT_F settings_edit{};
@@ -972,11 +976,31 @@ private:
             88.0F,
             size.width - margin,
             128.0F);
-        result.settings_listenbrainz_card = D2D1::RectF(
+        result.settings_audio_card = D2D1::RectF(
             margin,
             148.0F,
             size.width - margin,
-            342.0F);
+            300.0F);
+        result.settings_audio_endpoint = D2D1::RectF(
+            result.settings_audio_card.left + 24.0F,
+            result.settings_audio_card.top + 72.0F,
+            result.settings_audio_card.right - 230.0F,
+            result.settings_audio_card.top + 120.0F);
+        result.settings_audio_exclusive_toggle = D2D1::RectF(
+            result.settings_audio_card.right - 76.0F,
+            result.settings_audio_card.top + 58.0F,
+            result.settings_audio_card.right - 24.0F,
+            result.settings_audio_card.top + 86.0F);
+        result.settings_audio_fallback_toggle = D2D1::RectF(
+            result.settings_audio_card.right - 76.0F,
+            result.settings_audio_card.top + 100.0F,
+            result.settings_audio_card.right - 24.0F,
+            result.settings_audio_card.top + 128.0F);
+        result.settings_listenbrainz_card = D2D1::RectF(
+            margin,
+            316.0F,
+            size.width - margin,
+            510.0F);
         result.settings_edit = D2D1::RectF(
             result.settings_listenbrainz_card.left + 24.0F,
             result.settings_listenbrainz_card.top + 112.0F,
@@ -2199,6 +2223,12 @@ private:
                 close_settings();
             } else if (key == VK_RETURN) {
                 save_settings();
+            } else if (key == 'D') {
+                select_next_audio_endpoint();
+            } else if (key == 'X') {
+                toggle_exclusive_output();
+            } else if (key == 'F') {
+                toggle_shared_fallback();
             }
             return 0;
         }
@@ -2460,6 +2490,12 @@ private:
                 0,
                 disc_.tracks[selected_track_].frame_count - 1));
         request.maximum_frames.reset();
+        request.output.endpoint_id = user_settings_.audio_endpoint_id;
+        request.output.mode = user_settings_.audio_exclusive_mode
+            ? platform::windows::WasapiShareMode::exclusive
+            : platform::windows::WasapiShareMode::shared;
+        request.output.allow_shared_fallback =
+            user_settings_.audio_allow_shared_fallback;
         if (resume_session) {
             listenbrainz_tracker_.seek(request.offset_frames);
         }
@@ -2650,6 +2686,13 @@ private:
         }
         if (result->succeeded()) {
             playback_completed_ = true;
+            if (result->output_open_result.fallback_attempted) {
+                ui_message_ = L"独占模式失败（" +
+                    platform::windows::describe_wasapi_status(
+                        result->output_open_result.fallback_reason) +
+                    L"），本次已明确回退到共享模式";
+                ui_message_is_error_ = false;
+            }
             if (!current_disc_key_.empty()) {
                 user_settings_.playback_positions.erase(current_disc_key_);
                 persist_user_settings();
@@ -2701,9 +2744,9 @@ private:
                     L"默认音频设备恢复失败：0x{:08X}，请检查输出设备",
                     static_cast<std::uint32_t>(result.audio_status));
             } else {
-                ui_message_ = std::format(
-                    L"音频设备错误：0x{:08X}",
-                    static_cast<std::uint32_t>(result.audio_status));
+                ui_message_ = L"音频设备错误：" +
+                    platform::windows::describe_wasapi_status(
+                        result.audio_status);
             }
             break;
         default:
@@ -3145,6 +3188,18 @@ private:
         settings_save_failed_ = false;
         settings_saved_ = false;
         settings_input_required_ = false;
+        audio_endpoints_ = platform::windows::enumerate_wasapi_render_endpoints(
+            &audio_endpoint_status_);
+        audio_endpoints_.insert(
+            audio_endpoints_.begin(),
+            platform::windows::WasapiEndpoint{L"", L"系统默认设备", true});
+        selected_audio_endpoint_ = 0;
+        for (std::size_t index = 1; index < audio_endpoints_.size(); ++index) {
+            if (audio_endpoints_[index].id == user_settings_.audio_endpoint_id) {
+                selected_audio_endpoint_ = index;
+                break;
+            }
+        }
         if (settings_font_ == nullptr) {
             settings_font_ = CreateFontW(
                 -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
@@ -3300,10 +3355,53 @@ private:
                 user_settings_.listenbrainz_reporting_enabled);
             persist_user_settings();
             InvalidateRect(window_, nullptr, FALSE);
+        } else if (contains(layout_.settings_audio_endpoint, point)) {
+            select_next_audio_endpoint();
+        } else if (contains(
+                       layout_.settings_audio_exclusive_toggle,
+                       point)) {
+            toggle_exclusive_output();
+        } else if (contains(layout_.settings_audio_fallback_toggle, point)) {
+            toggle_shared_fallback();
         } else if (contains(layout_.settings_back, point) ||
                    contains(layout_.settings_button, point)) {
             close_settings();
         }
+    }
+
+    void select_next_audio_endpoint()
+    {
+        if (audio_endpoints_.empty()) {
+            return;
+        }
+        selected_audio_endpoint_ =
+            (selected_audio_endpoint_ + 1U) % audio_endpoints_.size();
+        user_settings_.audio_endpoint_id =
+            audio_endpoints_[selected_audio_endpoint_].id;
+        persist_user_settings();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void toggle_exclusive_output()
+    {
+        user_settings_.audio_exclusive_mode =
+            !user_settings_.audio_exclusive_mode;
+        if (!user_settings_.audio_exclusive_mode) {
+            user_settings_.audio_allow_shared_fallback = false;
+        }
+        persist_user_settings();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void toggle_shared_fallback()
+    {
+        if (!user_settings_.audio_exclusive_mode) {
+            return;
+        }
+        user_settings_.audio_allow_shared_fallback =
+            !user_settings_.audio_allow_shared_fallback;
+        persist_user_settings();
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void update_settings_edit_bounds()
@@ -3376,6 +3474,78 @@ private:
             layout_.settings_back,
             text_brush_.Get(),
             DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto audio_card = D2D1::RoundedRect(
+            layout_.settings_audio_card,
+            16.0F,
+            16.0F);
+        render_target_->FillRoundedRectangle(audio_card, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(audio_card, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"音频输出",
+            heading_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.left + 24.0F,
+                audio_card.rect.top + 18.0F,
+                audio_card.rect.right - 24.0F,
+                audio_card.rect.top + 50.0F),
+            text_brush_.Get());
+        const auto endpoint_box = D2D1::RoundedRect(
+            layout_.settings_audio_endpoint,
+            10.0F,
+            10.0F);
+        render_target_->FillRoundedRectangle(endpoint_box, elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(endpoint_box, border_brush_.Get(), 1.0F);
+        const std::wstring endpoint_name = audio_endpoints_.empty()
+            ? L"系统默认设备"
+            : audio_endpoints_[std::min(
+                  selected_audio_endpoint_,
+                  audio_endpoints_.size() - 1U)].name;
+        draw_text(
+            endpoint_name + L"  ›",
+            body_format_.Get(),
+            layout_.settings_audio_endpoint,
+            text_brush_.Get());
+        draw_text(
+            user_settings_.audio_exclusive_mode ? L"独占模式 (X)" : L"共享模式 (X)",
+            small_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.right - 220.0F,
+                audio_card.rect.top + 60.0F,
+                audio_card.rect.right - 88.0F,
+                audio_card.rect.top + 84.0F),
+            secondary_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_toggle(
+            layout_.settings_audio_exclusive_toggle,
+            user_settings_.audio_exclusive_mode);
+        draw_text(
+            L"失败后回退共享 (F)",
+            small_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.right - 230.0F,
+                audio_card.rect.top + 102.0F,
+                audio_card.rect.right - 88.0F,
+                audio_card.rect.top + 126.0F),
+            user_settings_.audio_exclusive_mode
+                ? secondary_brush_.Get()
+                : muted_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_toggle(
+            layout_.settings_audio_fallback_toggle,
+            user_settings_.audio_exclusive_mode &&
+                user_settings_.audio_allow_shared_fallback);
+        draw_text(
+            audio_endpoint_status_ < 0
+                ? platform::windows::describe_wasapi_status(audio_endpoint_status_)
+                : L"44.1 kHz / 16 位 / 双声道；按 D 切换设备",
+            caption_format_.Get(),
+            D2D1::RectF(
+                audio_card.rect.left + 24.0F,
+                audio_card.rect.bottom - 28.0F,
+                audio_card.rect.right - 24.0F,
+                audio_card.rect.bottom - 6.0F),
+            audio_endpoint_status_ < 0 ? error_brush_.Get() : muted_brush_.Get());
 
         const auto listenbrainz_card = D2D1::RoundedRect(
             layout_.settings_listenbrainz_card,
@@ -3570,6 +3740,9 @@ private:
     float scrollbar_drag_offset_{};
     bool volume_dragging_{};
     platform::windows::UserSettings user_settings_;
+    std::vector<platform::windows::WasapiEndpoint> audio_endpoints_;
+    std::size_t selected_audio_endpoint_{};
+    std::int32_t audio_endpoint_status_{};
     float volume_{1.0F};
     std::wstring current_disc_key_;
     unsigned int last_persisted_track_number_{};

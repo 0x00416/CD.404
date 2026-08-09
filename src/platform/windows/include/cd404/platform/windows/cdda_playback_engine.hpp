@@ -5,6 +5,7 @@
 #include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
+#include <cd404/platform/windows/wasapi_output.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -24,6 +25,7 @@ struct CddaPlaybackRequest final {
     core::SampleFrame offset_frames{};
     std::optional<core::SampleFrame> maximum_frames{
         15 * core::kCdSampleFramesPerSecond};
+    WasapiOpenOptions output;
 };
 
 enum class CddaPlaybackError {
@@ -66,6 +68,8 @@ struct CddaPlaybackResult final {
     audio::ReadStatus read_status{audio::ReadStatus::ok};
     unsigned long system_error{};
     std::int32_t audio_status{};
+    WasapiOpenResult output_open_result;
+    bool used_default_output_endpoint{true};
     unsigned int first_track_number{};
     unsigned int final_track_number{};
     core::SampleFrame target_frames{};
