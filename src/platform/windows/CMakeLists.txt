@@ -5,6 +5,7 @@ target_sources(
     PRIVATE
         src/cdda_playback_engine.cpp
         src/device_lifecycle.cpp
+        src/diagnostics.cpp
         src/optical_drive.cpp
         src/http_client.cpp
         src/gnudb_client.cpp
@@ -25,6 +26,7 @@ target_sources(
         FILES
             include/cd404/platform/windows/cdda_playback_engine.hpp
             include/cd404/platform/windows/device_lifecycle.hpp
+            include/cd404/platform/windows/diagnostics.hpp
             include/cd404/platform/windows/optical_drive.hpp
             include/cd404/platform/windows/gnudb_client.hpp
             include/cd404/platform/windows/http_client.hpp

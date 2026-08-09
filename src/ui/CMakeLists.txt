@@ -21,6 +21,7 @@ target_link_libraries(
         cd404::windows
     PRIVATE
         d2d1
+        comdlg32
         dwrite
         dwmapi
         user32

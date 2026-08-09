@@ -5,6 +5,7 @@
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <commdlg.h>
 #include <commctrl.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -14,6 +15,7 @@
 #include <cd404/listenbrainz/playback_tracker.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
+#include <cd404/platform/windows/diagnostics.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
@@ -132,6 +134,7 @@ public:
               listenbrainz_reporter_.submit(submission);
           })
     {
+        diagnostics_.record(L"app", L"startup");
         listenbrainz_reporter_.set_reporting_enabled(
             user_settings_.listenbrainz_reporting_enabled);
     }
@@ -1697,6 +1700,13 @@ private:
         }
         ++disc_generation_;
         disc_ = std::move(*snapshot);
+        diagnostics_.record(
+            L"disc",
+            std::format(
+                L"refresh complete optical={} toc={} tracks={}",
+                disc_.has_optical_drive ? 1 : 0,
+                disc_.toc ? 1 : 0,
+                disc_.tracks.size()));
         preferred_metadata_release_id_.clear();
         selected_track_ = first_audio_track();
         update_metadata_source_summary();
@@ -1714,6 +1724,10 @@ private:
         const platform::windows::DeviceLifecycleEvent event)
     {
         using platform::windows::DeviceLifecycleEvent;
+
+        diagnostics_.record(
+            L"device",
+            std::format(L"lifecycle event={}", static_cast<unsigned int>(event)));
 
         switch (event) {
         case DeviceLifecycleEvent::optical_media_changed: {
@@ -2014,6 +2028,8 @@ private:
                 toggle_exclusive_output();
             } else if (key == 'F') {
                 toggle_shared_fallback();
+            } else if (key == 'G') {
+                export_diagnostics();
             }
             return 0;
         }
@@ -2505,6 +2521,18 @@ private:
         if (!result) {
             return;
         }
+
+        diagnostics_.record(
+            L"playback",
+            std::format(
+                L"complete state={} error={} system={} audio=0x{:08X} requested={} actual={} fallback={}",
+                static_cast<unsigned int>(result->final_state),
+                static_cast<unsigned int>(result->error),
+                result->system_error,
+                static_cast<unsigned int>(result->audio_status),
+                static_cast<unsigned int>(result->output_open_result.requested_mode),
+                static_cast<unsigned int>(result->output_open_result.actual_mode),
+                result->output_open_result.fallback_attempted ? 1 : 0));
 
         update_playback_clock();
         if (platform::windows::is_recoverable_default_endpoint_failure(*result)) {
@@ -3386,7 +3414,9 @@ private:
 
     void handle_settings_click(const D2D1_POINT_2F point)
     {
-        if (contains(layout_.settings_save, point)) {
+        if (contains(layout_.settings_diagnostics_export, point)) {
+            export_diagnostics();
+        } else if (contains(layout_.settings_save, point)) {
             save_settings();
         } else if (contains(layout_.settings_clear, point)) {
             clear_settings_token();
@@ -3414,6 +3444,35 @@ private:
                    contains(layout_.settings_button, point)) {
             close_settings();
         }
+    }
+
+    void export_diagnostics()
+    {
+        wchar_t path[MAX_PATH]{L'C', L'D', L'.', L'4', L'0', L'4', L'-',
+            L'd', L'i', L'a', L'g', L'n', L'o', L's', L't', L'i', L'c', L's',
+            L'.', L't', L'x', L't', L'\0'};
+        constexpr wchar_t filter[] =
+            L"文本文件 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0\0";
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = window_;
+        dialog.lpstrFilter = filter;
+        dialog.lpstrFile = path;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+        dialog.lpstrDefExt = L"txt";
+        dialog.lpstrTitle = L"导出已脱敏的 CD.404 诊断";
+        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
+            OFN_NOCHANGEDIR | OFN_EXPLORER;
+        if (GetSaveFileNameW(&dialog) == FALSE) {
+            return;
+        }
+        diagnostics_.record(L"diagnostics", L"export requested");
+        const bool exported = diagnostics_.export_to(path);
+        ui_message_ = exported
+            ? L"已导出脱敏诊断（不含 Token、路径、端点 ID 或媒体元数据）"
+            : L"诊断导出失败，请检查目标文件权限";
+        ui_message_is_error_ = !exported;
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void select_next_audio_endpoint()
@@ -3519,6 +3578,18 @@ private:
             L"←  返回播放器",
             button_format_.Get(),
             layout_.settings_back,
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto diagnostic_export = D2D1::RoundedRect(
+            layout_.settings_diagnostics_export, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(diagnostic_export, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            diagnostic_export, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"导出脱敏诊断 (G)",
+            button_format_.Get(),
+            layout_.settings_diagnostics_export,
             text_brush_.Get(),
             DWRITE_TEXT_ALIGNMENT_CENTER);
 
@@ -3799,6 +3870,7 @@ private:
     float scrollbar_drag_offset_{};
     bool volume_dragging_{};
     platform::windows::UserSettings user_settings_;
+    platform::windows::DiagnosticLog diagnostics_;
     std::vector<platform::windows::WasapiEndpoint> audio_endpoints_;
     std::size_t selected_audio_endpoint_{};
     std::int32_t audio_endpoint_status_{};

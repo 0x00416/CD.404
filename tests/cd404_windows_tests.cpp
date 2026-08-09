@@ -9,6 +9,7 @@
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
+#include <cd404/platform/windows/diagnostics.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/listenbrainz_queue.hpp>
 #include <cd404/platform/windows/musicbrainz_client.hpp>
@@ -24,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -62,6 +64,52 @@ void test_result_semantics()
     expect(
         !result.succeeded(),
         "non-terminal playback is not reported as successful");
+}
+
+void test_diagnostic_redaction_and_export()
+{
+    using namespace cd404::platform::windows;
+
+    const std::wstring secret =
+        L"Authorization: Token abc-secret token=second-secret "
+        L"C:\\Users\\Alice\\AppData\\Local\\CD.404\\listenbrainz.db\n"
+        L"endpoint={0.0.0.00000000}.{e1880c7c-30a8-4662-b49d-79db6df5824b}";
+    const std::wstring redacted = redact_diagnostic_text(secret);
+    expect(
+        redacted.find(L"abc-secret") == std::wstring::npos &&
+            redacted.find(L"second-secret") == std::wstring::npos &&
+            redacted.find(L"Alice") == std::wstring::npos &&
+            redacted.find(L"e1880c7c") == std::wstring::npos &&
+            redacted.find(L"[REDACTED_TOKEN]") != std::wstring::npos &&
+            redacted.find(L"[REDACTED_PATH]") != std::wstring::npos &&
+            redacted.find(L"[REDACTED_ENDPOINT]") != std::wstring::npos,
+        "diagnostic redaction removes tokens, local paths and stable endpoint IDs");
+
+    DiagnosticLog log(2);
+    log.record(L"first", L"discarded by bounded ring");
+    log.record(L"http", secret);
+    log.record(L"playback", L"error=0x88890004");
+    const auto entries = log.snapshot();
+    expect(
+        entries.size() == 2 && entries.front().component == L"http" &&
+            entries.front().message.find(L"abc-secret") == std::wstring::npos,
+        "diagnostic log is bounded and redacts at ingestion");
+
+    const auto path = std::filesystem::temp_directory_path() /
+        L"cd404-diagnostic-redaction-test.txt";
+    const bool exported = log.export_to(path);
+    std::ifstream input(path, std::ios::binary);
+    const std::string contents{
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>()};
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    expect(
+        exported && contents.find("abc-secret") == std::string::npos &&
+            contents.find("Alice") == std::string::npos &&
+            contents.find("e1880c7c") == std::string::npos &&
+            contents.find("REDACTED_TOKEN") != std::string::npos,
+        "diagnostic export applies a second redaction pass and writes no injected secret");
 }
 
 void test_device_failure_classification()
@@ -1104,6 +1152,7 @@ int main(const int argument_count, char** arguments)
 {
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
+    test_diagnostic_redaction_and_export();
     test_device_failure_classification();
     test_wasapi_negotiation_and_fallback();
     test_device_lifecycle_message_classification();

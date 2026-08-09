@@ -45,6 +45,9 @@ Layout calculate_layout(const float width, const float height) noexcept
 
     result.settings_page = D2D1::RectF(margin, 84.0F, width - margin, height - 24.0F);
     result.settings_back = D2D1::RectF(width - margin - 132.0F, 88.0F, width - margin, 128.0F);
+    result.settings_diagnostics_export = D2D1::RectF(
+        result.settings_back.left - 164.0F, 88.0F,
+        result.settings_back.left - 12.0F, 128.0F);
     result.settings_audio_card = D2D1::RectF(margin, 148.0F, width - margin, 300.0F);
     result.settings_audio_endpoint = D2D1::RectF(
         result.settings_audio_card.left + 24.0F,

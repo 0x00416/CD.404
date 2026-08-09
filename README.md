@@ -89,6 +89,10 @@ ctest --preset ninja-msvc-debug
 
 点击播放器右上角的设置按钮会进入独立 ListenBrainz 设置页，可输入、替换或清除 User Token，并开关播放记录上报；输入框会隐藏内容，保存后写入 Windows 凭据管理器并立即生效。播放器优先读取通用凭据 `CD.404/ListenBrainz`，也可读取当前进程的 `CD404_LISTENBRAINZ_TOKEN` 环境变量。Token 不会写入仓库、配置文件或日志。
 
+设置页可按 `G` 或点击“导出脱敏诊断”保存有界运行事件。日志只记录组件、状态码、
+计数和模式，不记录曲名、专辑或账户名；Token、本机绝对路径和稳定音频端点 ID 在写入
+及导出时各脱敏一次。导出位置由用户通过 Windows 保存对话框明确选择。
+
 推荐打开“控制面板 → 凭据管理器 → Windows 凭据 → 添加通用凭据”，将网络地址填写为 `CD.404/ListenBrainz`，用户名可填写 `ListenBrainz`，密码填写个人 User Token。重新启动播放器后生效。
 
 用于临时测试时，也可在启动播放器的同一 PowerShell 会话中设置：

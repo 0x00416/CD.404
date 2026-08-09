@@ -24,6 +24,7 @@ struct Layout final {
     D2D1_RECT_F settings_audio_fallback_toggle{};
     D2D1_RECT_F settings_listenbrainz_card{};
     D2D1_RECT_F settings_back{};
+    D2D1_RECT_F settings_diagnostics_export{};
     D2D1_RECT_F settings_edit{};
     D2D1_RECT_F settings_save{};
     D2D1_RECT_F settings_clear{};
