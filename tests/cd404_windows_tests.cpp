@@ -9,6 +9,7 @@
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
+#include <cd404/platform/windows/musicbrainz_client.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
@@ -551,6 +552,32 @@ void test_user_settings_round_trip()
         "malformed settings keep shared default output and safe volume");
 }
 
+void test_musicbrainz_exact_lookup_paths()
+{
+    using namespace cd404;
+    constexpr std::array entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 15'213, true},
+        disc::RawTocEntry{3, 32'164, true},
+        disc::RawTocEntry{4, 46'442, true},
+        disc::RawTocEntry{5, 63'264, true},
+        disc::RawTocEntry{6, 80'339, true},
+    };
+    disc::TocError error{};
+    const auto toc = disc::Toc::create(entries, 95'312, error);
+    expect(toc.has_value(), "MusicBrainz lookup test TOC is valid");
+    if (!toc) {
+        return;
+    }
+    const auto paths = platform::windows::make_musicbrainz_lookup_paths(*toc);
+    expect(
+        paths && paths->exact.find(
+            L"/ws/2/discid/49HHV7Eb8UKF3aQiNmu1GR8vKTY-?") == 0 &&
+            paths->exact.find(L"toc=") == std::wstring::npos &&
+            paths->fuzzy.find(L"/ws/2/discid/-?toc=1+6+95462+") == 0,
+        "MusicBrainz performs exact Disc ID lookup before TOC fuzzy fallback");
+}
+
 void test_diagnostic_names()
 {
     using namespace cd404;
@@ -734,6 +761,7 @@ int main(const int argument_count, char** arguments)
     test_system_media_controls_safe_fallback();
     test_system_media_controls_with_window();
     test_user_settings_round_trip();
+    test_musicbrainz_exact_lookup_paths();
     test_diagnostic_names();
     if (argument_count == 2 &&
         std::string_view(arguments[1]) == "--hardware-cancel") {

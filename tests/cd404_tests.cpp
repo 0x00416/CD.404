@@ -9,6 +9,7 @@
 #include <cd404/core/cd_time.hpp>
 #include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/gnudb.hpp>
+#include <cd404/disc/musicbrainz_disc_id.hpp>
 #include <cd404/disc/toc.hpp>
 #include <cd404/listenbrainz/playback_tracker.hpp>
 
@@ -412,6 +413,41 @@ void test_gnudb_identity_and_entry()
             metadata->track_artists ==
                 std::vector<std::string>{"Artist One", "Artist Two", "Artist Three"},
         "GnuDB UTF-8 entry joins repeated fields and separates compilation artists");
+}
+
+void test_musicbrainz_disc_id()
+{
+    using namespace cd404;
+
+    // Official MusicBrainz Disc ID calculation example, expressed as LBA.
+    constexpr std::array entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 15'213, true},
+        disc::RawTocEntry{3, 32'164, true},
+        disc::RawTocEntry{4, 46'442, true},
+        disc::RawTocEntry{5, 63'264, true},
+        disc::RawTocEntry{6, 80'339, true},
+    };
+    disc::TocError error{};
+    const auto toc = disc::Toc::create(entries, 95'312, error);
+    expect(toc.has_value(), "MusicBrainz example TOC is valid");
+    if (!toc) {
+        return;
+    }
+    const auto identity = disc::make_musicbrainz_disc_identity(*toc);
+    expect(
+        identity && identity->disc_id == "49HHV7Eb8UKF3aQiNmu1GR8vKTY-" &&
+            identity->toc == "1 6 95462 150 15363 32314 46592 63414 80489",
+        "MusicBrainz Disc ID matches the official SHA-1 and modified Base64 vector");
+
+    constexpr std::array mixed_entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 10'000, false},
+    };
+    const auto mixed = disc::Toc::create(mixed_entries, 20'000, error);
+    expect(
+        mixed && !disc::make_musicbrainz_disc_identity(*mixed),
+        "a multisession TOC without session lead-out data cannot fabricate an exact Disc ID");
 }
 
 [[nodiscard]] std::uint32_t read_pattern_frame(
@@ -1141,6 +1177,7 @@ int main()
     test_invalid_toc();
     test_cd_text_parsing();
     test_gnudb_identity_and_entry();
+    test_musicbrainz_disc_id();
     test_continuous_cdda_stream();
     test_repeated_cross_track_repositioning();
     test_reliable_cdda_sector_source();

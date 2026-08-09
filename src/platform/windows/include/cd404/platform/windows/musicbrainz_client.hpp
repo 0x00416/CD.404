@@ -28,6 +28,14 @@ struct MusicBrainzLookupResult final {
     unsigned long http_status{};
 };
 
+struct MusicBrainzLookupPaths final {
+    std::wstring exact;
+    std::wstring fuzzy;
+};
+
+[[nodiscard]] std::optional<MusicBrainzLookupPaths>
+make_musicbrainz_lookup_paths(const disc::Toc& toc);
+
 [[nodiscard]] MusicBrainzLookupResult lookup_musicbrainz(const disc::Toc& toc);
 
 } // namespace cd404::platform::windows
