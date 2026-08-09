@@ -1,8 +1,6 @@
 #include <windows.h>
 
-#include <shlobj.h>
-#include <wincred.h>
-#include <winsqlite/winsqlite3.h>
+#include <objbase.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 
@@ -10,6 +8,7 @@
 #include <cd404/platform/windows/listenbrainz_queue.hpp>
 
 #include "http_client.hpp"
+#include "listenbrainz_credentials.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -31,53 +30,6 @@ namespace {
 
 using namespace winrt::Windows::Data::Json;
 
-constexpr wchar_t kCredentialTarget[] = L"CD.404/ListenBrainz";
-constexpr wchar_t kTokenEnvironment[] = L"CD404_LISTENBRAINZ_TOKEN";
-
-[[nodiscard]] std::wstring token_from_environment()
-{
-    const DWORD required = GetEnvironmentVariableW(kTokenEnvironment, nullptr, 0);
-    if (required <= 1U) {
-        return {};
-    }
-    std::wstring token(required, L'\0');
-    const DWORD written = GetEnvironmentVariableW(
-        kTokenEnvironment,
-        token.data(),
-        required);
-    if (written == 0U || written >= required) {
-        return {};
-    }
-    token.resize(written);
-    return token;
-}
-
-[[nodiscard]] std::wstring load_token()
-{
-    PCREDENTIALW credential{};
-    if (CredReadW(kCredentialTarget, CRED_TYPE_GENERIC, 0, &credential) != FALSE) {
-        std::wstring token;
-        if (credential->CredentialBlob != nullptr &&
-            credential->CredentialBlobSize >= sizeof(wchar_t) &&
-            credential->CredentialBlobSize % sizeof(wchar_t) == 0) {
-            const auto* characters = reinterpret_cast<const wchar_t*>(
-                credential->CredentialBlob);
-            token.assign(
-                characters,
-                characters + credential->CredentialBlobSize / sizeof(wchar_t));
-            while (!token.empty() && token.back() == L'\0') {
-                token.pop_back();
-            }
-        }
-        CredFree(credential);
-        if (is_listenbrainz_token_format_valid(token)) {
-            return token;
-        }
-    }
-    std::wstring token = token_from_environment();
-    return is_listenbrainz_token_format_valid(token) ? token : std::wstring{};
-}
-
 [[nodiscard]] JsonValue string_value(const std::wstring& value)
 {
     return JsonValue::CreateStringValue(value);
@@ -88,275 +40,6 @@ constexpr wchar_t kTokenEnvironment[] = L"CD404_LISTENBRAINZ_TOKEN";
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
-
-[[nodiscard]] std::filesystem::path queue_database_path()
-{
-    wchar_t* local_app_data{};
-    if (FAILED(SHGetKnownFolderPath(
-            FOLDERID_LocalAppData,
-            KF_FLAG_CREATE,
-            nullptr,
-            &local_app_data)) ||
-        local_app_data == nullptr) {
-        return {};
-    }
-    const std::filesystem::path base(local_app_data);
-    CoTaskMemFree(local_app_data);
-    return base / L"CD.404" / L"listenbrainz.db";
-}
-
-class SqliteStatement final {
-public:
-    SqliteStatement(sqlite3* database, const char* sql) noexcept
-    {
-        if (database != nullptr) {
-            static_cast<void>(sqlite3_prepare_v2(database, sql, -1, &statement_, nullptr));
-        }
-    }
-
-    ~SqliteStatement()
-    {
-        if (statement_ != nullptr) {
-            sqlite3_finalize(statement_);
-        }
-    }
-
-    SqliteStatement(const SqliteStatement&) = delete;
-    SqliteStatement& operator=(const SqliteStatement&) = delete;
-
-    [[nodiscard]] sqlite3_stmt* get() const noexcept { return statement_; }
-
-private:
-    sqlite3_stmt* statement_{};
-};
-
-struct PendingListen final {
-    std::int64_t id{};
-    std::string payload;
-    unsigned int attempts{};
-    std::int64_t next_attempt{};
-};
-
-class PersistentListenQueue final {
-public:
-    PersistentListenQueue()
-    {
-        const auto path = queue_database_path();
-        if (path.empty()) {
-            return;
-        }
-        std::error_code error;
-        std::filesystem::create_directories(path.parent_path(), error);
-        if (error || sqlite3_open16(path.c_str(), &database_) != SQLITE_OK) {
-            close();
-            return;
-        }
-        sqlite3_busy_timeout(database_, 2'000);
-        if (!execute("PRAGMA journal_mode=WAL;") ||
-            !execute("PRAGMA synchronous=FULL;") ||
-            !execute(
-                "CREATE TABLE IF NOT EXISTS listen_queue ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "session_id TEXT NOT NULL UNIQUE,"
-                "owner_key TEXT NOT NULL DEFAULT '',"
-                "payload TEXT NOT NULL,"
-                "attempts INTEGER NOT NULL DEFAULT 0,"
-                "next_attempt INTEGER NOT NULL DEFAULT 0,"
-                "failed INTEGER NOT NULL DEFAULT 0,"
-                "last_status INTEGER NOT NULL DEFAULT 0,"
-                "last_error INTEGER NOT NULL DEFAULT 0"
-                ");") ||
-            (!has_column("owner_key") && !execute(
-                "ALTER TABLE listen_queue ADD COLUMN "
-                "owner_key TEXT NOT NULL DEFAULT '';")) ||
-            !execute("PRAGMA user_version=2;")) {
-            close();
-        }
-    }
-
-    ~PersistentListenQueue() { close(); }
-
-    PersistentListenQueue(const PersistentListenQueue&) = delete;
-    PersistentListenQueue& operator=(const PersistentListenQueue&) = delete;
-
-    [[nodiscard]] bool available() const noexcept { return database_ != nullptr; }
-
-    [[nodiscard]] bool enqueue(
-        const std::string_view owner_key,
-        const std::string_view session_id,
-        const std::string_view payload) noexcept
-    {
-        SqliteStatement statement(database_,
-            "INSERT OR IGNORE INTO listen_queue(owner_key, session_id, payload) "
-            "VALUES(?1, ?2, ?3);");
-        if (statement.get() == nullptr ||
-            sqlite3_bind_text(
-                statement.get(), 1, owner_key.data(),
-                static_cast<int>(owner_key.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
-            sqlite3_bind_text(
-                statement.get(), 2, session_id.data(),
-                static_cast<int>(session_id.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
-            sqlite3_bind_text(
-                statement.get(), 3, payload.data(),
-                static_cast<int>(payload.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
-            return false;
-        }
-        return sqlite3_step(statement.get()) == SQLITE_DONE;
-    }
-
-    [[nodiscard]] std::optional<PendingListen> next(
-        const std::string_view owner_key) const noexcept
-    {
-        SqliteStatement statement(database_,
-            "SELECT id, payload, attempts, next_attempt FROM listen_queue "
-            "WHERE failed=0 AND owner_key=?1 ORDER BY next_attempt, id LIMIT 1;");
-        if (statement.get() == nullptr ||
-            sqlite3_bind_text(
-                statement.get(), 1, owner_key.data(),
-                static_cast<int>(owner_key.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
-            sqlite3_step(statement.get()) != SQLITE_ROW) {
-            return std::nullopt;
-        }
-        const auto* payload = sqlite3_column_text(statement.get(), 1);
-        if (payload == nullptr) {
-            return std::nullopt;
-        }
-        return PendingListen{
-            sqlite3_column_int64(statement.get(), 0),
-            reinterpret_cast<const char*>(payload),
-            static_cast<unsigned int>(std::max(0, sqlite3_column_int(statement.get(), 2))),
-            sqlite3_column_int64(statement.get(), 3),
-        };
-    }
-
-    [[nodiscard]] bool complete(const std::int64_t id) noexcept
-    {
-        SqliteStatement statement(database_, "DELETE FROM listen_queue WHERE id=?1;");
-        return bind_id_and_step(statement.get(), id);
-    }
-
-    [[nodiscard]] bool schedule_retry(
-        const std::int64_t id,
-        const unsigned int attempts,
-        const std::int64_t next_attempt,
-        const unsigned long status,
-        const unsigned long system_error) noexcept
-    {
-        SqliteStatement statement(database_,
-            "UPDATE listen_queue SET attempts=?2, next_attempt=?3, "
-            "last_status=?4, last_error=?5 WHERE id=?1;");
-        if (statement.get() == nullptr ||
-            sqlite3_bind_int64(statement.get(), 1, id) != SQLITE_OK ||
-            sqlite3_bind_int(statement.get(), 2, static_cast<int>(attempts)) != SQLITE_OK ||
-            sqlite3_bind_int64(statement.get(), 3, next_attempt) != SQLITE_OK ||
-            sqlite3_bind_int64(statement.get(), 4, status) != SQLITE_OK ||
-            sqlite3_bind_int64(statement.get(), 5, system_error) != SQLITE_OK) {
-            return false;
-        }
-        return sqlite3_step(statement.get()) == SQLITE_DONE;
-    }
-
-    [[nodiscard]] bool mark_failed(
-        const std::int64_t id,
-        const unsigned long status,
-        const unsigned long system_error) noexcept
-    {
-        SqliteStatement statement(database_,
-            "UPDATE listen_queue SET failed=1, last_status=?2, last_error=?3 "
-            "WHERE id=?1;");
-        if (statement.get() == nullptr ||
-            sqlite3_bind_int64(statement.get(), 1, id) != SQLITE_OK ||
-            sqlite3_bind_int64(statement.get(), 2, status) != SQLITE_OK ||
-            sqlite3_bind_int64(statement.get(), 3, system_error) != SQLITE_OK) {
-            return false;
-        }
-        return sqlite3_step(statement.get()) == SQLITE_DONE;
-    }
-
-    [[nodiscard]] bool retry_all(const std::string_view owner_key) noexcept
-    {
-        SqliteStatement statement(database_,
-            "UPDATE listen_queue SET failed=0, attempts=0, next_attempt=0, "
-            "last_status=0, last_error=0 WHERE owner_key=?1;");
-        return statement.get() != nullptr &&
-            sqlite3_bind_text(
-                statement.get(), 1, owner_key.data(),
-                static_cast<int>(owner_key.size()), SQLITE_TRANSIENT) == SQLITE_OK &&
-            sqlite3_step(statement.get()) == SQLITE_DONE;
-    }
-
-    [[nodiscard]] std::size_t pending_count(const std::string_view owner_key) const noexcept
-    {
-        return count_for_owner(owner_key, false);
-    }
-
-    [[nodiscard]] std::size_t failed_count(const std::string_view owner_key) const noexcept
-    {
-        return count_for_owner(owner_key, true);
-    }
-
-private:
-    [[nodiscard]] bool execute(const char* sql) const noexcept
-    {
-        if (database_ == nullptr) {
-            return false;
-        }
-        return sqlite3_exec(database_, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
-    }
-
-    [[nodiscard]] static bool bind_id_and_step(
-        sqlite3_stmt* statement,
-        const std::int64_t id) noexcept
-    {
-        return statement != nullptr &&
-            sqlite3_bind_int64(statement, 1, id) == SQLITE_OK &&
-            sqlite3_step(statement) == SQLITE_DONE;
-    }
-
-    [[nodiscard]] bool has_column(const std::string_view column_name) const noexcept
-    {
-        SqliteStatement statement(database_, "PRAGMA table_info(listen_queue);");
-        if (statement.get() == nullptr) {
-            return false;
-        }
-        while (sqlite3_step(statement.get()) == SQLITE_ROW) {
-            const auto* name = sqlite3_column_text(statement.get(), 1);
-            if (name != nullptr && column_name ==
-                    reinterpret_cast<const char*>(name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    [[nodiscard]] std::size_t count_for_owner(
-        const std::string_view owner_key,
-        const bool failed) const noexcept
-    {
-        SqliteStatement statement(database_, failed
-            ? "SELECT COUNT(*) FROM listen_queue WHERE owner_key=?1 AND failed<>0;"
-            : "SELECT COUNT(*) FROM listen_queue WHERE owner_key=?1 AND failed=0;");
-        if (statement.get() == nullptr ||
-            sqlite3_bind_text(
-                statement.get(), 1, owner_key.data(),
-                static_cast<int>(owner_key.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
-            sqlite3_step(statement.get()) != SQLITE_ROW) {
-            return 0;
-        }
-        return static_cast<std::size_t>(std::max<std::int64_t>(
-            0, sqlite3_column_int64(statement.get(), 0)));
-    }
-
-    void close() noexcept
-    {
-        if (database_ != nullptr) {
-            sqlite3_close(database_);
-            database_ = nullptr;
-        }
-    }
-
-    sqlite3* database_{};
-};
 
 [[nodiscard]] std::string new_session_id()
 {
@@ -403,49 +86,6 @@ private:
 }
 
 } // namespace
-
-bool is_listenbrainz_token_format_valid(const std::wstring_view token) noexcept
-{
-    return !token.empty() && token.size() <= 512U &&
-        std::ranges::all_of(token, [](const wchar_t character) {
-            // ListenBrainz tokens in use are not limited to letters and digits
-            // (for example, UUID-shaped values contain '-').  The server's
-            // validate-token endpoint is authoritative; locally we only need
-            // to keep control characters and whitespace out of the HTTP header.
-            return character >= L'!' && character <= L'~';
-        });
-}
-
-bool save_listenbrainz_token(const std::wstring_view token) noexcept
-{
-    if (token.empty()) {
-        if (CredDeleteW(kCredentialTarget, CRED_TYPE_GENERIC, 0) != FALSE) {
-            return true;
-        }
-        return GetLastError() == ERROR_NOT_FOUND;
-    }
-
-    if (!is_listenbrainz_token_format_valid(token)) {
-        return false;
-    }
-
-    if (token.size() >
-        static_cast<std::size_t>(std::numeric_limits<DWORD>::max()) /
-            sizeof(wchar_t)) {
-        return false;
-    }
-
-    CREDENTIALW credential{};
-    credential.Type = CRED_TYPE_GENERIC;
-    credential.TargetName = const_cast<wchar_t*>(kCredentialTarget);
-    credential.CredentialBlobSize = static_cast<DWORD>(
-        token.size() * sizeof(wchar_t));
-    credential.CredentialBlob = reinterpret_cast<LPBYTE>(
-        const_cast<wchar_t*>(token.data()));
-    credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
-    credential.UserName = const_cast<wchar_t*>(L"ListenBrainz");
-    return CredWriteW(&credential, 0) != FALSE;
-}
 
 std::wstring build_listenbrainz_payload(
     const listenbrainz::Submission& submission)
@@ -1011,7 +651,7 @@ struct ListenBrainzReporter::Implementation final {
 
 ListenBrainzReporter::ListenBrainzReporter()
     : implementation_(std::make_unique<Implementation>(
-          load_token(),
+          detail::load_listenbrainz_token(),
           make_win_http_client(),
           default_listenbrainz_queue_path()))
 {
@@ -1051,7 +691,7 @@ bool ListenBrainzReporter::reporting_enabled() const noexcept
 void ListenBrainzReporter::reload_token()
 {
     if (implementation_ != nullptr) {
-        implementation_->reload(load_token());
+        implementation_->reload(detail::load_listenbrainz_token());
     }
 }
 

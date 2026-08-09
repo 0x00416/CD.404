@@ -21,6 +21,9 @@
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/ui/main_window.hpp>
 
+#include "disc_snapshot.hpp"
+#include "ui_layout.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -28,7 +31,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -100,176 +102,10 @@ constexpr float kMinimumHeight = 600.0F;
         std::chrono::system_clock::now()));
 }
 
-[[nodiscard]] std::wstring to_wstring(const std::u16string_view text)
-{
-    std::wstring result;
-    result.reserve(text.size());
-    std::ranges::transform(text, std::back_inserter(result), [](const char16_t character) {
-        return static_cast<wchar_t>(character);
-    });
-    return result;
-}
-
-struct UiTrack final {
-    std::uint8_t number{};
-    core::SampleFrame frame_count{};
-    bool is_audio{};
-    bool has_metadata_title{};
-    std::wstring title;
-    std::wstring artist;
-    platform::windows::MetadataSource title_source{
-        platform::windows::MetadataSource::unknown};
-    platform::windows::MetadataSource artist_source{
-        platform::windows::MetadataSource::unknown};
-    std::wstring track_mbid;
-    std::wstring recording_mbid;
-    std::vector<std::wstring> artist_mbids;
-};
-
-struct DiscSnapshot final {
-    std::optional<platform::windows::OpticalDrive> drive;
-    std::optional<disc::Toc> toc;
-    std::vector<UiTrack> tracks;
-    core::SampleFrame total_audio_frames{};
-    std::wstring album_title;
-    std::wstring album_artist;
-    platform::windows::MetadataSource album_title_source{
-        platform::windows::MetadataSource::unknown};
-    platform::windows::MetadataSource album_artist_source{
-        platform::windows::MetadataSource::unknown};
-    std::wstring release_mbid;
-    std::wstring release_group_mbid;
-    std::wstring metadata_source;
-    std::vector<platform::windows::MetadataReleaseCandidate> release_candidates;
-    std::wstring selected_release_id;
-    std::filesystem::path cover_art_path;
-    std::wstring status;
-    bool has_cd_text{};
-    bool has_optical_drive{};
-};
-
-struct OnlineMetadataSnapshot final {
-    std::optional<platform::windows::OnlineMetadata> metadata;
-    std::uint64_t disc_generation{};
-};
-
-[[nodiscard]] DiscSnapshot load_disc_snapshot()
-{
-    DiscSnapshot snapshot;
-    const auto drives = platform::windows::enumerate_optical_drives();
-    snapshot.has_optical_drive = !drives.empty();
-    if (drives.empty()) {
-        snapshot.status = L"未检测到光驱";
-        return snapshot;
-    }
-
-    unsigned long last_error{};
-    for (const auto& drive : drives) {
-        auto toc_result = platform::windows::read_toc(drive);
-        if (!toc_result.toc) {
-            last_error = toc_result.system_error;
-            continue;
-        }
-
-        snapshot.drive = drive;
-        snapshot.toc = *toc_result.toc;
-        for (const auto& track : toc_result.toc->tracks()) {
-            UiTrack view;
-            view.number = track.number;
-            view.frame_count = track.frame_count;
-            view.is_audio = track.is_audio;
-            view.title = track.is_audio
-                ? std::format(L"音轨 {:02}", track.number)
-                : std::format(L"数据轨 {:02}", track.number);
-            if (track.is_audio) {
-                snapshot.total_audio_frames += track.frame_count;
-            }
-            snapshot.tracks.push_back(std::move(view));
-        }
-
-        const auto cd_text_result = platform::windows::read_cd_text(drive);
-        if (cd_text_result.metadata) {
-            snapshot.has_cd_text = true;
-            snapshot.metadata_source = L"CD-TEXT";
-            snapshot.album_title = to_wstring(cd_text_result.metadata->album_title);
-            snapshot.album_artist = to_wstring(cd_text_result.metadata->album_performer);
-            if (!snapshot.album_title.empty()) {
-                snapshot.album_title_source =
-                    platform::windows::MetadataSource::cd_text;
-            }
-            if (!snapshot.album_artist.empty()) {
-                snapshot.album_artist_source =
-                    platform::windows::MetadataSource::cd_text;
-            }
-            for (auto& track : snapshot.tracks) {
-                const auto& metadata = cd_text_result.metadata->tracks[track.number];
-                if (!metadata.title.empty()) {
-                    track.title = to_wstring(metadata.title);
-                    track.has_metadata_title = true;
-                    track.title_source = platform::windows::MetadataSource::cd_text;
-                }
-                if (!metadata.performer.empty()) {
-                    track.artist = to_wstring(metadata.performer);
-                    track.artist_source = platform::windows::MetadataSource::cd_text;
-                }
-            }
-        }
-        if (const auto cached = platform::windows::load_metadata_cache(
-                platform::windows::make_disc_settings_key(*snapshot.toc))) {
-            const auto merge_cached = [](
-                                          std::wstring& value,
-                                          platform::windows::MetadataSource& source,
-                                          const platform::windows::SourcedMetadataValue& incoming) {
-                platform::windows::SourcedMetadataValue destination{value, source};
-                if (platform::windows::merge_metadata_value(
-                        destination,
-                        incoming.value,
-                        incoming.source)) {
-                    value = std::move(destination.value);
-                    source = destination.source;
-                }
-            };
-            merge_cached(
-                snapshot.album_title,
-                snapshot.album_title_source,
-                cached->metadata.album_title);
-            merge_cached(
-                snapshot.album_artist,
-                snapshot.album_artist_source,
-                cached->metadata.album_artist);
-            for (std::size_t index = 0;
-                 index < std::min(snapshot.tracks.size(), cached->metadata.tracks.size());
-                 ++index) {
-                merge_cached(
-                    snapshot.tracks[index].title,
-                    snapshot.tracks[index].title_source,
-                    cached->metadata.tracks[index].title);
-                merge_cached(
-                    snapshot.tracks[index].artist,
-                    snapshot.tracks[index].artist_source,
-                    cached->metadata.tracks[index].artist);
-                snapshot.tracks[index].has_metadata_title =
-                    snapshot.tracks[index].title_source !=
-                    platform::windows::MetadataSource::unknown;
-            }
-            snapshot.selected_release_id = cached->selected_release_id;
-            snapshot.metadata_source = L"本地元数据缓存";
-        }
-        snapshot.status = std::format(
-            L"已就绪 · {} 首音频轨",
-            std::count_if(
-                snapshot.tracks.begin(),
-                snapshot.tracks.end(),
-                [](const UiTrack& track) { return track.is_audio; }));
-        return snapshot;
-    }
-
-    snapshot.drive = drives.front();
-    snapshot.status = last_error == 0
-        ? L"请插入一张音频 CD"
-        : L"光驱已连接 · 等待音频 CD";
-    return snapshot;
-}
+using detail::DiscSnapshot;
+using detail::OnlineMetadataSnapshot;
+using detail::UiTrack;
+using detail::load_disc_snapshot;
 
 struct TrackHit final {
     D2D1_RECT_F rectangle{};
@@ -284,32 +120,7 @@ struct ScrollbarGeometry final {
     bool visible{};
 };
 
-struct Layout final {
-    float width{};
-    float height{};
-    D2D1_RECT_F refresh_button{};
-    D2D1_RECT_F eject_button{};
-    D2D1_RECT_F settings_button{};
-    D2D1_RECT_F cover{};
-    D2D1_RECT_F track_list{};
-    D2D1_RECT_F progress_hit{};
-    D2D1_RECT_F previous_button{};
-    D2D1_RECT_F play_button{};
-    D2D1_RECT_F next_button{};
-    D2D1_RECT_F volume_hit{};
-    D2D1_RECT_F settings_page{};
-    D2D1_RECT_F settings_audio_card{};
-    D2D1_RECT_F settings_audio_endpoint{};
-    D2D1_RECT_F settings_audio_exclusive_toggle{};
-    D2D1_RECT_F settings_audio_fallback_toggle{};
-    D2D1_RECT_F settings_listenbrainz_card{};
-    D2D1_RECT_F settings_back{};
-    D2D1_RECT_F settings_edit{};
-    D2D1_RECT_F settings_save{};
-    D2D1_RECT_F settings_clear{};
-    D2D1_RECT_F settings_listenbrainz_toggle{};
-    D2D1_RECT_F settings_queue_clear{};
-};
+using detail::Layout;
 
 class MainWindow final {
 public:
@@ -973,143 +784,6 @@ private:
             sizeof(backdrop)));
     }
 
-    [[nodiscard]] Layout calculate_layout() const
-    {
-        const auto size = render_target_->GetSize();
-        Layout result;
-        result.width = size.width;
-        result.height = size.height;
-
-        const float margin = size.width < 960.0F ? 20.0F : 24.0F;
-        const float top = 84.0F;
-        const float transport_height = size.height < 680.0F ? 104.0F : 124.0F;
-        const float transport_top = size.height - transport_height;
-        const float left_width = std::clamp(size.width * 0.27F, 240.0F, 300.0F);
-        const float gap = size.width < 960.0F ? 28.0F : 40.0F;
-        const float cover_size = std::min(
-            left_width,
-            std::max(220.0F, transport_top - top - 185.0F));
-        const float cover_top = top + 52.0F;
-
-        result.refresh_button = D2D1::RectF(
-            size.width - 160.0F,
-            12.0F,
-            size.width - 120.0F,
-            52.0F);
-        result.eject_button = D2D1::RectF(
-            size.width - 112.0F,
-            12.0F,
-            size.width - 72.0F,
-            52.0F);
-        result.settings_button = D2D1::RectF(
-            size.width - 64.0F,
-            12.0F,
-            size.width - 24.0F,
-            52.0F);
-        result.cover = D2D1::RectF(
-            margin,
-            cover_top,
-            margin + cover_size,
-            cover_top + cover_size);
-        result.track_list = D2D1::RectF(
-            margin + left_width + gap,
-            top + 52.0F,
-            size.width - margin,
-            transport_top - 12.0F);
-        result.progress_hit = D2D1::RectF(
-            margin,
-            transport_top + 14.0F,
-            size.width - margin,
-            transport_top + 34.0F);
-
-        const float center = size.width * 0.5F;
-        const float controls_y = transport_top + transport_height * 0.57F;
-        result.previous_button = D2D1::RectF(
-            center - 96.0F,
-            controls_y - 20.0F,
-            center - 56.0F,
-            controls_y + 20.0F);
-        result.play_button = D2D1::RectF(
-            center - 28.0F,
-            controls_y - 28.0F,
-            center + 28.0F,
-            controls_y + 28.0F);
-        result.next_button = D2D1::RectF(
-            center + 56.0F,
-            controls_y - 20.0F,
-            center + 96.0F,
-            controls_y + 20.0F);
-        const float volume_right = size.width - 24.0F;
-        const float volume_left = std::max(size.width * 0.77F, volume_right - 164.0F);
-        result.volume_hit = D2D1::RectF(
-            volume_left - 4.0F,
-            controls_y - 16.0F,
-            volume_right + 4.0F,
-            controls_y + 16.0F);
-
-        result.settings_page = D2D1::RectF(
-            margin,
-            84.0F,
-            size.width - margin,
-            size.height - 24.0F);
-        result.settings_back = D2D1::RectF(
-            size.width - margin - 132.0F,
-            88.0F,
-            size.width - margin,
-            128.0F);
-        result.settings_audio_card = D2D1::RectF(
-            margin,
-            148.0F,
-            size.width - margin,
-            300.0F);
-        result.settings_audio_endpoint = D2D1::RectF(
-            result.settings_audio_card.left + 24.0F,
-            result.settings_audio_card.top + 72.0F,
-            result.settings_audio_card.right - 230.0F,
-            result.settings_audio_card.top + 120.0F);
-        result.settings_audio_exclusive_toggle = D2D1::RectF(
-            result.settings_audio_card.right - 76.0F,
-            result.settings_audio_card.top + 58.0F,
-            result.settings_audio_card.right - 24.0F,
-            result.settings_audio_card.top + 86.0F);
-        result.settings_audio_fallback_toggle = D2D1::RectF(
-            result.settings_audio_card.right - 76.0F,
-            result.settings_audio_card.top + 100.0F,
-            result.settings_audio_card.right - 24.0F,
-            result.settings_audio_card.top + 128.0F);
-        result.settings_listenbrainz_card = D2D1::RectF(
-            margin,
-            316.0F,
-            size.width - margin,
-            510.0F);
-        result.settings_edit = D2D1::RectF(
-            result.settings_listenbrainz_card.left + 24.0F,
-            result.settings_listenbrainz_card.top + 112.0F,
-            result.settings_listenbrainz_card.right - 224.0F,
-            result.settings_listenbrainz_card.top + 156.0F);
-        result.settings_clear = D2D1::RectF(
-            result.settings_listenbrainz_card.right - 208.0F,
-            result.settings_listenbrainz_card.top + 112.0F,
-            result.settings_listenbrainz_card.right - 112.0F,
-            result.settings_listenbrainz_card.top + 156.0F);
-        result.settings_save = D2D1::RectF(
-            result.settings_listenbrainz_card.right - 104.0F,
-            result.settings_listenbrainz_card.top + 112.0F,
-            result.settings_listenbrainz_card.right - 24.0F,
-            result.settings_listenbrainz_card.top + 156.0F);
-        result.settings_listenbrainz_toggle = D2D1::RectF(
-            result.settings_listenbrainz_card.right - 76.0F,
-            result.settings_listenbrainz_card.top + 22.0F,
-            result.settings_listenbrainz_card.right - 24.0F,
-            result.settings_listenbrainz_card.top + 50.0F);
-        result.settings_queue_clear = D2D1::RectF(
-            result.settings_listenbrainz_card.right - 208.0F,
-            result.settings_listenbrainz_card.top + 66.0F,
-            result.settings_listenbrainz_card.right - 24.0F,
-            result.settings_listenbrainz_card.top + 102.0F);
-        return result;
-    }
-
     void paint()
     {
         PAINTSTRUCT paint_structure{};
@@ -1118,7 +792,8 @@ private:
             render_target_->BeginDraw();
             render_target_->SetTransform(D2D1::Matrix3x2F::Identity());
             render_target_->Clear(color(0x0C0E12));
-            layout_ = calculate_layout();
+            const auto size = render_target_->GetSize();
+            layout_ = detail::calculate_layout(size.width, size.height);
             draw_header();
             if (active_page_ == AppPage::settings) {
                 update_settings_edit_bounds();

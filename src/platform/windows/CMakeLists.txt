@@ -9,6 +9,7 @@ target_sources(
         src/http_client.cpp
         src/gnudb_client.cpp
         src/itunes_client.cpp
+        src/listenbrainz_credentials.cpp
         src/listenbrainz_reporter.cpp
         src/listenbrainz_queue.cpp
         src/metadata_store.cpp

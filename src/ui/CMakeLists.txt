@@ -3,7 +3,9 @@ add_library(cd404_ui STATIC)
 target_sources(
     cd404_ui
     PRIVATE
+        src/disc_snapshot.cpp
         src/main_window.cpp
+        src/ui_layout.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
