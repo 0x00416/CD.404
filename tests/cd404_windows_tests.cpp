@@ -7,6 +7,7 @@
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
+#include <cd404/platform/windows/user_settings.hpp>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -206,6 +207,53 @@ void test_system_media_controls_with_window()
     UnregisterClassW(class_name, window_class.hInstance);
 }
 
+void test_user_settings_round_trip()
+{
+    using namespace cd404;
+    using namespace platform::windows;
+
+    constexpr std::array entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 10'000, true},
+    };
+    disc::TocError toc_error{};
+    const auto toc = disc::Toc::create(entries, 20'000, toc_error);
+    expect(toc.has_value(), "settings test creates a valid TOC");
+    if (!toc) {
+        return;
+    }
+    const std::wstring disc_key = make_disc_settings_key(*toc);
+    expect(
+        !disc_key.empty() && disc_key == make_disc_settings_key(*toc),
+        "TOC settings key is stable and non-empty");
+
+    UserSettings source;
+    source.volume = 0.37F;
+    source.listenbrainz_reporting_enabled = false;
+    source.playback_positions[disc_key] = {2, 123'456};
+    const std::wstring json = encode_user_settings(source);
+    const UserSettings decoded = decode_user_settings(json);
+    const auto position = decoded.playback_positions.find(disc_key);
+    expect(
+        decoded.volume > 0.369F && decoded.volume < 0.371F &&
+            !decoded.listenbrainz_reporting_enabled,
+        "user settings JSON round-trips persistent options");
+    expect(
+        position != decoded.playback_positions.end() &&
+            position->second.track_number == 2 &&
+            position->second.offset_frames == 123'456,
+        "user settings JSON round-trips per-disc playback position");
+    expect(
+        json.find(L"Token") == std::wstring::npos &&
+            json.find(L"token") == std::wstring::npos,
+        "settings JSON never contains a ListenBrainz token");
+
+    const UserSettings defaults = decode_user_settings(L"not json");
+    expect(
+        defaults.volume == 1.0F && defaults.listenbrainz_reporting_enabled,
+        "malformed settings fall back to safe defaults with 100 percent volume");
+}
+
 void test_diagnostic_names()
 {
     using namespace cd404;
@@ -215,6 +263,7 @@ void test_diagnostic_names()
         audio::PlaybackState::opening,
         audio::PlaybackState::buffering,
         audio::PlaybackState::playing,
+        audio::PlaybackState::paused,
         audio::PlaybackState::draining,
         audio::PlaybackState::stopping,
         audio::PlaybackState::completed,
@@ -283,6 +332,66 @@ void test_hardware_cancellation()
         "real playback request stops through the cooperative cancellation path");
 }
 
+void test_hardware_pause_resume()
+{
+    using namespace cd404;
+
+    platform::windows::CddaPlaybackEngine engine;
+    platform::windows::CddaPlaybackRequest request;
+    request.maximum_frames = 30 * core::kCdSampleFramesPerSecond;
+    std::optional<platform::windows::CddaPlaybackResult> result;
+    std::thread playback([&] { result = engine.play(request); });
+
+    const auto playing_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < playing_deadline &&
+           engine.progress().state != audio::PlaybackState::playing) {
+        const auto state = engine.progress().state;
+        if (state == audio::PlaybackState::completed ||
+            state == audio::PlaybackState::cancelled ||
+            state == audio::PlaybackState::failed) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    engine.request_pause();
+    const auto pause_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < pause_deadline &&
+           engine.progress().state != audio::PlaybackState::paused) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const auto paused_progress = engine.progress();
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    const auto still_paused = engine.progress();
+    expect(
+        paused_progress.state == audio::PlaybackState::paused &&
+            still_paused.state == audio::PlaybackState::paused &&
+            still_paused.frames_rendered == paused_progress.frames_rendered,
+        "real WASAPI pause keeps the session alive without advancing frames");
+
+    engine.request_resume();
+    const auto resume_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < resume_deadline &&
+           (engine.progress().state != audio::PlaybackState::playing ||
+            engine.progress().frames_rendered <= paused_progress.frames_rendered)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect(
+        engine.progress().state == audio::PlaybackState::playing &&
+            engine.progress().frames_rendered > paused_progress.frames_rendered,
+        "real WASAPI session resumes and advances after pause");
+
+    engine.request_stop();
+    playback.join();
+    expect(
+        result && result->error ==
+                platform::windows::CddaPlaybackError::cancelled,
+        "paused and resumed playback remains cooperatively cancellable");
+}
+
 } // namespace
 
 int main(const int argument_count, char** arguments)
@@ -294,10 +403,14 @@ int main(const int argument_count, char** arguments)
     test_listenbrainz_payload_contract();
     test_system_media_controls_safe_fallback();
     test_system_media_controls_with_window();
+    test_user_settings_round_trip();
     test_diagnostic_names();
     if (argument_count == 2 &&
         std::string_view(arguments[1]) == "--hardware-cancel") {
         test_hardware_cancellation();
+    } else if (argument_count == 2 &&
+               std::string_view(arguments[1]) == "--hardware-pause") {
+        test_hardware_pause_resume();
     }
 
     if (failures != 0) {

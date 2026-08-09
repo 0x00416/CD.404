@@ -16,6 +16,7 @@
 #include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
+#include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/ui/main_window.hpp>
 
 #include <algorithm>
@@ -228,21 +229,25 @@ struct Layout final {
     D2D1_RECT_F volume_hit{};
     D2D1_RECT_F settings_page{};
     D2D1_RECT_F settings_listenbrainz_card{};
-    D2D1_RECT_F settings_audio_card{};
     D2D1_RECT_F settings_back{};
     D2D1_RECT_F settings_edit{};
     D2D1_RECT_F settings_save{};
     D2D1_RECT_F settings_clear{};
+    D2D1_RECT_F settings_listenbrainz_toggle{};
 };
 
 class MainWindow final {
 public:
     explicit MainWindow(HINSTANCE instance)
         : instance_(instance),
+          user_settings_(platform::windows::load_user_settings()),
+          volume_(user_settings_.volume),
           listenbrainz_tracker_([this](const listenbrainz::Submission& submission) {
               listenbrainz_reporter_.submit(submission);
           })
     {
+        listenbrainz_reporter_.set_reporting_enabled(
+            user_settings_.listenbrainz_reporting_enabled);
     }
 
     MainWindow(const MainWindow&) = delete;
@@ -252,6 +257,8 @@ public:
     {
         close_settings();
         stop_playback();
+        user_settings_.volume = volume_;
+        static_cast<void>(platform::windows::save_user_settings(user_settings_));
         if (settings_font_ != nullptr) {
             DeleteObject(settings_font_);
         }
@@ -320,7 +327,6 @@ public:
                     static_cast<WPARAM>(request.command),
                     static_cast<LPARAM>(request.position_milliseconds)));
             }));
-
         apply_window_materials();
         ShowWindow(window_, show_command);
         UpdateWindow(window_);
@@ -471,6 +477,7 @@ private:
             if (volume_dragging_) {
                 volume_dragging_ = false;
                 ReleaseCapture();
+                persist_user_settings();
                 return 0;
             }
             if (scrollbar_dragging_) {
@@ -484,15 +491,9 @@ private:
             scrollbar_dragging_ = false;
             return 0;
         case WM_LBUTTONDBLCLK:
-            if (active_page_ == AppPage::settings) {
-                handle_settings_click(D2D1::Point2F(
-                    pixel_to_dip(GET_X_LPARAM(lparam)),
-                    pixel_to_dip(GET_Y_LPARAM(lparam))));
-                return 0;
-            }
-            handle_double_click(D2D1::Point2F(
-                pixel_to_dip(GET_X_LPARAM(lparam)),
-                pixel_to_dip(GET_Y_LPARAM(lparam))));
+            // The first click in a Windows double-click sequence has already
+            // performed the action. Ignore the second notification so track
+            // playback and settings toggles are not restarted or reversed.
             return 0;
         case WM_KEYDOWN:
             return handle_key_down(wparam);
@@ -517,6 +518,7 @@ private:
         case WM_TIMER:
             if (wparam == kAnimationTimer) {
                 update_playback_clock();
+                maybe_persist_playback_position();
                 InvalidateRect(window_, nullptr, FALSE);
             }
             return 0;
@@ -547,6 +549,8 @@ private:
             return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
+            persist_playback_position();
+            persist_user_settings();
             stop_playback();
             PostQuitMessage(0);
             return 0;
@@ -956,11 +960,6 @@ private:
             148.0F,
             size.width - margin,
             342.0F);
-        result.settings_audio_card = D2D1::RectF(
-            margin,
-            362.0F,
-            size.width - margin,
-            std::min(size.height - 24.0F, 548.0F));
         result.settings_edit = D2D1::RectF(
             result.settings_listenbrainz_card.left + 24.0F,
             result.settings_listenbrainz_card.top + 112.0F,
@@ -976,6 +975,11 @@ private:
             result.settings_listenbrainz_card.top + 112.0F,
             result.settings_listenbrainz_card.right - 24.0F,
             result.settings_listenbrainz_card.top + 156.0F);
+        result.settings_listenbrainz_toggle = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 76.0F,
+            result.settings_listenbrainz_card.top + 22.0F,
+            result.settings_listenbrainz_card.right - 24.0F,
+            result.settings_listenbrainz_card.top + 50.0F);
         return result;
     }
 
@@ -1454,10 +1458,7 @@ private:
                     2.0F),
                 accent_brush_.Get());
         }
-        const core::SampleFrame current_track_frames =
-            static_cast<core::SampleFrame>(
-                playback_track_seconds_ *
-                static_cast<double>(core::kCdSampleFramesPerSecond));
+        const core::SampleFrame current_track_frames = playback_track_frame_;
         const core::SampleFrame selected_duration =
             selected_track_ < disc_.tracks.size()
                 ? disc_.tracks[selected_track_].frame_count
@@ -1514,7 +1515,9 @@ private:
             false);
         draw_round_control(
             layout_.play_button,
-            playback_active_ ? ControlIcon::pause : ControlIcon::play,
+            playback_active_ && !playback_paused_
+                ? ControlIcon::pause
+                : ControlIcon::play,
             hovered_control_ == HoveredControl::play,
             true);
         draw_round_control(
@@ -1843,6 +1846,7 @@ private:
         if (disc_loading_ || disc_worker_.joinable()) {
             return;
         }
+        persist_playback_position();
         stop_playback();
         disc_loading_ = true;
         ui_message_.clear();
@@ -1870,6 +1874,7 @@ private:
         ++disc_generation_;
         disc_ = std::move(*snapshot);
         selected_track_ = first_audio_track();
+        restore_playback_position();
         scroll_row_ = 0;
         InvalidateRect(window_, nullptr, FALSE);
         sync_system_media(true);
@@ -2031,10 +2036,11 @@ private:
     {
         for (const auto& hit : track_hits_) {
             if (contains(hit.rectangle, point)) {
-                selected_track_ = hit.track_index;
-                ensure_selected_track_visible();
-                sync_system_media(true);
-                InvalidateRect(window_, nullptr, FALSE);
+                if (hit.track_index < disc_.tracks.size() &&
+                    disc_.tracks[hit.track_index].is_audio) {
+                    select_track(hit.track_index, false);
+                    start_playback(0);
+                }
                 return;
             }
         }
@@ -2069,17 +2075,6 @@ private:
         }
     }
 
-    void handle_double_click(const D2D1_POINT_2F point)
-    {
-        for (const auto& hit : track_hits_) {
-            if (contains(hit.rectangle, point)) {
-                selected_track_ = hit.track_index;
-                start_playback(0);
-                return;
-            }
-        }
-    }
-
     LRESULT handle_key_down(const WPARAM key)
     {
         if (active_page_ == AppPage::settings) {
@@ -2102,16 +2097,14 @@ private:
             select_relative_track(1);
             return 0;
         case VK_HOME:
-            selected_track_ = first_audio_track();
-            ensure_selected_track_visible();
-            sync_system_media(true);
-            InvalidateRect(window_, nullptr, FALSE);
+            select_track(first_audio_track());
             return 0;
         case VK_END:
             select_last_audio_track();
             return 0;
         case VK_ESCAPE:
             stop_playback();
+            persist_playback_position();
             return 0;
         case VK_F5:
             refresh_disc();
@@ -2152,6 +2145,7 @@ private:
             const float steps = static_cast<float>(wheel_delta) /
                 static_cast<float>(WHEEL_DELTA);
             set_volume(volume_ + steps * 0.05F);
+            persist_user_settings();
             return;
         }
         if (!contains(layout_.track_list, point)) {
@@ -2236,6 +2230,33 @@ private:
         }
     }
 
+    void select_track(
+        const std::size_t track_index,
+        const bool continue_active_playback = true)
+    {
+        if (track_index >= disc_.tracks.size() ||
+            !disc_.tracks[track_index].is_audio) {
+            return;
+        }
+        const bool should_continue = continue_active_playback &&
+            playback_active_ && !playback_paused_;
+        if (playback_active_) {
+            stop_playback();
+        }
+        selected_track_ = track_index;
+        playback_track_frame_ = 0;
+        playback_paused_ = false;
+        playback_completed_ = false;
+        ensure_selected_track_visible();
+        sync_system_media(true);
+        if (should_continue) {
+            start_playback(0);
+        } else {
+            persist_playback_position();
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
     void select_relative_track(const int direction)
     {
         if (disc_.tracks.empty()) {
@@ -2248,11 +2269,7 @@ private:
                 return;
             }
             if (disc_.tracks[static_cast<std::size_t>(index)].is_audio) {
-                stop_playback();
-                selected_track_ = static_cast<std::size_t>(index);
-                ensure_selected_track_visible();
-                sync_system_media(true);
-                InvalidateRect(window_, nullptr, FALSE);
+                select_track(static_cast<std::size_t>(index));
                 return;
             }
         }
@@ -2262,11 +2279,7 @@ private:
     {
         for (std::size_t index = disc_.tracks.size(); index > 0; --index) {
             if (disc_.tracks[index - 1].is_audio) {
-                stop_playback();
-                selected_track_ = index - 1;
-                ensure_selected_track_visible();
-                sync_system_media(true);
-                InvalidateRect(window_, nullptr, FALSE);
+                select_track(index - 1);
                 return;
             }
         }
@@ -2288,17 +2301,18 @@ private:
     void toggle_playback()
     {
         if (playback_active_) {
-            pause_playback();
+            if (playback_paused_) {
+                resume_playback();
+            } else {
+                pause_playback();
+            }
         } else {
-            const unsigned int offset = playback_paused_
-                ? static_cast<unsigned int>(playback_track_seconds_)
-                : 0U;
-            start_playback(offset);
+            start_playback(playback_track_frame_);
         }
     }
 
     void start_playback(
-        const unsigned int offset_seconds,
+        const core::SampleFrame offset_frames,
         const bool preserve_listen_session = false)
     {
         if (selected_track_ >= disc_.tracks.size() ||
@@ -2313,9 +2327,12 @@ private:
         platform::windows::CddaPlaybackRequest request;
         request.drive = disc_.drive;
         request.track_number = disc_.tracks[selected_track_].number;
-        request.offset_frames =
-            static_cast<core::SampleFrame>(offset_seconds) *
-            core::kCdSampleFramesPerSecond;
+        request.offset_frames = std::clamp<core::SampleFrame>(
+            offset_frames,
+            0,
+            std::max<core::SampleFrame>(
+                0,
+                disc_.tracks[selected_track_].frame_count - 1));
         request.maximum_frames.reset();
         if (resume_session) {
             listenbrainz_tracker_.seek(request.offset_frames);
@@ -2329,11 +2346,13 @@ private:
         }
         playback_active_ = true;
         playback_paused_ = false;
+        playback_completed_ = false;
         playback_start_track_ = selected_track_;
         playback_start_offset_frames_ = request.offset_frames;
-        playback_track_seconds_ = static_cast<double>(offset_seconds);
+        playback_track_frame_ = request.offset_frames;
         ui_message_.clear();
         ui_message_is_error_ = false;
+        playback_engine_.request_resume();
         playback_engine_.set_volume(volume_);
         system_media_controls_.set_playback_state(
             platform::windows::SystemMediaPlaybackState::playing);
@@ -2379,7 +2398,7 @@ private:
         playback_active_ = false;
         if (!preserve_position) {
             playback_paused_ = false;
-            playback_track_seconds_ = 0.0;
+            playback_track_frame_ = 0;
         }
         system_media_controls_.set_playback_state(
             preserve_position
@@ -2410,8 +2429,7 @@ private:
             const core::SampleFrame duration = disc_.tracks[track_index].frame_count;
             if (track_frame < duration) {
                 selected_track_ = track_index;
-                playback_track_seconds_ = static_cast<double>(track_frame) /
-                    static_cast<double>(core::kCdSampleFramesPerSecond);
+                playback_track_frame_ = track_frame;
                 ensure_selected_track_visible();
                 update_listenbrainz_tracker(track_index, track_frame, progress.state);
                 sync_system_media(false);
@@ -2422,9 +2440,7 @@ private:
         }
         if (last_audio_track) {
             selected_track_ = *last_audio_track;
-            playback_track_seconds_ = static_cast<double>(
-                disc_.tracks[*last_audio_track].frame_count) /
-                static_cast<double>(core::kCdSampleFramesPerSecond);
+            playback_track_frame_ = disc_.tracks[*last_audio_track].frame_count;
             ensure_selected_track_visible();
             update_listenbrainz_tracker(
                 *last_audio_track,
@@ -2455,6 +2471,16 @@ private:
 
         update_playback_clock();
         listenbrainz_tracker_.end();
+        if (result->succeeded()) {
+            playback_completed_ = true;
+            if (!current_disc_key_.empty()) {
+                user_settings_.playback_positions.erase(current_disc_key_);
+                persist_user_settings();
+            }
+        } else {
+            playback_completed_ = false;
+            persist_playback_position();
+        }
         playback_active_ = false;
         playback_paused_ = false;
         system_media_controls_.set_playback_state(
@@ -2502,12 +2528,13 @@ private:
         if (selected_track_ >= disc_.tracks.size()) {
             return 0.0F;
         }
-        const double duration = static_cast<double>(
-            disc_.tracks[selected_track_].frame_count) /
-            static_cast<double>(core::kCdSampleFramesPerSecond);
-        return duration <= 0.0
+        const core::SampleFrame duration =
+            disc_.tracks[selected_track_].frame_count;
+        return duration <= 0
             ? 0.0F
-            : clamp01(static_cast<float>(playback_track_seconds_ / duration));
+            : clamp01(static_cast<float>(
+                static_cast<double>(playback_track_frame_) /
+                static_cast<double>(duration)));
     }
 
     void seek_from_point(const float x)
@@ -2519,19 +2546,19 @@ private:
         const float ratio = clamp01(
             (x - layout_.progress_hit.left) /
             (layout_.progress_hit.right - layout_.progress_hit.left));
-        const auto total_seconds = static_cast<unsigned int>(
-            disc_.tracks[selected_track_].frame_count /
-            core::kCdSampleFramesPerSecond);
-        const unsigned int offset = static_cast<unsigned int>(
-            std::floor(static_cast<float>(total_seconds) * ratio));
-        start_playback(
-            std::min(offset, total_seconds > 0 ? total_seconds - 1 : 0),
-            true);
+        const core::SampleFrame total_frames =
+            disc_.tracks[selected_track_].frame_count;
+        const core::SampleFrame offset = static_cast<core::SampleFrame>(
+            std::floor(static_cast<double>(total_frames) * ratio));
+        start_playback(std::min(offset, std::max<core::SampleFrame>(
+            0,
+            total_frames - 1)), true);
     }
 
     void set_volume(const float volume)
     {
         volume_ = std::clamp(volume, 0.0F, 1.0F);
+        user_settings_.volume = volume_;
         playback_engine_.set_volume(volume_);
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -2548,13 +2575,29 @@ private:
 
     void pause_playback()
     {
-        if (!playback_active_) {
+        if (!playback_active_ || playback_paused_) {
             return;
         }
-        stop_playback(true, true);
+        playback_engine_.request_pause();
         playback_paused_ = true;
         system_media_controls_.set_playback_state(
             platform::windows::SystemMediaPlaybackState::paused);
+        sync_system_media(true);
+        persist_playback_position();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void resume_playback()
+    {
+        if (!playback_active_ || !playback_paused_) {
+            return;
+        }
+        playback_engine_.request_resume();
+        playback_paused_ = false;
+        system_media_controls_.set_playback_state(
+            platform::windows::SystemMediaPlaybackState::playing);
+        sync_system_media(true);
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void handle_system_media_request(
@@ -2564,11 +2607,10 @@ private:
 
         switch (request.command) {
         case SystemMediaCommand::play:
-            if (!playback_active_) {
-                const unsigned int offset = playback_paused_
-                    ? static_cast<unsigned int>(playback_track_seconds_)
-                    : 0U;
-                start_playback(offset);
+            if (playback_active_) {
+                resume_playback();
+            } else {
+                start_playback(playback_track_frame_);
             }
             break;
         case SystemMediaCommand::pause:
@@ -2576,21 +2618,21 @@ private:
             break;
         case SystemMediaCommand::stop:
             stop_playback();
+            persist_playback_position();
             break;
         case SystemMediaCommand::previous:
             select_relative_track(-1);
-            start_playback(0);
             break;
         case SystemMediaCommand::next:
             select_relative_track(1);
-            start_playback(0);
             break;
         case SystemMediaCommand::seek:
-            start_playback(static_cast<unsigned int>(
+            start_playback(static_cast<core::SampleFrame>(
                 std::min<std::uint64_t>(
-                    request.position_milliseconds / 1'000U,
-                    86'400U)),
-                true);
+                    request.position_milliseconds,
+                    86'400'000U) *
+                static_cast<std::uint64_t>(core::kCdSampleFramesPerSecond) /
+                1'000U), true);
             break;
         }
     }
@@ -2658,12 +2700,105 @@ private:
         const ULONGLONG now = GetTickCount64();
         if (force || now - last_system_timeline_update_ >= 5'000U) {
             system_media_controls_.update_timeline(
-                static_cast<std::uint64_t>(playback_track_seconds_ * 1'000.0),
+                static_cast<std::uint64_t>(
+                    std::max<core::SampleFrame>(0, playback_track_frame_)) *
+                    1'000U /
+                    static_cast<std::uint64_t>(core::kCdSampleFramesPerSecond),
                 static_cast<std::uint64_t>(
                     track.frame_count * 1'000 /
                     core::kCdSampleFramesPerSecond));
             last_system_timeline_update_ = now;
         }
+    }
+
+    void restore_playback_position()
+    {
+        current_disc_key_.clear();
+        playback_track_frame_ = 0;
+        playback_completed_ = false;
+        if (!disc_.toc) {
+            return;
+        }
+        current_disc_key_ = platform::windows::make_disc_settings_key(*disc_.toc);
+        const auto saved = user_settings_.playback_positions.find(current_disc_key_);
+        if (saved == user_settings_.playback_positions.end()) {
+            return;
+        }
+        for (std::size_t index = 0; index < disc_.tracks.size(); ++index) {
+            const auto& track = disc_.tracks[index];
+            if (!track.is_audio || track.number != saved->second.track_number ||
+                track.frame_count <= 0) {
+                continue;
+            }
+            selected_track_ = index;
+            const core::SampleFrame offset = std::clamp<core::SampleFrame>(
+                saved->second.offset_frames,
+                0,
+                track.frame_count - 1);
+            playback_track_frame_ = offset;
+            last_persisted_track_number_ = track.number;
+            last_persisted_frame_ = offset;
+            return;
+        }
+    }
+
+    void persist_playback_position()
+    {
+        if (playback_completed_) {
+            if (!current_disc_key_.empty()) {
+                user_settings_.playback_positions.erase(current_disc_key_);
+                persist_user_settings();
+            }
+            return;
+        }
+        if (playback_active_) {
+            update_playback_clock();
+        }
+        if (current_disc_key_.empty() || selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        const auto& track = disc_.tracks[selected_track_];
+        if (!track.is_audio || track.frame_count <= 0) {
+            return;
+        }
+        const core::SampleFrame offset = std::clamp<core::SampleFrame>(
+            playback_track_frame_,
+            0,
+            track.frame_count - 1);
+        user_settings_.playback_positions[current_disc_key_] = {
+            track.number,
+            offset,
+        };
+        last_persisted_track_number_ = track.number;
+        last_persisted_frame_ = offset;
+        last_position_save_tick_ = GetTickCount64();
+        persist_user_settings();
+    }
+
+    void maybe_persist_playback_position()
+    {
+        if (!playback_active_ || selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now - last_position_save_tick_ < 5'000U) {
+            return;
+        }
+        const auto& track = disc_.tracks[selected_track_];
+        const core::SampleFrame frame = playback_track_frame_;
+        if (track.number == last_persisted_track_number_ &&
+            std::abs(frame - last_persisted_frame_) <
+                core::kCdSampleFramesPerSecond) {
+            last_position_save_tick_ = now;
+            return;
+        }
+        persist_playback_position();
+    }
+
+    void persist_user_settings()
+    {
+        user_settings_.volume = volume_;
+        static_cast<void>(platform::windows::save_user_settings(user_settings_));
     }
 
     static LRESULT CALLBACK settings_edit_window_proc(
@@ -2858,6 +2993,13 @@ private:
             save_settings();
         } else if (contains(layout_.settings_clear, point)) {
             clear_settings_token();
+        } else if (contains(layout_.settings_listenbrainz_toggle, point)) {
+            user_settings_.listenbrainz_reporting_enabled =
+                !user_settings_.listenbrainz_reporting_enabled;
+            listenbrainz_reporter_.set_reporting_enabled(
+                user_settings_.listenbrainz_reporting_enabled);
+            persist_user_settings();
+            InvalidateRect(window_, nullptr, FALSE);
         } else if (contains(layout_.settings_back, point) ||
                    contains(layout_.settings_button, point)) {
             close_settings();
@@ -2881,6 +3023,27 @@ private:
             to_pixel(layout_.settings_edit.right - layout_.settings_edit.left - 26.0F),
             to_pixel(layout_.settings_edit.bottom - layout_.settings_edit.top - 16.0F),
             SWP_NOACTIVATE);
+    }
+
+    void draw_toggle(const D2D1_RECT_F rectangle, const bool enabled)
+    {
+        const auto pill = D2D1::RoundedRect(rectangle, 14.0F, 14.0F);
+        render_target_->FillRoundedRectangle(
+            pill,
+            enabled ? accent_brush_.Get() : elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(pill, border_brush_.Get(), 1.0F);
+        const float radius = 10.0F;
+        const float center_x = enabled
+            ? rectangle.right - radius - 4.0F
+            : rectangle.left + radius + 4.0F;
+        render_target_->FillEllipse(
+            D2D1::Ellipse(
+                D2D1::Point2F(
+                    center_x,
+                    (rectangle.top + rectangle.bottom) * 0.5F),
+                radius,
+                radius),
+            enabled ? accent_text_brush_.Get() : secondary_brush_.Get());
     }
 
     void draw_settings_page()
@@ -2939,17 +3102,22 @@ private:
                 listenbrainz_card.rect.top + 82.0F),
             secondary_brush_.Get());
         draw_text(
-            listenbrainz_reporter_.enabled() ? L"●  已配置" : L"○  未配置",
+            !user_settings_.listenbrainz_reporting_enabled
+                ? L"已关闭"
+                : (listenbrainz_reporter_.enabled() ? L"已配置" : L"未配置"),
             small_format_.Get(),
             D2D1::RectF(
-                listenbrainz_card.rect.right - 164.0F,
+                listenbrainz_card.rect.right - 180.0F,
                 listenbrainz_card.rect.top + 22.0F,
-                listenbrainz_card.rect.right - 24.0F,
+                listenbrainz_card.rect.right - 92.0F,
                 listenbrainz_card.rect.top + 50.0F),
             listenbrainz_reporter_.enabled()
                 ? success_brush_.Get()
                 : muted_brush_.Get(),
             DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_toggle(
+            layout_.settings_listenbrainz_toggle,
+            user_settings_.listenbrainz_reporting_enabled);
         draw_text(
             L"USER TOKEN",
             caption_format_.Get(),
@@ -3003,70 +3171,6 @@ private:
             accent_text_brush_.Get(),
             DWRITE_TEXT_ALIGNMENT_CENTER);
 
-        const auto audio_card = D2D1::RoundedRect(
-            layout_.settings_audio_card,
-            16.0F,
-            16.0F);
-        render_target_->FillRoundedRectangle(audio_card, surface_brush_.Get());
-        render_target_->DrawRoundedRectangle(audio_card, border_brush_.Get(), 1.0F);
-        draw_text(
-            L"播放与系统集成",
-            heading_format_.Get(),
-            D2D1::RectF(
-                audio_card.rect.left + 24.0F,
-                audio_card.rect.top + 20.0F,
-                audio_card.rect.right - 24.0F,
-                audio_card.rect.top + 52.0F),
-            text_brush_.Get());
-        draw_text(
-            L"播放音量",
-            body_format_.Get(),
-            D2D1::RectF(
-                audio_card.rect.left + 24.0F,
-                audio_card.rect.top + 72.0F,
-                audio_card.rect.left + 200.0F,
-                audio_card.rect.top + 102.0F),
-            text_brush_.Get());
-        draw_text(
-            std::format(L"{}%", static_cast<int>(std::lround(volume_ * 100.0F))),
-            body_format_.Get(),
-            D2D1::RectF(
-                audio_card.rect.right - 120.0F,
-                audio_card.rect.top + 72.0F,
-                audio_card.rect.right - 24.0F,
-                audio_card.rect.top + 102.0F),
-            secondary_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_TRAILING);
-        render_target_->DrawLine(
-            D2D1::Point2F(
-                audio_card.rect.left + 24.0F,
-                audio_card.rect.top + 112.0F),
-            D2D1::Point2F(
-                audio_card.rect.right - 24.0F,
-                audio_card.rect.top + 112.0F),
-            border_brush_.Get(),
-            1.0F);
-        draw_text(
-            L"Windows 媒体控制",
-            body_format_.Get(),
-            D2D1::RectF(
-                audio_card.rect.left + 24.0F,
-                audio_card.rect.top + 126.0F,
-                audio_card.rect.left + 260.0F,
-                audio_card.rect.top + 156.0F),
-            text_brush_.Get());
-        draw_text(
-            system_media_controls_.available() ? L"已启用" : L"不可用",
-            body_format_.Get(),
-            D2D1::RectF(
-                audio_card.rect.right - 120.0F,
-                audio_card.rect.top + 126.0F,
-                audio_card.rect.right - 24.0F,
-                audio_card.rect.top + 156.0F),
-            system_media_controls_.available()
-                ? success_brush_.Get()
-                : muted_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
     void eject_disc()
@@ -3074,6 +3178,7 @@ private:
         if (!disc_.drive) {
             return;
         }
+        persist_playback_position();
         stop_playback();
         const unsigned long error = platform::windows::eject_media(*disc_.drive);
         if (error != ERROR_SUCCESS) {
@@ -3146,7 +3251,12 @@ private:
     bool scrollbar_dragging_{};
     float scrollbar_drag_offset_{};
     bool volume_dragging_{};
-    float volume_{0.72F};
+    platform::windows::UserSettings user_settings_;
+    float volume_{1.0F};
+    std::wstring current_disc_key_;
+    unsigned int last_persisted_track_number_{};
+    core::SampleFrame last_persisted_frame_{-1};
+    ULONGLONG last_position_save_tick_{};
     AppPage active_page_{AppPage::player};
     bool settings_save_failed_{};
     bool settings_saved_{};
@@ -3167,9 +3277,10 @@ private:
     std::uint64_t playback_generation_{};
     bool playback_active_{};
     bool playback_paused_{};
+    bool playback_completed_{};
     std::size_t playback_start_track_{};
     core::SampleFrame playback_start_offset_frames_{};
-    double playback_track_seconds_{};
+    core::SampleFrame playback_track_frame_{};
     std::wstring ui_message_;
     bool ui_message_is_error_{};
 };

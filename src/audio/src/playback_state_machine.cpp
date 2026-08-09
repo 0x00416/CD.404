@@ -29,6 +29,18 @@ bool PlaybackStateMachine::apply(const PlaybackEvent event) noexcept
         }
         next = PlaybackState::playing;
         break;
+    case PlaybackEvent::pause_requested:
+        if (state_ != PlaybackState::playing) {
+            return false;
+        }
+        next = PlaybackState::paused;
+        break;
+    case PlaybackEvent::resume_requested:
+        if (state_ != PlaybackState::paused) {
+            return false;
+        }
+        next = PlaybackState::playing;
+        break;
     case PlaybackEvent::stream_ended:
         if (state_ != PlaybackState::playing) {
             return false;
@@ -39,6 +51,7 @@ bool PlaybackStateMachine::apply(const PlaybackEvent event) noexcept
         if (state_ != PlaybackState::opening &&
             state_ != PlaybackState::buffering &&
             state_ != PlaybackState::playing &&
+            state_ != PlaybackState::paused &&
             state_ != PlaybackState::draining) {
             return false;
         }
@@ -60,6 +73,7 @@ bool PlaybackStateMachine::apply(const PlaybackEvent event) noexcept
         if (state_ != PlaybackState::opening &&
             state_ != PlaybackState::buffering &&
             state_ != PlaybackState::playing &&
+            state_ != PlaybackState::paused &&
             state_ != PlaybackState::draining &&
             state_ != PlaybackState::stopping) {
             return false;
@@ -91,6 +105,8 @@ const char* to_string(const PlaybackState state) noexcept
         return "buffering";
     case PlaybackState::playing:
         return "playing";
+    case PlaybackState::paused:
+        return "paused";
     case PlaybackState::draining:
         return "draining";
     case PlaybackState::stopping:

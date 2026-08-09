@@ -2,6 +2,7 @@
 
 #include <cd404/listenbrainz/playback_tracker.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -26,12 +27,15 @@ public:
     ListenBrainzReporter& operator=(const ListenBrainzReporter&) = delete;
 
     [[nodiscard]] bool enabled() const noexcept;
+    void set_reporting_enabled(bool enabled) noexcept;
+    [[nodiscard]] bool reporting_enabled() const noexcept;
     void reload_token();
     void submit(const listenbrainz::Submission& submission);
 
 private:
     struct Implementation;
     std::unique_ptr<Implementation> implementation_;
+    std::atomic_bool reporting_enabled_{true};
 };
 
 } // namespace cd404::platform::windows

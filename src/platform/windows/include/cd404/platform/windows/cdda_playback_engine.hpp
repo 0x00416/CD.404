@@ -7,8 +7,10 @@
 #include <cd404/platform/windows/optical_drive.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 
 namespace cd404::platform::windows {
@@ -86,6 +88,8 @@ public:
 
     [[nodiscard]] CddaPlaybackResult play(const CddaPlaybackRequest& request);
     void request_stop() noexcept;
+    void request_pause() noexcept;
+    void request_resume() noexcept;
     void set_volume(float volume) noexcept;
     [[nodiscard]] float volume() const noexcept;
     [[nodiscard]] CddaPlaybackProgress progress() const noexcept;
@@ -93,6 +97,9 @@ public:
 private:
     std::atomic_bool active_{};
     std::atomic_bool stop_requested_{};
+    std::atomic_bool pause_requested_{};
+    std::mutex control_mutex_;
+    std::condition_variable control_changed_;
     std::atomic<float> volume_{1.0F};
     std::atomic<audio::PlaybackState> state_{audio::PlaybackState::idle};
     std::atomic<core::SampleFrame> target_frames_{};

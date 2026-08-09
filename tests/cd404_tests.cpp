@@ -662,6 +662,17 @@ void test_playback_state_machine()
             completed.state() == PlaybackState::idle,
         "completed playback can reset for reuse");
 
+    PlaybackStateMachine paused;
+    expect(
+        paused.apply(PlaybackEvent::open) &&
+            paused.apply(PlaybackEvent::source_ready) &&
+            paused.apply(PlaybackEvent::prebuffer_ready) &&
+            paused.apply(PlaybackEvent::pause_requested) &&
+            paused.state() == PlaybackState::paused &&
+            paused.apply(PlaybackEvent::resume_requested) &&
+            paused.state() == PlaybackState::playing,
+        "playback pauses and resumes without terminating the session");
+
     PlaybackStateMachine cancelled;
     expect(
         cancelled.apply(PlaybackEvent::open) &&

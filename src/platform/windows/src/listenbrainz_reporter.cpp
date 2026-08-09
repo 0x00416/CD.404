@@ -218,7 +218,18 @@ ListenBrainzReporter::~ListenBrainzReporter() = default;
 
 bool ListenBrainzReporter::enabled() const noexcept
 {
-    return implementation_ != nullptr && !implementation_->token.empty();
+    return reporting_enabled_.load(std::memory_order_acquire) &&
+           implementation_ != nullptr && !implementation_->token.empty();
+}
+
+void ListenBrainzReporter::set_reporting_enabled(const bool enabled) noexcept
+{
+    reporting_enabled_.store(enabled, std::memory_order_release);
+}
+
+bool ListenBrainzReporter::reporting_enabled() const noexcept
+{
+    return reporting_enabled_.load(std::memory_order_acquire);
 }
 
 void ListenBrainzReporter::reload_token()

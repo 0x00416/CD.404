@@ -45,6 +45,10 @@ public:
     // Starts rendering frames previously primed through write_interleaved().
     [[nodiscard]] std::int32_t start() noexcept;
 
+    // Pauses the audio clock without resetting or discarding queued frames.
+    // start() resumes from the exact next frame in the same WASAPI session.
+    [[nodiscard]] std::int32_t pause() noexcept;
+
     // Waits until all submitted frames have left the WASAPI endpoint buffer.
     [[nodiscard]] std::int32_t drain() noexcept;
 
@@ -52,7 +56,8 @@ public:
     [[nodiscard]] std::int32_t get_current_padding(
         std::uint32_t& frame_count) noexcept;
 
-    // Stops and resets the stream, discarding queued frames. It is idempotent.
+    // Stops and resets the stream, discarding queued frames. It is idempotent
+    // and also resets a stream that is currently paused.
     [[nodiscard]] std::int32_t stop() noexcept;
 
     // May be called from another thread to interrupt a blocked write or drain.

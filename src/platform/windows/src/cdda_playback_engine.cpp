@@ -385,6 +385,43 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     static_cast<void>(advance(audio::PlaybackEvent::prebuffer_ready));
 
     while (!stop_requested_.load(std::memory_order_acquire)) {
+        if (pause_requested_.load(std::memory_order_acquire)) {
+            std::uint32_t padding{};
+            if (output.get_current_padding(padding) >= 0) {
+                const SampleFrame rendered_frames = std::max<SampleFrame>(
+                    submitted_frames - static_cast<SampleFrame>(padding),
+                    0);
+                frames_rendered_.store(rendered_frames, std::memory_order_release);
+            }
+            if (output_started) {
+                playback_status = output.pause();
+                if (playback_status < 0) {
+                    request_stream_stop(stream_state, *source_result.source);
+                    break;
+                }
+            }
+            static_cast<void>(advance(audio::PlaybackEvent::pause_requested));
+            {
+                std::unique_lock lock(control_mutex_);
+                control_changed_.wait(lock, [this] {
+                    return stop_requested_.load(std::memory_order_acquire) ||
+                           !pause_requested_.load(std::memory_order_acquire);
+                });
+            }
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                break;
+            }
+            if (output_started) {
+                playback_status = output.start();
+                if (playback_status < 0) {
+                    request_stream_stop(stream_state, *source_result.source);
+                    break;
+                }
+            }
+            static_cast<void>(advance(audio::PlaybackEvent::resume_requested));
+            continue;
+        }
+
         const std::size_t readable = ring.readable_frames();
         if (output_started && (readable != 0 || !ring.drained())) {
             minimum_queued_frames = std::min(minimum_queued_frames, readable);
@@ -524,6 +561,20 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
 void CddaPlaybackEngine::request_stop() noexcept
 {
     stop_requested_.store(true, std::memory_order_release);
+    pause_requested_.store(false, std::memory_order_release);
+    control_changed_.notify_all();
+}
+
+void CddaPlaybackEngine::request_pause() noexcept
+{
+    pause_requested_.store(true, std::memory_order_release);
+    control_changed_.notify_all();
+}
+
+void CddaPlaybackEngine::request_resume() noexcept
+{
+    pause_requested_.store(false, std::memory_order_release);
+    control_changed_.notify_all();
 }
 
 void CddaPlaybackEngine::set_volume(const float volume) noexcept

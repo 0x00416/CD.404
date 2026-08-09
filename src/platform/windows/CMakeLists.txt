@@ -13,6 +13,7 @@ target_sources(
         src/online_metadata.cpp
         src/raw_cdda_sector_source.cpp
         src/system_media_controls.cpp
+        src/user_settings.cpp
         src/wasapi_output.cpp
     PUBLIC
         FILE_SET HEADERS
@@ -27,6 +28,7 @@ target_sources(
             include/cd404/platform/windows/online_metadata.hpp
             include/cd404/platform/windows/raw_cdda_sector_source.hpp
             include/cd404/platform/windows/system_media_controls.hpp
+            include/cd404/platform/windows/user_settings.hpp
             include/cd404/platform/windows/wasapi_output.hpp
 )
 

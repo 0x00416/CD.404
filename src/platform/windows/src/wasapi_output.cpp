@@ -353,6 +353,28 @@ std::int32_t WasapiOutput::drain() noexcept
     }
 }
 
+std::int32_t WasapiOutput::pause() noexcept
+{
+    if (implementation_ == nullptr || !implementation_->open) {
+        return invalid_state();
+    }
+
+    Implementation& state = *implementation_;
+    HRESULT result = state.check_thread();
+    if (FAILED(result)) {
+        return result;
+    }
+    if (!state.started) {
+        return S_OK;
+    }
+
+    result = state.audio_client->Stop();
+    if (SUCCEEDED(result)) {
+        state.started = false;
+    }
+    return result;
+}
+
 std::int32_t WasapiOutput::get_current_padding(
     std::uint32_t& frame_count) noexcept
 {
@@ -379,15 +401,17 @@ std::int32_t WasapiOutput::stop() noexcept
     if (FAILED(result)) {
         return result;
     }
-    if (!state.open || !state.started) {
+    if (!state.open) {
         return S_OK;
     }
 
-    result = state.audio_client->Stop();
-    if (FAILED(result)) {
-        return result;
+    if (state.started) {
+        result = state.audio_client->Stop();
+        if (FAILED(result)) {
+            return result;
+        }
+        state.started = false;
     }
-    state.started = false;
     return state.audio_client->Reset();
 }
 
