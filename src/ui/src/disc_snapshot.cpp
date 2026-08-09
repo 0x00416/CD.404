@@ -1,6 +1,7 @@
 #include "disc_snapshot.hpp"
 
 #include <cd404/platform/windows/user_settings.hpp>
+#include <cd404/ui/metadata_source_model.hpp>
 
 #include <algorithm>
 #include <format>
@@ -59,7 +60,8 @@ DiscSnapshot load_disc_snapshot()
         const auto cd_text_result = platform::windows::read_cd_text(drive);
         if (cd_text_result.metadata) {
             snapshot.has_cd_text = true;
-            snapshot.metadata_source = L"CD-TEXT";
+            snapshot.metadata_sources = make_metadata_source_labels(
+                true, false, {});
             snapshot.album_title = to_wstring(cd_text_result.metadata->album_title);
             snapshot.album_artist = to_wstring(cd_text_result.metadata->album_performer);
             if (!snapshot.album_title.empty()) {
@@ -114,7 +116,8 @@ DiscSnapshot load_disc_snapshot()
                     platform::windows::MetadataSource::unknown;
             }
             snapshot.selected_release_id = cached->selected_release_id;
-            snapshot.metadata_source = L"本地元数据缓存";
+            snapshot.metadata_sources = make_metadata_source_labels(
+                snapshot.has_cd_text, true, {});
         }
         snapshot.status = std::format(
             L"已就绪 · {} 首音频轨",

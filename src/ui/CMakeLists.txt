@@ -5,6 +5,7 @@ target_sources(
     PRIVATE
         src/disc_snapshot.cpp
         src/main_window.cpp
+        src/metadata_source_model.cpp
         src/playback_presenter.cpp
         src/settings_model.cpp
         src/theme.cpp
@@ -15,6 +16,7 @@ target_sources(
         BASE_DIRS include
         FILES
             include/cd404/ui/main_window.hpp
+            include/cd404/ui/metadata_source_model.hpp
             include/cd404/ui/playback_presenter.hpp
             include/cd404/ui/settings_model.hpp
             include/cd404/ui/theme.hpp

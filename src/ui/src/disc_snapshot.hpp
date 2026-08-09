@@ -42,7 +42,7 @@ struct DiscSnapshot final {
         platform::windows::MetadataSource::unknown};
     std::wstring release_mbid;
     std::wstring release_group_mbid;
-    std::wstring metadata_source;
+    std::vector<std::wstring> metadata_sources;
     std::vector<platform::windows::MetadataReleaseCandidate> release_candidates;
     std::wstring selected_release_id;
     std::filesystem::path cover_art_path;

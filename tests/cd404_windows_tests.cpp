@@ -20,6 +20,7 @@
 #include <cd404/platform/windows/wasapi_output.hpp>
 #include <cd404/ui/theme.hpp>
 #include <cd404/ui/playback_presenter.hpp>
+#include <cd404/ui/metadata_source_model.hpp>
 #include <cd404/ui/settings_model.hpp>
 
 #include <winrt/Windows.Data.Json.h>
@@ -152,6 +153,25 @@ void test_playback_error_presentation()
         ui::playback_error_message(result).find(L"音频设备错误") !=
             std::wstring::npos,
         "playback presenter keeps selected endpoint failure explicit");
+}
+
+void test_metadata_source_capsules()
+{
+    using namespace cd404;
+
+    const std::array<std::wstring, 5> online_sources{
+        L"MusicBrainz", L"GnuDB", L"MusicBrainz", L"", L"iTunes"};
+    const auto live = ui::make_metadata_source_labels(
+        true, true, online_sources);
+    expect(
+        live == std::vector<std::wstring>{
+                    L"CD-TEXT", L"MusicBrainz", L"GnuDB", L"iTunes"},
+        "metadata acquisition sources remain separate, ordered and unique");
+
+    const auto offline = ui::make_metadata_source_labels(true, true, {});
+    expect(
+        offline == std::vector<std::wstring>{L"CD-TEXT", L"本地元数据缓存"},
+        "offline metadata identifies CD-TEXT and persistent cache separately");
 }
 
 void test_diagnostic_redaction_and_export()
@@ -1245,6 +1265,7 @@ int main(const int argument_count, char** arguments)
     test_theme_palettes();
     test_settings_model();
     test_playback_error_presentation();
+    test_metadata_source_capsules();
     test_diagnostic_redaction_and_export();
     test_device_failure_classification();
     test_wasapi_negotiation_and_fallback();

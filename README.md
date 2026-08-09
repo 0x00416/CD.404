@@ -103,7 +103,7 @@ ctest --preset ninja-msvc-debug
 界面跟随 Windows 应用浅色/深色主题和系统高对比度颜色，并在主题变化时即时重建资源。
 窗口通过 MSAA 暴露随所选曲目更新的可访问名称；所有主要播放和设置操作都有键盘入口，
 按 `F1` 可打开由屏幕阅读器直接读取的原生快捷键帮助。
-元数据优先使用光盘内嵌 CD-TEXT；后台先按标准 MusicBrainz Disc ID 精确查询，未关联时才使用 TOC 模糊后备，同时并行查询 GnuDB，再以可信的专辑/艺术家结果查询 iTunes。多个 MusicBrainz 发行版可按 `M` 切换并按光盘记忆。来源胶囊逐字段显示专辑名、艺术家、当前曲名和表演者来自用户、CD-TEXT 或具体在线服务。`F2`/`Shift+F2` 可修订当前曲目，`Ctrl+F2`/`Ctrl+Shift+F2` 可修订专辑；用户值不会被刷新覆盖。文本元数据使用当前用户目录下的版本化持久缓存支持离线启动；正面封面仅使用 Cover Art Archive 的 1200px 缩略图，不会写入仓库，也不会下载或复用 iTunes 宣传图。
+元数据优先使用光盘内嵌 CD-TEXT；后台先按标准 MusicBrainz Disc ID 精确查询，未关联时才使用 TOC 模糊后备，同时并行查询 GnuDB，再以可信的专辑/艺术家结果查询 iTunes。多个 MusicBrainz 发行版可按 `M` 切换并按光盘记忆。专辑下方每个来源胶囊只显示一个本次实际命中的获取来源，例如 `CD-TEXT`、`MusicBrainz`、`GnuDB` 或 `iTunes`；空间不足时自动换行。`F2`/`Shift+F2` 可修订当前曲目，`Ctrl+F2`/`Ctrl+Shift+F2` 可修订专辑，编辑提示会显示当前字段来源；用户值不会被刷新覆盖。文本元数据使用当前用户目录下的版本化持久缓存支持离线启动；正面封面仅使用 Cover Art Archive 的 1200px 缩略图，不会写入仓库，也不会下载或复用 iTunes 宣传图。
 
 首次启动的音量为 100%。应用会在 `%LOCALAPPDATA%\CD.404\settings.json` 保存音量、ListenBrainz 上报选项，以及按 TOC 区分的光盘播放位置；进度使用 44.1 kHz 采样帧而非整秒记录。播放位置记忆和 Windows 媒体控制始终启用，不在设置页显示。该文件是当前用户的本机配置，不属于仓库内容，也不包含 ListenBrainz Token。
 

@@ -23,6 +23,7 @@
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/ui/main_window.hpp>
+#include <cd404/ui/metadata_source_model.hpp>
 #include <cd404/ui/playback_presenter.hpp>
 #include <cd404/ui/settings_model.hpp>
 #include <cd404/ui/theme.hpp>
@@ -961,7 +962,27 @@ private:
         }
 
         draw_cover();
-        const float album_info_height = 88.0F;
+        const float source_width = layout_.cover.right - layout_.cover.left;
+        std::size_t source_rows{};
+        float measured_row_width{};
+        for (const auto& source : disc_.metadata_sources) {
+            const float pill_width = metadata_source_pill_width(
+                source_width, source);
+            const float next_width = measured_row_width == 0.0F
+                ? pill_width
+                : measured_row_width + 8.0F + pill_width;
+            if (measured_row_width != 0.0F && next_width > source_width) {
+                ++source_rows;
+                measured_row_width = pill_width;
+            } else {
+                measured_row_width = next_width;
+            }
+        }
+        if (measured_row_width != 0.0F) {
+            ++source_rows;
+        }
+        const float album_info_height =
+            60.0F + static_cast<float>(source_rows) * 28.0F;
         const float text_top = layout_.track_list.bottom - album_info_height;
         draw_text(
             disc_.album_title.empty() ? L"未知专辑" : disc_.album_title,
@@ -981,12 +1002,19 @@ private:
                 layout_.cover.right,
                 text_top + 60.0F),
             secondary_brush_.Get());
-        if (!disc_.metadata_source.empty()) {
+        float pill_left = layout_.cover.left;
+        float pill_top = text_top + 64.0F;
+        for (const auto& source : disc_.metadata_sources) {
+            const float pill_width = metadata_source_pill_width(
+                source_width, source);
+            if (pill_left != layout_.cover.left &&
+                pill_left + pill_width > layout_.cover.right) {
+                pill_left = layout_.cover.left;
+                pill_top += 28.0F;
+            }
             draw_metadata_source_pill(
-                layout_.cover.left,
-                text_top + 64.0F,
-                layout_.cover.right - layout_.cover.left,
-                disc_.metadata_source);
+                pill_left, pill_top, pill_width, source);
+            pill_left += pill_width + 8.0F;
         }
         const float right_left = layout_.track_list.left;
         draw_text(
@@ -1488,15 +1516,21 @@ private:
             factory_.Get(), render_target_.Get(), icon, center, brush);
     }
 
-    void draw_metadata_source_pill(
-        const float left,
-        const float top,
+    [[nodiscard]] static float metadata_source_pill_width(
         const float maximum_width,
         const std::wstring& source)
     {
-        const float width = std::min(
+        return std::min(
             maximum_width,
             std::max(76.0F, 28.0F + static_cast<float>(source.size()) * 7.0F));
+    }
+
+    void draw_metadata_source_pill(
+        const float left,
+        const float top,
+        const float width,
+        const std::wstring& source)
+    {
         const auto capsule = D2D1::RoundedRect(
             D2D1::RectF(left, top, left + width, top + 24.0F),
             12.0F,
@@ -1593,7 +1627,6 @@ private:
                 disc_.tracks.size()));
         preferred_metadata_release_id_.clear();
         selected_track_ = first_audio_track();
-        update_metadata_source_summary();
         restore_playback_position();
         scroll_row_ = 0;
         InvalidateRect(window_, nullptr, FALSE);
@@ -1706,6 +1739,8 @@ private:
         }
 
         const auto& metadata = *snapshot->metadata;
+        disc_.metadata_sources = make_metadata_source_labels(
+            disc_.has_cd_text, false, metadata.sources);
         const auto merge_ui_field = [](
                                         std::wstring& value,
                                         platform::windows::MetadataSource& source,
@@ -1787,7 +1822,6 @@ private:
                 playback_track_frame_,
                 unix_time_now());
         }
-        update_metadata_source_summary();
         sync_system_media(true);
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -2111,7 +2145,6 @@ private:
             stop_playback();
         }
         selected_track_ = track_index;
-        update_metadata_source_summary();
         playback_track_frame_ = 0;
         playback_paused_ = false;
         playback_completed_ = false;
@@ -2123,30 +2156,6 @@ private:
             persist_playback_position();
         }
         InvalidateRect(window_, nullptr, FALSE);
-    }
-
-    void update_metadata_source_summary()
-    {
-        if (disc_.tracks.empty() || selected_track_ >= disc_.tracks.size()) {
-            return;
-        }
-        const auto& track = disc_.tracks[selected_track_];
-        disc_.metadata_source = std::format(
-            L"专辑 {} · 艺人 {} · 曲名 {} · 表演者 {}",
-            platform::windows::to_string(disc_.album_title_source),
-            platform::windows::to_string(disc_.album_artist_source),
-            platform::windows::to_string(track.title_source),
-            platform::windows::to_string(track.artist_source));
-        if (disc_.release_candidates.size() > 1U) {
-            const std::size_t selected =
-                platform::windows::select_metadata_candidate(
-                    disc_.release_candidates,
-                    disc_.selected_release_id);
-            disc_.metadata_source += std::format(
-                L" · 发行版 {}/{} (M 切换)",
-                selected + 1U,
-                disc_.release_candidates.size());
-        }
     }
 
     void select_next_metadata_release()
@@ -2947,18 +2956,24 @@ private:
         close_metadata_edit();
         metadata_edit_field_ = field;
         const std::wstring* value{};
+        platform::windows::MetadataSource source{
+            platform::windows::MetadataSource::unknown};
         switch (field) {
         case MetadataEditField::album_title:
             value = &disc_.album_title;
+            source = disc_.album_title_source;
             break;
         case MetadataEditField::album_artist:
             value = &disc_.album_artist;
+            source = disc_.album_artist_source;
             break;
         case MetadataEditField::track_title:
             value = &disc_.tracks[selected_track_].title;
+            source = disc_.tracks[selected_track_].title_source;
             break;
         case MetadataEditField::track_artist:
             value = &disc_.tracks[selected_track_].artist;
+            source = disc_.tracks[selected_track_].artist_source;
             break;
         case MetadataEditField::none:
             return;
@@ -3005,7 +3020,9 @@ private:
         update_metadata_edit_bounds();
         SendMessageW(metadata_edit_, EM_SETSEL, 0, -1);
         SetFocus(metadata_edit_);
-        ui_message_ = L"编辑元数据：Enter 保存，Esc 取消";
+        ui_message_ = std::format(
+            L"编辑元数据 · 当前字段来源 {}：Enter 保存，Esc 取消",
+            platform::windows::to_string(source));
         ui_message_is_error_ = false;
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -3098,7 +3115,6 @@ private:
         }
         const bool saved = platform::windows::save_metadata_cache(entry);
         close_metadata_edit();
-        update_metadata_source_summary();
         sync_system_media(true);
         ui_message_ = saved
             ? L"元数据修订已保存（F2/Shift/Ctrl 可编辑其他字段）"
