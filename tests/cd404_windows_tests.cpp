@@ -112,6 +112,18 @@ void test_listenbrainz_payload_contract()
     using namespace cd404;
     using namespace winrt::Windows::Data::Json;
 
+    expect(
+        platform::windows::is_listenbrainz_token_format_valid(
+            L"01234567-89ab-cdef-0123-456789abcdef") &&
+            platform::windows::is_listenbrainz_token_format_valid(
+                L"Abc123_~") &&
+            !platform::windows::is_listenbrainz_token_format_valid(L"") &&
+            !platform::windows::is_listenbrainz_token_format_valid(
+                L"token with space") &&
+            !platform::windows::is_listenbrainz_token_format_valid(
+                L"token\r\nInjected: header"),
+        "ListenBrainz token validation accepts punctuation but rejects whitespace and header injection");
+
     listenbrainz::Submission playing_now;
     playing_now.type = listenbrainz::SubmissionType::playing_now;
     playing_now.listened_at = 1'700'000'000;
@@ -119,6 +131,12 @@ void test_listenbrainz_payload_contract()
     playing_now.artist_name = L"Artist";
     playing_now.release_name = L"Album";
     playing_now.duration_milliseconds = 123'000;
+    playing_now.track_number = 2;
+    playing_now.recording_mbid = L"recording-id";
+    playing_now.release_mbid = L"release-id";
+    playing_now.release_group_mbid = L"release-group-id";
+    playing_now.track_mbid = L"track-id";
+    playing_now.artist_mbids = {L"artist-id-1", L"artist-id-2"};
 
     const auto now_root = JsonObject::Parse(
         platform::windows::build_listenbrainz_payload(playing_now));
@@ -130,8 +148,19 @@ void test_listenbrainz_payload_contract()
         "playing_now payload omits listened_at as required by ListenBrainz");
     expect(
         now_listen.GetNamedObject(L"track_metadata")
-                .GetNamedString(L"track_name") == L"Track",
+                  .GetNamedString(L"track_name") == L"Track",
         "playing_now payload contains required track metadata");
+    const auto now_additional = now_listen.GetNamedObject(L"track_metadata")
+                                    .GetNamedObject(L"additional_info");
+    expect(
+        now_additional.GetNamedString(L"tracknumber") == L"2" &&
+            now_additional.GetNamedString(L"recording_mbid") == L"recording-id" &&
+            now_additional.GetNamedString(L"release_mbid") == L"release-id" &&
+            now_additional.GetNamedString(L"release_group_mbid") ==
+                L"release-group-id" &&
+            now_additional.GetNamedString(L"track_mbid") == L"track-id" &&
+            now_additional.GetNamedArray(L"artist_mbids").Size() == 2,
+        "ListenBrainz payload carries exact MusicBrainz identities when available");
 
     auto single = playing_now;
     single.type = listenbrainz::SubmissionType::single;
@@ -295,6 +324,22 @@ void test_diagnostic_names()
         expect(
             std::string_view(platform::windows::to_string(error)) != "unknown",
             "every playback error has a diagnostic name");
+    }
+
+    constexpr std::array listenbrainz_states{
+        platform::windows::ListenBrainzState::disabled,
+        platform::windows::ListenBrainzState::token_missing,
+        platform::windows::ListenBrainzState::validating,
+        platform::windows::ListenBrainzState::ready,
+        platform::windows::ListenBrainzState::submitting,
+        platform::windows::ListenBrainzState::retry_wait,
+        platform::windows::ListenBrainzState::unauthorized,
+        platform::windows::ListenBrainzState::error,
+    };
+    for (const auto state : listenbrainz_states) {
+        expect(
+            std::wstring_view(platform::windows::to_string(state)) != L"未知",
+            "every ListenBrainz state has a user-facing name");
     }
 }
 

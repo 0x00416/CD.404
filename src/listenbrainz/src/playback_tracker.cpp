@@ -39,10 +39,13 @@ void PlaybackTracker::update(
     const core::SampleFrame position_frames,
     const std::int64_t unix_time)
 {
-    if (!active_ || track.track_number != track_.track_number) {
-        finish_track();
+    if (!active_) {
         start_track(std::move(track), position_frames, unix_time);
         return;
+    }
+    if (track.track_number != track_.track_number) {
+        finish_track();
+        start_track(std::move(track), 0, unix_time);
     }
 
     if (position_frames >= last_position_frames_) {
@@ -76,6 +79,18 @@ core::SampleFrame PlaybackTracker::rendered_frames() const noexcept
     return rendered_frames_;
 }
 
+PlaybackSubmissionProgress PlaybackTracker::progress() const noexcept
+{
+    return PlaybackSubmissionProgress{
+        active_,
+        playing_now_submitted_,
+        single_submitted_,
+        rendered_frames_,
+        submission_threshold(track_.duration_frames),
+        track_.duration_frames,
+    };
+}
+
 void PlaybackTracker::start_track(
     TrackMetadata track,
     const core::SampleFrame position_frames,
@@ -105,6 +120,21 @@ void PlaybackTracker::merge_metadata(const TrackMetadata& track)
     if (track.duration_frames > 0) {
         track_.duration_frames = track.duration_frames;
     }
+    if (!track.recording_mbid.empty()) {
+        track_.recording_mbid = track.recording_mbid;
+    }
+    if (!track.release_mbid.empty()) {
+        track_.release_mbid = track.release_mbid;
+    }
+    if (!track.release_group_mbid.empty()) {
+        track_.release_group_mbid = track.release_group_mbid;
+    }
+    if (!track.track_mbid.empty()) {
+        track_.track_mbid = track.track_mbid;
+    }
+    if (!track.artist_mbids.empty()) {
+        track_.artist_mbids = track.artist_mbids;
+    }
 }
 
 void PlaybackTracker::submit_playing_now_if_ready()
@@ -122,6 +152,12 @@ void PlaybackTracker::submit_playing_now_if_ready()
         static_cast<std::uint64_t>(
             track_.duration_frames * 1'000 / core::kCdSampleFramesPerSecond),
         0,
+        track_.track_number,
+        track_.recording_mbid,
+        track_.release_mbid,
+        track_.release_group_mbid,
+        track_.track_mbid,
+        track_.artist_mbids,
     });
     playing_now_submitted_ = true;
 }
@@ -161,6 +197,12 @@ void PlaybackTracker::submit_single_if_ready()
                 track_.duration_frames * 1'000 / core::kCdSampleFramesPerSecond),
             static_cast<std::uint64_t>(
                 rendered_frames_ / core::kCdSampleFramesPerSecond),
+            track_.track_number,
+            track_.recording_mbid,
+            track_.release_mbid,
+            track_.release_group_mbid,
+            track_.track_mbid,
+            track_.artist_mbids,
         });
         single_submitted_ = true;
     }

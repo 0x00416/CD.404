@@ -932,10 +932,14 @@ void test_listenbrainz_playback_tracker()
     };
 
     tracker.begin(short_track, 0, 1'700'000'000);
+    const auto initial_progress = tracker.progress();
     expect(
         submissions.size() == 1 &&
             submissions.front().type == SubmissionType::playing_now &&
-            submissions.front().listened_at == 0,
+            submissions.front().listened_at == 0 &&
+            initial_progress.active &&
+            initial_progress.threshold_frames ==
+                60 * core::kCdSampleFramesPerSecond,
         "ListenBrainz playing_now is emitted without a timestamp");
     tracker.update(
         short_track,
@@ -943,7 +947,7 @@ void test_listenbrainz_playback_tracker()
         1'700'000'059);
     tracker.end();
     expect(
-        submissions.size() == 1,
+        submissions.size() == 1 && !tracker.progress().active,
         "less than half of a short track is not submitted as a listen");
 
     tracker.begin(short_track, 0, 1'700'001'000);
@@ -953,7 +957,8 @@ void test_listenbrainz_playback_tracker()
         1'700'001'060);
     expect(
         submissions.size() == 3 &&
-            submissions.back().type == SubmissionType::single,
+            submissions.back().type == SubmissionType::single &&
+            tracker.progress().single_submitted,
         "ListenBrainz single is emitted immediately at the playback threshold");
     tracker.end();
     expect(

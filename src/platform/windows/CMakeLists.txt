@@ -48,6 +48,7 @@ target_link_libraries(
         shlwapi
         uuid
         winhttp
+        winsqlite3
         windowsapp
         xmllite
 )

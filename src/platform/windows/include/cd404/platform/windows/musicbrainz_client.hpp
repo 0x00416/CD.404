@@ -11,10 +11,14 @@ namespace cd404::platform::windows {
 
 struct MusicBrainzMetadata final {
     std::wstring release_id;
+    std::wstring release_group_id;
     std::wstring album_title;
     std::wstring album_artist;
     std::vector<std::wstring> track_titles;
     std::vector<std::wstring> track_artists;
+    std::vector<std::wstring> track_ids;
+    std::vector<std::wstring> recording_ids;
+    std::vector<std::vector<std::wstring>> track_artist_ids;
     std::filesystem::path cover_art_path;
 };
 

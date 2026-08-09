@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace cd404::listenbrainz {
 
@@ -19,6 +20,11 @@ struct TrackMetadata final {
     std::wstring artist;
     std::wstring release;
     core::SampleFrame duration_frames{};
+    std::wstring recording_mbid;
+    std::wstring release_mbid;
+    std::wstring release_group_mbid;
+    std::wstring track_mbid;
+    std::vector<std::wstring> artist_mbids;
 };
 
 struct Submission final {
@@ -29,6 +35,21 @@ struct Submission final {
     std::wstring release_name;
     std::uint64_t duration_milliseconds{};
     std::uint64_t duration_played_seconds{};
+    unsigned int track_number{};
+    std::wstring recording_mbid;
+    std::wstring release_mbid;
+    std::wstring release_group_mbid;
+    std::wstring track_mbid;
+    std::vector<std::wstring> artist_mbids;
+};
+
+struct PlaybackSubmissionProgress final {
+    bool active{};
+    bool playing_now_submitted{};
+    bool single_submitted{};
+    core::SampleFrame rendered_frames{};
+    core::SampleFrame threshold_frames{};
+    core::SampleFrame duration_frames{};
 };
 
 // Converts rendered-frame progress into ListenBrainz submissions. The tracker
@@ -52,6 +73,7 @@ public:
 
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] core::SampleFrame rendered_frames() const noexcept;
+    [[nodiscard]] PlaybackSubmissionProgress progress() const noexcept;
 
 private:
     void start_track(

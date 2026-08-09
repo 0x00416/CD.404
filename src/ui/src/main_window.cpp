@@ -113,6 +113,9 @@ struct UiTrack final {
     bool has_metadata_title{};
     std::wstring title;
     std::wstring artist;
+    std::wstring track_mbid;
+    std::wstring recording_mbid;
+    std::vector<std::wstring> artist_mbids;
 };
 
 struct DiscSnapshot final {
@@ -122,6 +125,8 @@ struct DiscSnapshot final {
     core::SampleFrame total_audio_frames{};
     std::wstring album_title;
     std::wstring album_artist;
+    std::wstring release_mbid;
+    std::wstring release_group_mbid;
     std::wstring metadata_source;
     std::filesystem::path cover_art_path;
     std::wstring status;
@@ -519,6 +524,11 @@ private:
             if (wparam == kAnimationTimer) {
                 update_playback_clock();
                 maybe_persist_playback_position();
+                if (active_page_ == AppPage::settings && settings_saved_ &&
+                    listenbrainz_reporter_.status().state !=
+                        platform::windows::ListenBrainzState::validating) {
+                    settings_saved_ = false;
+                }
                 InvalidateRect(window_, nullptr, FALSE);
             }
             return 0;
@@ -1477,7 +1487,6 @@ private:
             D2D1::RectF(right - 90.0F, progress_y + 7.0F, right, progress_y + 27.0F),
             muted_brush_.Get(),
             DWRITE_TEXT_ALIGNMENT_TRAILING);
-
         const float content_center_y =
             (layout_.play_button.top + layout_.play_button.bottom) * 0.5F;
         const float content_top = content_center_y - 24.0F;
@@ -1946,6 +1955,8 @@ private:
             disc_.album_artist = metadata.album_artist;
         }
         disc_.cover_art_path = metadata.cover_art_path;
+        disc_.release_mbid = metadata.release_mbid;
+        disc_.release_group_mbid = metadata.release_group_mbid;
         if (!disc_.cover_art_path.empty()) {
             load_cover_bitmap(disc_.cover_art_path);
         }
@@ -1967,6 +1978,31 @@ private:
                 !metadata.track_artists[index].empty()) {
                 disc_.tracks[index].artist = metadata.track_artists[index];
             }
+        }
+        const std::size_t identity_count = std::min(
+            disc_.tracks.size(),
+            metadata.recording_mbids.size());
+        for (std::size_t index = 0; index < identity_count; ++index) {
+            disc_.tracks[index].recording_mbid = metadata.recording_mbids[index];
+        }
+        const std::size_t track_id_count = std::min(
+            disc_.tracks.size(),
+            metadata.track_mbids.size());
+        for (std::size_t index = 0; index < track_id_count; ++index) {
+            disc_.tracks[index].track_mbid = metadata.track_mbids[index];
+        }
+        const std::size_t artist_id_count = std::min(
+            disc_.tracks.size(),
+            metadata.track_artist_mbids.size());
+        for (std::size_t index = 0; index < artist_id_count; ++index) {
+            disc_.tracks[index].artist_mbids = metadata.track_artist_mbids[index];
+        }
+        if (listenbrainz_tracker_.active() &&
+            selected_track_ < disc_.tracks.size()) {
+            listenbrainz_tracker_.update(
+                listen_metadata(selected_track_),
+                playback_track_frame_,
+                unix_time_now());
         }
         sync_system_media(true);
         InvalidateRect(window_, nullptr, FALSE);
@@ -2350,6 +2386,12 @@ private:
         playback_start_track_ = selected_track_;
         playback_start_offset_frames_ = request.offset_frames;
         playback_track_frame_ = request.offset_frames;
+        if (!resume_session) {
+            listenbrainz_tracker_.begin(
+                listen_metadata(selected_track_),
+                request.offset_frames,
+                unix_time_now());
+        }
         ui_message_.clear();
         ui_message_is_error_ = false;
         playback_engine_.request_resume();
@@ -2384,7 +2426,11 @@ private:
             update_playback_clock();
         }
         if (!preserve_listen_session) {
+            const bool had_listenbrainz_session = listenbrainz_tracker_.active();
             listenbrainz_tracker_.end();
+            if (had_listenbrainz_session) {
+                listenbrainz_reporter_.clear_playing_now();
+            }
         }
         ++playback_generation_;
         if (playback_worker_.joinable()) {
@@ -2431,7 +2477,10 @@ private:
                 selected_track_ = track_index;
                 playback_track_frame_ = track_frame;
                 ensure_selected_track_visible();
-                update_listenbrainz_tracker(track_index, track_frame, progress.state);
+                update_listenbrainz_tracker(
+                    track_index,
+                    track_frame,
+                    progress.state);
                 sync_system_media(false);
                 return;
             }
@@ -2470,7 +2519,11 @@ private:
         }
 
         update_playback_clock();
+        const bool had_listenbrainz_session = listenbrainz_tracker_.active();
         listenbrainz_tracker_.end();
+        if (had_listenbrainz_session) {
+            listenbrainz_reporter_.clear_playing_now();
+        }
         if (result->succeeded()) {
             playback_completed_ = true;
             if (!current_disc_key_.empty()) {
@@ -2535,6 +2588,38 @@ private:
             : clamp01(static_cast<float>(
                 static_cast<double>(playback_track_frame_) /
                 static_cast<double>(duration)));
+    }
+
+    [[nodiscard]] std::wstring listenbrainz_settings_detail() const
+    {
+        const auto status = listenbrainz_reporter_.status();
+        std::wstring detail;
+        const auto append = [&detail](const std::wstring& value) {
+            if (value.empty()) {
+                return;
+            }
+            if (!detail.empty()) {
+                detail += L" · ";
+            }
+            detail += value;
+        };
+        if (!status.user_name.empty()) {
+            append(L"账户 " + status.user_name);
+        }
+        if (status.pending_listens != 0) {
+            append(std::format(L"{} 条待同步", status.pending_listens));
+        }
+        if (status.failed_listens != 0) {
+            append(std::format(L"{} 条需重试", status.failed_listens));
+        }
+        if (status.state == platform::windows::ListenBrainzState::retry_wait &&
+            status.retry_after_seconds != 0) {
+            append(std::format(L"{} 秒后重试", status.retry_after_seconds));
+        }
+        if (detail.empty()) {
+            append(platform::windows::to_string(status.state));
+        }
+        return detail;
     }
 
     void seek_from_point(const float x)
@@ -2650,6 +2735,11 @@ private:
             track.artist.empty() ? disc_.album_artist : track.artist,
             disc_.album_title,
             track.frame_count,
+            track.recording_mbid,
+            disc_.release_mbid,
+            disc_.release_group_mbid,
+            track.track_mbid,
+            track.artist_mbids,
         };
     }
 
@@ -2664,7 +2754,15 @@ private:
         }
         auto metadata = listen_metadata(track_index);
         if (!listenbrainz_tracker_.active()) {
+            const core::SampleFrame initial_position =
+                track_index == playback_start_track_
+                ? playback_start_offset_frames_
+                : 0;
             listenbrainz_tracker_.begin(
+                metadata,
+                initial_position,
+                unix_time_now());
+            listenbrainz_tracker_.update(
                 std::move(metadata),
                 position_frames,
                 unix_time_now());
@@ -2945,7 +3043,7 @@ private:
             token = token.substr(first, last - first + 1U);
         }
 
-        if (token.empty()) {
+        if (!platform::windows::is_listenbrainz_token_format_valid(token)) {
             settings_input_required_ = true;
             settings_save_failed_ = false;
             settings_saved_ = false;
@@ -3101,19 +3199,23 @@ private:
                 listenbrainz_card.rect.right - 24.0F,
                 listenbrainz_card.rect.top + 82.0F),
             secondary_brush_.Get());
+        const auto listenbrainz_status = listenbrainz_reporter_.status();
         draw_text(
-            !user_settings_.listenbrainz_reporting_enabled
-                ? L"已关闭"
-                : (listenbrainz_reporter_.enabled() ? L"已配置" : L"未配置"),
+            platform::windows::to_string(listenbrainz_status.state),
             small_format_.Get(),
             D2D1::RectF(
                 listenbrainz_card.rect.right - 180.0F,
                 listenbrainz_card.rect.top + 22.0F,
                 listenbrainz_card.rect.right - 92.0F,
                 listenbrainz_card.rect.top + 50.0F),
-            listenbrainz_reporter_.enabled()
+            listenbrainz_status.state == platform::windows::ListenBrainzState::ready
                 ? success_brush_.Get()
-                : muted_brush_.Get(),
+                : (listenbrainz_status.state ==
+                           platform::windows::ListenBrainzState::unauthorized ||
+                       listenbrainz_status.state ==
+                           platform::windows::ListenBrainzState::error
+                    ? error_brush_.Get()
+                    : muted_brush_.Get()),
             DWRITE_TEXT_ALIGNMENT_TRAILING);
         draw_toggle(
             layout_.settings_listenbrainz_toggle,
@@ -3141,7 +3243,7 @@ private:
                 settings_saved_
                     ? L"设置已更新"
                     : (settings_input_required_
-                        ? L"请输入 User Token；移除已有凭据请使用“清除”"
+                        ? L"请输入完整的 User Token（不能包含空格或换行）；移除凭据请使用“清除”"
                         : L"保存失败，请检查 Windows 凭据管理器权限"),
                 caption_format_.Get(),
                 D2D1::RectF(
@@ -3150,6 +3252,20 @@ private:
                     layout_.settings_listenbrainz_card.right - 24.0F,
                     layout_.settings_edit.bottom + 28.0F),
                 settings_saved_ ? success_brush_.Get() : error_brush_.Get());
+        } else {
+            draw_text(
+                listenbrainz_settings_detail(),
+                caption_format_.Get(),
+                D2D1::RectF(
+                    layout_.settings_edit.left,
+                    layout_.settings_edit.bottom + 6.0F,
+                    layout_.settings_listenbrainz_card.right - 24.0F,
+                    layout_.settings_edit.bottom + 28.0F),
+                listenbrainz_status.failed_listens != 0 ||
+                        listenbrainz_status.state ==
+                            platform::windows::ListenBrainzState::unauthorized
+                    ? error_brush_.Get()
+                    : secondary_brush_.Get());
         }
 
         const auto clear = D2D1::RoundedRect(layout_.settings_clear, 10.0F, 10.0F);

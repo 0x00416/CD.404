@@ -13,11 +13,21 @@ struct HttpResponse final {
     std::vector<std::uint8_t> body;
     unsigned long system_error{};
     unsigned long status{};
+    std::uint64_t rate_limit_remaining{};
+    std::uint64_t rate_limit_reset_seconds{};
+    bool has_rate_limit_remaining{};
+    bool has_rate_limit_reset{};
 };
 
 [[nodiscard]] HttpResponse https_get(
     std::wstring_view host,
     std::wstring_view path,
+    std::size_t maximum_response_bytes = 2U * 1'024U * 1'024U);
+
+[[nodiscard]] HttpResponse https_get(
+    std::wstring_view host,
+    std::wstring_view path,
+    std::wstring_view headers,
     std::size_t maximum_response_bytes = 2U * 1'024U * 1'024U);
 
 [[nodiscard]] HttpResponse https_post(

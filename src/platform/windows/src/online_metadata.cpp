@@ -64,6 +64,11 @@ std::optional<OnlineMetadata> lookup_online_metadata(
     const MusicBrainzLookupResult musicbrainz = musicbrainz_future.get();
     if (musicbrainz.metadata) {
         merge_text_metadata(merged, *musicbrainz.metadata, expected_tracks);
+        merged.release_mbid = musicbrainz.metadata->release_id;
+        merged.release_group_mbid = musicbrainz.metadata->release_group_id;
+        merged.track_mbids = musicbrainz.metadata->track_ids;
+        merged.recording_mbids = musicbrainz.metadata->recording_ids;
+        merged.track_artist_mbids = musicbrainz.metadata->track_artist_ids;
         merged.cover_art_path = musicbrainz.metadata->cover_art_path;
         merged.sources.emplace_back(L"MusicBrainz");
     }

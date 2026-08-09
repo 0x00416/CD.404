@@ -68,7 +68,7 @@ private:
         toc_value += std::format(L"+{}", track.start_lba + kLeadInSectors);
     }
     return L"/ws/2/discid/-?toc=" + toc_value +
-           L"&inc=recordings+artist-credits&cdstubs=no";
+           L"&inc=recordings+artist-credits+release-groups&cdstubs=no";
 }
 
 [[nodiscard]] bool read_response(HINTERNET request, std::vector<std::uint8_t>& body)
@@ -256,6 +256,9 @@ struct XmlState final {
     std::wstring text;
     std::wstring pending_join_phrase;
     std::wstring current_track_artist;
+    std::wstring current_track_id;
+    std::wstring current_recording_id;
+    std::vector<std::wstring> current_track_artist_ids;
     std::wstring track_pending_join_phrase;
     std::optional<std::uint64_t> current_track_length;
     std::uint64_t best_score{std::numeric_limits<std::uint64_t>::max()};
@@ -283,6 +286,8 @@ void begin_element(
         state.candidate = {};
         state.candidate.release_id = string_attribute(reader, L"id");
         state.release_depth = depth;
+    } else if (name == L"release-group" && depth == state.release_depth + 1U) {
+        state.candidate.release_group_id = string_attribute(reader, L"id");
     } else if (name == L"artist-credit" && depth == state.release_depth + 1U) {
         state.release_artist_depth = depth;
     } else if (name == L"name-credit" && state.release_artist_depth !=
@@ -294,6 +299,9 @@ void begin_element(
         state.medium_matches = false;
         state.candidate.track_titles.clear();
         state.candidate.track_artists.clear();
+        state.candidate.track_ids.clear();
+        state.candidate.recording_ids.clear();
+        state.candidate.track_artist_ids.clear();
         state.track_lengths.clear();
     } else if (name == L"track-list" && depth == state.medium_depth + 1U) {
         state.track_list_depth = depth;
@@ -304,15 +312,27 @@ void begin_element(
         state.track_depth = depth;
         state.current_track_length.reset();
         state.current_track_artist.clear();
+        state.current_track_id = string_attribute(reader, L"id");
+        state.current_recording_id.clear();
+        state.current_track_artist_ids.clear();
     } else if (name == L"recording" && state.medium_matches &&
                state.track_list_depth != std::numeric_limits<std::size_t>::max()) {
         state.recording_depth = depth;
+        state.current_recording_id = string_attribute(reader, L"id");
     } else if (name == L"artist-credit" && state.recording_depth !=
                std::numeric_limits<std::size_t>::max()) {
         state.track_artist_depth = depth;
     } else if (name == L"name-credit" && state.track_artist_depth !=
                std::numeric_limits<std::size_t>::max()) {
         state.track_pending_join_phrase = string_attribute(reader, L"joinphrase");
+    } else if (name == L"artist" && state.track_artist_depth !=
+               std::numeric_limits<std::size_t>::max()) {
+        const std::wstring artist_id = string_attribute(reader, L"id");
+        if (!artist_id.empty() &&
+            std::ranges::find(state.current_track_artist_ids, artist_id) ==
+                state.current_track_artist_ids.end()) {
+            state.current_track_artist_ids.push_back(artist_id);
+        }
     }
 }
 
@@ -351,9 +371,15 @@ void end_element(
     } else if (name == L"track" && depth == state.track_depth) {
         state.track_lengths.push_back(state.current_track_length.value_or(0));
         state.candidate.track_artists.push_back(state.current_track_artist);
+        state.candidate.track_ids.push_back(state.current_track_id);
+        state.candidate.recording_ids.push_back(state.current_recording_id);
+        state.candidate.track_artist_ids.push_back(state.current_track_artist_ids);
         state.track_depth = std::numeric_limits<std::size_t>::max();
         state.current_track_length.reset();
         state.current_track_artist.clear();
+        state.current_track_id.clear();
+        state.current_recording_id.clear();
+        state.current_track_artist_ids.clear();
     } else if (name == L"track-list" && depth == state.track_list_depth) {
         state.track_list_depth = std::numeric_limits<std::size_t>::max();
     } else if (name == L"medium" && depth == state.medium_depth) {
@@ -387,6 +413,9 @@ void end_element(
         state.medium_matches = false;
         state.candidate.track_titles.clear();
         state.candidate.track_artists.clear();
+        state.candidate.track_ids.clear();
+        state.candidate.recording_ids.clear();
+        state.candidate.track_artist_ids.clear();
         state.track_lengths.clear();
     } else if (name == L"artist-credit" && depth == state.track_artist_depth) {
         state.track_artist_depth = std::numeric_limits<std::size_t>::max();

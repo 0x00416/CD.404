@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cwchar>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -32,11 +34,51 @@ private:
     HINTERNET handle_{};
 };
 
+void read_rate_limit_headers(HINTERNET request, HttpResponse& response) noexcept
+{
+    auto read_number = [request](const wchar_t* name) -> std::optional<std::uint64_t> {
+        wchar_t value[64]{};
+        DWORD size = sizeof(value);
+        if (WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_CUSTOM,
+                name,
+                value,
+                &size,
+                WINHTTP_NO_HEADER_INDEX) == FALSE) {
+            return std::nullopt;
+        }
+        wchar_t* end{};
+        const unsigned long long parsed = std::wcstoull(value, &end, 10);
+        return end != value && *end == L'\0'
+            ? std::optional<std::uint64_t>(parsed)
+            : std::nullopt;
+    };
+
+    if (const auto remaining = read_number(L"X-RateLimit-Remaining")) {
+        response.rate_limit_remaining = *remaining;
+        response.has_rate_limit_remaining = true;
+    }
+    if (const auto reset = read_number(L"X-RateLimit-Reset-In")) {
+        response.rate_limit_reset_seconds = *reset;
+        response.has_rate_limit_reset = true;
+    }
+}
+
 } // namespace
 
 HttpResponse https_get(
     const std::wstring_view host,
     const std::wstring_view path,
+    const std::size_t maximum_response_bytes)
+{
+    return https_get(host, path, {}, maximum_response_bytes);
+}
+
+HttpResponse https_get(
+    const std::wstring_view host,
+    const std::wstring_view path,
+    const std::wstring_view headers,
     const std::size_t maximum_response_bytes)
 {
     if (host.empty() || path.empty() || maximum_response_bytes == 0U) {
@@ -70,11 +112,12 @@ HttpResponse https_get(
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_SECURE));
+    const std::wstring header_string(headers);
     if (request.get() == nullptr ||
         WinHttpSendRequest(
             request.get(),
-            WINHTTP_NO_ADDITIONAL_HEADERS,
-            0,
+            header_string.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : header_string.c_str(),
+            header_string.empty() ? 0U : static_cast<DWORD>(-1L),
             WINHTTP_NO_REQUEST_DATA,
             0,
             0,
@@ -97,6 +140,7 @@ HttpResponse https_get(
 
     HttpResponse response;
     response.status = status;
+    read_rate_limit_headers(request.get(), response);
     for (;;) {
         DWORD available{};
         if (WinHttpQueryDataAvailable(request.get(), &available) == FALSE) {
@@ -196,6 +240,7 @@ HttpResponse https_post(
 
     HttpResponse response;
     response.status = status;
+    read_rate_limit_headers(request.get(), response);
     for (;;) {
         DWORD available{};
         if (WinHttpQueryDataAvailable(request.get(), &available) == FALSE) {

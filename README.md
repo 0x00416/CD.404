@@ -42,6 +42,7 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - 曲内已播放/总时长显示，以及直接作用于 PCM 消费端的实时音量控制；首次启动默认为 100%，单位增益保持样本不变。
 - 按光盘 TOC 记忆当前曲目和精确采样帧位置，并持久化音量。
 - ListenBrainz `playing_now` 和符合“半曲或 4 分钟取较短者”规则的 `single` 上报。
+- ListenBrainz Token 在线验证、账户状态、SQLite 离线队列及速率限制感知重试。
 - CD-TEXT、MusicBrainz、GnuDB 与 iTunes 多源元数据补全，并显示本次实际命中的来源。
 - 基础自动测试。
 
@@ -95,7 +96,9 @@ $env:CD404_LISTENBRAINZ_TOKEN = '<个人 User Token>'
 make run-release
 ```
 
-开始实际播放且曲名、艺术家可用时提交一次 `playing_now`；实际渲染达到曲目时长的一半或 4 分钟（取较短者）后立即提交一次带起播时间的 `single`。网络请求在后台执行，不会阻塞播放。持久化离线队列和失败补报仍属于后续工作。
+用户单击曲目并创建播放会话时，只要曲名和艺术家可用就立即提交一次 `playing_now`，无需等待光驱预缓冲完成；实际渲染达到曲目时长的一半或 4 分钟（取较短者）后，才将带起播时间的 `single` 写入本地 SQLite 队列并由后台线程上报。设置页会显示已验证账户、待同步、重试和凭据状态；播放主界面不显示上报进度。网络失败按指数退避重试，HTTP 429 优先遵循 ListenBrainz 的 `X-RateLimit-Reset-In`，应用退出后未完成的正式记录仍会保留。
+
+待同步记录位于 `%LOCALAPPDATA%\CD.404\listenbrainz.db`。数据库不保存 User Token，并以不可逆的本地凭据指纹隔离不同账户的队列；Token 始终只保存在 Windows 凭据管理器中。
 
 也可以直接生成 Visual Studio 工程：
 
