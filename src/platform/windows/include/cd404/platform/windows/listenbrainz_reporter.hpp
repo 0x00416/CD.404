@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cd404/listenbrainz/playback_tracker.hpp>
+#include <cd404/platform/windows/http_client.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -48,9 +50,16 @@ struct ListenBrainzStatus final {
 
 [[nodiscard]] const wchar_t* to_string(ListenBrainzState state) noexcept;
 
+struct ListenBrainzReporterOptions final {
+    std::shared_ptr<HttpClient> http_client;
+    std::filesystem::path queue_path;
+    std::wstring token;
+};
+
 class ListenBrainzReporter final {
 public:
     ListenBrainzReporter();
+    explicit ListenBrainzReporter(ListenBrainzReporterOptions options);
     ~ListenBrainzReporter();
 
     ListenBrainzReporter(const ListenBrainzReporter&) = delete;
@@ -63,6 +72,7 @@ public:
     void submit(const listenbrainz::Submission& submission);
     void clear_playing_now();
     void retry_pending();
+    [[nodiscard]] bool clear_pending();
     [[nodiscard]] ListenBrainzStatus status() const;
 
 private:

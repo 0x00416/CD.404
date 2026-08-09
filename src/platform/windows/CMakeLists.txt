@@ -10,6 +10,7 @@ target_sources(
         src/gnudb_client.cpp
         src/itunes_client.cpp
         src/listenbrainz_reporter.cpp
+        src/listenbrainz_queue.cpp
         src/metadata_store.cpp
         src/musicbrainz_client.cpp
         src/online_metadata.cpp
@@ -25,8 +26,10 @@ target_sources(
             include/cd404/platform/windows/device_lifecycle.hpp
             include/cd404/platform/windows/optical_drive.hpp
             include/cd404/platform/windows/gnudb_client.hpp
+            include/cd404/platform/windows/http_client.hpp
             include/cd404/platform/windows/itunes_client.hpp
             include/cd404/platform/windows/listenbrainz_reporter.hpp
+            include/cd404/platform/windows/listenbrainz_queue.hpp
             include/cd404/platform/windows/metadata_store.hpp
             include/cd404/platform/windows/musicbrainz_client.hpp
             include/cd404/platform/windows/online_metadata.hpp

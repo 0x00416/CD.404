@@ -7,6 +7,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
+#include <cd404/platform/windows/listenbrainz_queue.hpp>
 
 #include "http_client.hpp"
 
@@ -530,14 +531,19 @@ struct ListenBrainzReporter::Implementation final {
         ActionKind kind{ActionKind::none};
         std::wstring token;
         std::string payload;
-        std::optional<PendingListen> pending;
+        std::optional<ListenBrainzPendingListen> pending;
         unsigned int attempts{};
         std::uint64_t generation{};
     };
 
-    explicit Implementation(std::wstring loaded_token)
+    Implementation(
+        std::wstring loaded_token,
+        std::shared_ptr<HttpClient> transport,
+        std::filesystem::path queue_path)
         : token(std::move(loaded_token)),
           owner_key(token_owner_key(token)),
+          queue(std::move(queue_path)),
+          http_client(transport ? std::move(transport) : make_win_http_client()),
           validation_needed(!token.empty())
     {
         refresh_counts_locked();
@@ -660,7 +666,7 @@ struct ListenBrainzReporter::Implementation final {
                 : (action.kind == ActionKind::playing_now
                     ? L"/1/submit-listens?return_msid=true"
                     : L"/1/submit-listens");
-            const detail::HttpResponse response = detail::https_post(
+            const HttpResponse response = http_client->post(
                 L"api.listenbrainz.org",
                 path,
                 authorization_headers(action.token),
@@ -672,7 +678,7 @@ struct ListenBrainzReporter::Implementation final {
 
     void process_validation(const std::wstring& attempted_token)
     {
-        const detail::HttpResponse response = detail::https_get(
+        const HttpResponse response = http_client->get(
             L"api.listenbrainz.org",
             L"/1/validate-token",
             authorization_headers(attempted_token),
@@ -955,6 +961,15 @@ struct ListenBrainzReporter::Implementation final {
         changed.notify_all();
     }
 
+    [[nodiscard]] bool clear_pending()
+    {
+        std::scoped_lock lock(mutex);
+        const bool cleared = queue.clear_owner(owner_key);
+        refresh_counts_locked();
+        changed.notify_all();
+        return cleared;
+    }
+
     [[nodiscard]] ListenBrainzStatus status() const
     {
         std::scoped_lock lock(mutex);
@@ -977,7 +992,8 @@ struct ListenBrainzReporter::Implementation final {
     std::string owner_key;
     mutable std::mutex mutex;
     std::condition_variable_any changed;
-    PersistentListenQueue queue;
+    ListenBrainzQueue queue;
+    std::shared_ptr<HttpClient> http_client;
     ListenBrainzStatus current_status;
     std::optional<EphemeralSubmission> playing_now;
     std::string active_playing_now_payload;
@@ -994,7 +1010,20 @@ struct ListenBrainzReporter::Implementation final {
 };
 
 ListenBrainzReporter::ListenBrainzReporter()
-    : implementation_(std::make_unique<Implementation>(load_token()))
+    : implementation_(std::make_unique<Implementation>(
+          load_token(),
+          make_win_http_client(),
+          default_listenbrainz_queue_path()))
+{
+}
+
+ListenBrainzReporter::ListenBrainzReporter(ListenBrainzReporterOptions options)
+    : implementation_(std::make_unique<Implementation>(
+          std::move(options.token),
+          std::move(options.http_client),
+          options.queue_path.empty()
+              ? default_listenbrainz_queue_path()
+              : std::move(options.queue_path)))
 {
 }
 
@@ -1046,6 +1075,11 @@ void ListenBrainzReporter::retry_pending()
     if (implementation_ != nullptr) {
         implementation_->retry();
     }
+}
+
+bool ListenBrainzReporter::clear_pending()
+{
+    return implementation_ != nullptr && implementation_->clear_pending();
 }
 
 ListenBrainzStatus ListenBrainzReporter::status() const

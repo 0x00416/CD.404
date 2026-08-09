@@ -82,6 +82,7 @@ private:
         std::int64_t unix_time);
     void merge_metadata(const TrackMetadata& track);
     void submit_playing_now_if_ready();
+    void submit_playing_now_identity_update_if_ready(bool identity_was_available);
     void submit_single_if_ready();
     void finish_track();
     [[nodiscard]] bool metadata_ready() const noexcept;
@@ -93,6 +94,7 @@ private:
     std::int64_t listened_at_{};
     bool active_{};
     bool playing_now_submitted_{};
+    bool playing_now_identity_update_submitted_{};
     bool single_submitted_{};
 };
 

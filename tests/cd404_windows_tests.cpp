@@ -4,11 +4,13 @@
 #include <audioclient.h>
 #include <dbt.h>
 #include <objbase.h>
+#include <winsqlite/winsqlite3.h>
 
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
+#include <cd404/platform/windows/listenbrainz_queue.hpp>
 #include <cd404/platform/windows/musicbrainz_client.hpp>
 #include <cd404/platform/windows/metadata_store.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
@@ -19,7 +21,9 @@
 #include <winrt/Windows.Foundation.Collections.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string_view>
@@ -129,6 +133,36 @@ public:
         return mode == cd404::platform::windows::WasapiShareMode::exclusive
             ? exclusive_initialize
             : shared_initialize;
+    }
+};
+
+class ScriptedHttpClient final
+    : public cd404::platform::windows::HttpClient {
+public:
+    cd404::platform::windows::HttpResponse validation;
+    cd404::platform::windows::HttpResponse submission;
+    std::atomic_uint get_calls{};
+    std::atomic_uint post_calls{};
+
+    cd404::platform::windows::HttpResponse get(
+        std::wstring_view,
+        std::wstring_view,
+        std::wstring_view,
+        std::size_t) override
+    {
+        get_calls.fetch_add(1, std::memory_order_relaxed);
+        return validation;
+    }
+
+    cd404::platform::windows::HttpResponse post(
+        std::wstring_view,
+        std::wstring_view,
+        std::wstring_view,
+        std::span<const std::uint8_t>,
+        std::size_t) override
+    {
+        post_calls.fetch_add(1, std::memory_order_relaxed);
+        return submission;
     }
 };
 
@@ -440,6 +474,185 @@ void test_listenbrainz_payload_contract()
         additional.GetNamedNumber(L"duration_ms") == 123'000.0 &&
             additional.GetNamedNumber(L"duration_played") == 61.0,
         "single payload includes duration diagnostics");
+}
+
+void test_listenbrainz_queue_restart_and_account_isolation()
+{
+    using namespace cd404::platform::windows;
+    const auto path = std::filesystem::temp_directory_path() /
+        std::format(L"cd404-listenbrainz-{}.db", GetCurrentProcessId());
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(path.wstring() + L"-wal", error);
+    std::filesystem::remove(path.wstring() + L"-shm", error);
+    {
+        ListenBrainzQueue queue(path);
+        expect(
+            queue.available() && queue.schema_version() == 3,
+            "ListenBrainz queue creates the current SQLite schema");
+        expect(
+            queue.enqueue("owner-a", "session-a", "payload-a") &&
+                queue.enqueue("owner-b", "session-b", "payload-b") &&
+                queue.pending_count("owner-a") == 1U &&
+                queue.pending_count("owner-b") == 1U,
+            "different token fingerprints have isolated pending queues");
+    }
+    {
+        ListenBrainzQueue queue(path);
+        expect(
+            queue.pending_count("owner-a") == 1U &&
+                queue.pending_count("owner-b") == 1U,
+            "pending listens recover after process-style queue restart");
+        expect(
+            queue.clear_owner("owner-a") &&
+                queue.pending_count("owner-a") == 0U &&
+                queue.pending_count("owner-b") == 1U,
+            "queue cleanup deletes only the current account");
+    }
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(path.wstring() + L"-wal", error);
+    std::filesystem::remove(path.wstring() + L"-shm", error);
+
+    const auto legacy_path = std::filesystem::temp_directory_path() /
+        std::format(L"cd404-listenbrainz-legacy-{}.db", GetCurrentProcessId());
+    std::filesystem::remove(legacy_path, error);
+    sqlite3* legacy{};
+    const bool legacy_created = sqlite3_open16(legacy_path.c_str(), &legacy) == SQLITE_OK &&
+        sqlite3_exec(
+            legacy,
+            "CREATE TABLE listen_queue ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL UNIQUE,"
+            "payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,"
+            "next_attempt INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,"
+            "last_status INTEGER NOT NULL DEFAULT 0, last_error INTEGER NOT NULL DEFAULT 0);"
+            "INSERT INTO listen_queue(session_id,payload) VALUES('legacy','payload');"
+            "PRAGMA user_version=1;",
+            nullptr,
+            nullptr,
+            nullptr) == SQLITE_OK;
+    if (legacy != nullptr) {
+        sqlite3_close(legacy);
+    }
+    {
+        ListenBrainzQueue migrated(legacy_path);
+        expect(
+            legacy_created && migrated.available() && migrated.schema_version() == 3 &&
+                migrated.pending_count("") == 1U,
+            "SQLite v1 queue migrates in place without losing legacy pending listens");
+    }
+    std::filesystem::remove(legacy_path, error);
+    std::filesystem::remove(legacy_path.wstring() + L"-wal", error);
+    std::filesystem::remove(legacy_path.wstring() + L"-shm", error);
+}
+
+void test_listenbrainz_fake_http_failures()
+{
+    using namespace cd404;
+    using namespace platform::windows;
+
+    const auto exercise = [](
+                              HttpResponse submission_response,
+                              const std::wstring_view suffix,
+                              const ListenBrainzState expected_state) {
+        const auto path = std::filesystem::temp_directory_path() /
+            (L"cd404-listenbrainz-http-" + std::wstring(suffix) + L".db");
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        std::filesystem::remove(path.wstring() + L"-wal", error);
+        std::filesystem::remove(path.wstring() + L"-shm", error);
+        auto client = std::make_shared<ScriptedHttpClient>();
+        client->validation.status = 200;
+        constexpr std::string_view validation_json =
+            R"({"valid":true,"user_name":"synthetic"})";
+        client->validation.body.assign(
+            validation_json.begin(),
+            validation_json.end());
+        client->submission = std::move(submission_response);
+
+        ListenBrainzStatus final_status;
+        {
+            ListenBrainzReporter reporter(ListenBrainzReporterOptions{
+                client,
+                path,
+                L"synthetic-token",
+            });
+            const auto validation_deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(3);
+            while (std::chrono::steady_clock::now() < validation_deadline &&
+                   reporter.status().state != ListenBrainzState::ready) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            listenbrainz::Submission listen;
+            listen.type = listenbrainz::SubmissionType::single;
+            listen.listened_at = 1'700'000'000;
+            listen.track_name = L"Track";
+            listen.artist_name = L"Artist";
+            listen.duration_milliseconds = 60'000;
+            reporter.submit(listen);
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(3);
+            while (std::chrono::steady_clock::now() < deadline) {
+                final_status = reporter.status();
+                if (client->post_calls.load(std::memory_order_relaxed) != 0U &&
+                    final_status.state == expected_state) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        std::filesystem::remove(path, error);
+        std::filesystem::remove(path.wstring() + L"-wal", error);
+        std::filesystem::remove(path.wstring() + L"-shm", error);
+        return final_status;
+    };
+
+    HttpResponse unauthorized;
+    unauthorized.status = 401;
+    const auto unauthorized_status = exercise(
+        unauthorized,
+        L"401",
+        ListenBrainzState::unauthorized);
+    expect(
+        unauthorized_status.state == ListenBrainzState::unauthorized &&
+            unauthorized_status.pending_listens == 1U,
+        "fake HTTP 401 pauses the durable queue without deleting the listen");
+
+    HttpResponse limited;
+    limited.status = 429;
+    limited.has_rate_limit_reset = true;
+    limited.rate_limit_reset_seconds = 17;
+    const auto limited_status = exercise(
+        limited,
+        L"429",
+        ListenBrainzState::retry_wait);
+    expect(
+        limited_status.state == ListenBrainzState::retry_wait &&
+            limited_status.retry_after_seconds == 17U &&
+            limited_status.pending_listens == 1U,
+        "fake HTTP 429 honors the server reset interval and retains the queue");
+
+    HttpResponse offline;
+    offline.system_error = ERROR_NETWORK_UNREACHABLE;
+    const auto offline_status = exercise(
+        offline,
+        L"offline",
+        ListenBrainzState::retry_wait);
+    expect(
+        offline_status.state == ListenBrainzState::retry_wait &&
+            offline_status.retry_after_seconds > 0U &&
+            offline_status.pending_listens == 1U,
+        "fake network failure schedules retry without public internet access");
+
+    HttpResponse server_error;
+    server_error.status = 503;
+    const auto server_status = exercise(
+        server_error,
+        L"503",
+        ListenBrainzState::retry_wait);
+    expect(
+        server_status.state == ListenBrainzState::retry_wait &&
+            server_status.pending_listens == 1U,
+        "fake HTTP 5xx remains retryable and durable");
 }
 
 void test_system_media_controls_safe_fallback()
@@ -857,6 +1070,8 @@ int main(const int argument_count, char** arguments)
     test_playback_session_seek_planning();
     test_volume_control_boundaries();
     test_listenbrainz_payload_contract();
+    test_listenbrainz_queue_restart_and_account_isolation();
+    test_listenbrainz_fake_http_failures();
     test_system_media_controls_safe_fallback();
     test_system_media_controls_with_window();
     test_user_settings_round_trip();

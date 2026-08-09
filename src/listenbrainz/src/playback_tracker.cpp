@@ -18,6 +18,13 @@ constexpr core::SampleFrame kFourMinutesFrames =
     return std::min(duration_frames / 2, kFourMinutesFrames);
 }
 
+[[nodiscard]] bool has_musicbrainz_identity(const TrackMetadata& track) noexcept
+{
+    return !track.recording_mbid.empty() || !track.release_mbid.empty() ||
+        !track.release_group_mbid.empty() || !track.track_mbid.empty() ||
+        !track.artist_mbids.empty();
+}
+
 } // namespace
 
 PlaybackTracker::PlaybackTracker(SubmitCallback callback)
@@ -52,8 +59,10 @@ void PlaybackTracker::update(
         rendered_frames_ += position_frames - last_position_frames_;
     }
     last_position_frames_ = position_frames;
+    const bool identity_was_available = has_musicbrainz_identity(track_);
     merge_metadata(track);
     submit_playing_now_if_ready();
+    submit_playing_now_identity_update_if_ready(identity_was_available);
     submit_single_if_ready();
 }
 
@@ -102,6 +111,7 @@ void PlaybackTracker::start_track(
     listened_at_ = unix_time;
     active_ = track_.duration_frames > 0;
     playing_now_submitted_ = false;
+    playing_now_identity_update_submitted_ = false;
     single_submitted_ = false;
     submit_playing_now_if_ready();
 }
@@ -160,6 +170,34 @@ void PlaybackTracker::submit_playing_now_if_ready()
         track_.artist_mbids,
     });
     playing_now_submitted_ = true;
+    playing_now_identity_update_submitted_ = has_musicbrainz_identity(track_);
+}
+
+void PlaybackTracker::submit_playing_now_identity_update_if_ready(
+    const bool identity_was_available)
+{
+    if (!active_ || !playing_now_submitted_ ||
+        playing_now_identity_update_submitted_ || identity_was_available ||
+        !has_musicbrainz_identity(track_) || !callback_) {
+        return;
+    }
+    callback_(Submission{
+        SubmissionType::playing_now,
+        0,
+        track_.title,
+        track_.artist,
+        track_.release,
+        static_cast<std::uint64_t>(
+            track_.duration_frames * 1'000 / core::kCdSampleFramesPerSecond),
+        0,
+        track_.track_number,
+        track_.recording_mbid,
+        track_.release_mbid,
+        track_.release_group_mbid,
+        track_.track_mbid,
+        track_.artist_mbids,
+    });
+    playing_now_identity_update_submitted_ = true;
 }
 
 void PlaybackTracker::finish_track()
@@ -176,6 +214,7 @@ void PlaybackTracker::finish_track()
     listened_at_ = 0;
     active_ = false;
     playing_now_submitted_ = false;
+    playing_now_identity_update_submitted_ = false;
     single_submitted_ = false;
 }
 

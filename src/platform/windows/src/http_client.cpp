@@ -394,3 +394,42 @@ std::string wide_to_utf8(const std::wstring_view value)
 }
 
 } // namespace cd404::platform::windows::detail
+
+namespace cd404::platform::windows {
+namespace {
+
+class WinHttpClient final : public HttpClient {
+public:
+    HttpResponse get(
+        const std::wstring_view host,
+        const std::wstring_view path,
+        const std::wstring_view headers,
+        const std::size_t maximum_response_bytes) override
+    {
+        return detail::https_get(host, path, headers, maximum_response_bytes);
+    }
+
+    HttpResponse post(
+        const std::wstring_view host,
+        const std::wstring_view path,
+        const std::wstring_view headers,
+        const std::span<const std::uint8_t> body,
+        const std::size_t maximum_response_bytes) override
+    {
+        return detail::https_post(
+            host,
+            path,
+            headers,
+            body,
+            maximum_response_bytes);
+    }
+};
+
+} // namespace
+
+std::shared_ptr<HttpClient> make_win_http_client()
+{
+    return std::make_shared<WinHttpClient>();
+}
+
+} // namespace cd404::platform::windows

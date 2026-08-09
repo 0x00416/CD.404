@@ -1149,6 +1149,36 @@ void test_listenbrainz_playback_tracker()
         "playing_now waits until required metadata becomes available");
     late_metadata_tracker.end();
 
+    std::vector<listenbrainz::Submission> identity_updates;
+    listenbrainz::PlaybackTracker identity_tracker(
+        [&](const auto& submission) { identity_updates.push_back(submission); });
+    auto identity_late = short_track;
+    identity_late.recording_mbid = L"recording-id";
+    identity_tracker.begin(short_track, 0, 1'700'003'100);
+    identity_tracker.update(
+        identity_late,
+        core::kCdSampleFramesPerSecond,
+        1'700'003'101);
+    identity_late.release_mbid = L"release-id";
+    identity_tracker.update(
+        identity_late,
+        2 * core::kCdSampleFramesPerSecond,
+        1'700'003'102);
+    identity_tracker.update(
+        identity_late,
+        60 * core::kCdSampleFramesPerSecond,
+        1'700'003'160);
+    expect(
+        identity_updates.size() == 3U &&
+            identity_updates[0].type == SubmissionType::playing_now &&
+            identity_updates[0].recording_mbid.empty() &&
+            identity_updates[1].type == SubmissionType::playing_now &&
+            identity_updates[1].recording_mbid == L"recording-id" &&
+            identity_updates[2].type == SubmissionType::single &&
+            identity_updates[2].release_mbid == L"release-id",
+        "late MusicBrainz identity sends one playing_now correction and one formal listen");
+    identity_tracker.end();
+
     std::vector<listenbrainz::Submission> seek_submissions;
     listenbrainz::PlaybackTracker seek_tracker(
         [&](const auto& submission) { seek_submissions.push_back(submission); });

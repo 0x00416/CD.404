@@ -308,6 +308,7 @@ struct Layout final {
     D2D1_RECT_F settings_save{};
     D2D1_RECT_F settings_clear{};
     D2D1_RECT_F settings_listenbrainz_toggle{};
+    D2D1_RECT_F settings_queue_clear{};
 };
 
 class MainWindow final {
@@ -1101,6 +1102,11 @@ private:
             result.settings_listenbrainz_card.top + 22.0F,
             result.settings_listenbrainz_card.right - 24.0F,
             result.settings_listenbrainz_card.top + 50.0F);
+        result.settings_queue_clear = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 208.0F,
+            result.settings_listenbrainz_card.top + 66.0F,
+            result.settings_listenbrainz_card.right - 24.0F,
+            result.settings_listenbrainz_card.top + 102.0F);
         return result;
     }
 
@@ -3716,6 +3722,11 @@ private:
                 user_settings_.listenbrainz_reporting_enabled);
             persist_user_settings();
             InvalidateRect(window_, nullptr, FALSE);
+        } else if (contains(layout_.settings_queue_clear, point)) {
+            settings_saved_ = listenbrainz_reporter_.clear_pending();
+            settings_save_failed_ = !settings_saved_;
+            settings_input_required_ = false;
+            InvalidateRect(window_, nullptr, FALSE);
         } else if (contains(layout_.settings_audio_endpoint, point)) {
             select_next_audio_endpoint();
         } else if (contains(
@@ -3953,6 +3964,18 @@ private:
         draw_toggle(
             layout_.settings_listenbrainz_toggle,
             user_settings_.listenbrainz_reporting_enabled);
+        const auto queue_clear = D2D1::RoundedRect(
+            layout_.settings_queue_clear,
+            9.0F,
+            9.0F);
+        render_target_->FillRoundedRectangle(queue_clear, elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(queue_clear, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"清理当前账户待同步队列",
+            small_format_.Get(),
+            layout_.settings_queue_clear,
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(
             L"USER TOKEN",
             caption_format_.Get(),
