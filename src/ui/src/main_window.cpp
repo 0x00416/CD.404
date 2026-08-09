@@ -6,6 +6,7 @@
 #include <dwrite.h>
 #include <dwmapi.h>
 #include <commdlg.h>
+#include <oleacc.h>
 #include <commctrl.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -22,6 +23,7 @@
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/ui/main_window.hpp>
+#include <cd404/ui/theme.hpp>
 
 #include "disc_snapshot.hpp"
 #include "ui_layout.hpp"
@@ -81,6 +83,14 @@ constexpr float kMinimumHeight = 600.0F;
         alpha);
 }
 
+[[nodiscard]] COLORREF colorref(const std::uint32_t rgb) noexcept
+{
+    return RGB(
+        static_cast<BYTE>((rgb >> 16U) & 0xffU),
+        static_cast<BYTE>((rgb >> 8U) & 0xffU),
+        static_cast<BYTE>(rgb & 0xffU));
+}
+
 [[nodiscard]] bool contains(const D2D1_RECT_F& rectangle, const D2D1_POINT_2F point)
 {
     return point.x >= rectangle.left && point.x <= rectangle.right &&
@@ -134,6 +144,7 @@ public:
               listenbrainz_reporter_.submit(submission);
           })
     {
+        theme_ = query_system_theme();
         diagnostics_.record(L"app", L"startup");
         listenbrainz_reporter_.set_reporting_enabled(
             user_settings_.listenbrainz_reporting_enabled);
@@ -271,7 +282,36 @@ private:
                 kAnimationIntervalMs,
                 nullptr));
             refresh_disc();
+            update_accessible_name();
             return 0;
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_SETTINGCHANGE:
+            refresh_theme();
+            return 0;
+        case WM_GETOBJECT:
+            if (static_cast<long>(lparam) == OBJID_CLIENT) {
+                IAccessible* accessible{};
+                if (SUCCEEDED(CreateStdAccessibleObject(
+                        window_,
+                        OBJID_CLIENT,
+                        IID_IAccessible,
+                        reinterpret_cast<void**>(&accessible))) &&
+                    accessible != nullptr) {
+                    const LRESULT result = LresultFromObject(
+                        IID_IAccessible,
+                        wparam,
+                        accessible);
+                    accessible->Release();
+                    return result;
+                }
+            }
+            break;
+        case WM_SETFOCUS:
+            NotifyWinEvent(EVENT_OBJECT_FOCUS, window_, OBJID_CLIENT, CHILDID_SELF);
+            return 0;
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS;
         case WM_PAINT:
             paint();
             return 0;
@@ -392,8 +432,8 @@ private:
             if (reinterpret_cast<HWND>(lparam) == settings_token_edit_ ||
                 reinterpret_cast<HWND>(lparam) == metadata_edit_) {
                 const auto device_context = reinterpret_cast<HDC>(wparam);
-                SetTextColor(device_context, RGB(242, 244, 248));
-                SetBkColor(device_context, RGB(29, 33, 42));
+                SetTextColor(device_context, colorref(theme_.text));
+                SetBkColor(device_context, colorref(theme_.elevated));
                 return reinterpret_cast<LRESULT>(settings_edit_brush_);
             }
             break;
@@ -652,21 +692,21 @@ private:
 
         const float dpi = static_cast<float>(GetDpiForWindow(window_));
         render_target_->SetDpi(dpi, dpi);
-        result = create_brush(color(0x0C0E12), background_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x14171C), surface_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x1B2027), elevated_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x2A3038), border_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0xF2F4F7), text_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0xA8B0BB), secondary_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x747D89), muted_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x91A0FF), accent_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x101218), accent_text_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x62D3A4), success_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0xF0BD6A), warning_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0xEF737A), error_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x91A0FF, 0.11F), selection_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0xFFFFFF, 0.055F), hover_brush_);
-        if (SUCCEEDED(result)) result = create_brush(color(0x050608, 0.72F), disc_brush_);
+        result = create_brush(color(theme_.background), background_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.surface), surface_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.elevated), elevated_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.border), border_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.text), text_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.secondary), secondary_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.muted), muted_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.accent), accent_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.accent_text), accent_text_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.success), success_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.warning), warning_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.error), error_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.accent, 0.14F), selection_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.text, 0.07F), hover_brush_);
+        if (SUCCEEDED(result)) result = create_brush(color(theme_.disc, 0.72F), disc_brush_);
         if (FAILED(result)) {
             discard_device_resources();
             return result;
@@ -767,7 +807,7 @@ private:
 
     void apply_window_materials() const
     {
-        const BOOL dark = TRUE;
+        const BOOL dark = theme_.dark && !theme_.high_contrast;
         static_cast<void>(DwmSetWindowAttribute(
             window_,
             kDwmUseImmersiveDarkMode,
@@ -779,12 +819,30 @@ private:
             kDwmWindowCornerPreference,
             &rounded,
             sizeof(rounded)));
-        const int backdrop = 2;
+        const int backdrop = theme_.high_contrast ? 0 : 2;
         static_cast<void>(DwmSetWindowAttribute(
             window_,
             kDwmSystemBackdropType,
             &backdrop,
             sizeof(backdrop)));
+    }
+
+    void refresh_theme()
+    {
+        theme_ = query_system_theme();
+        discard_device_resources();
+        if (settings_edit_brush_ != nullptr) {
+            DeleteObject(settings_edit_brush_);
+        }
+        settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
+        apply_window_materials();
+        diagnostics_.record(
+            L"theme",
+            std::format(
+                L"changed dark={} high-contrast={}",
+                theme_.dark ? 1 : 0,
+                theme_.high_contrast ? 1 : 0));
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void paint()
@@ -794,7 +852,7 @@ private:
         if (SUCCEEDED(create_device_resources())) {
             render_target_->BeginDraw();
             render_target_->SetTransform(D2D1::Matrix3x2F::Identity());
-            render_target_->Clear(color(0x0C0E12));
+            render_target_->Clear(color(theme_.background));
             const auto size = render_target_->GetSize();
             layout_ = detail::calculate_layout(size.width, size.height);
             draw_header();
@@ -2017,6 +2075,10 @@ private:
 
     LRESULT handle_key_down(const WPARAM key)
     {
+        if (key == VK_F1) {
+            show_keyboard_help();
+            return 0;
+        }
         if (active_page_ == AppPage::settings) {
             if (key == VK_ESCAPE) {
                 close_settings();
@@ -2089,6 +2151,19 @@ private:
             }
         }
         return DefWindowProcW(window_, WM_KEYDOWN, key, 0);
+    }
+
+    void show_keyboard_help() const
+    {
+        MessageBoxW(
+            window_,
+            L"播放器：空格/Enter 播放或暂停；↑/↓ 选择曲目；Ctrl+←/→ 切轨；"
+            L"Home/End 首末曲；F2 组合键修订元数据；F5 刷新；Ctrl+E 弹出；Esc 停止。\n\n"
+            L"设置：D 切换输出设备；X 切换独占；F 切换显式共享回退；"
+            L"G 导出脱敏诊断；Enter 保存；Esc 返回。\n\n"
+            L"应用跟随 Windows 浅色/深色和高对比度设置。",
+            L"CD.404 键盘与辅助功能帮助",
+            MB_OK | MB_ICONINFORMATION);
     }
 
     void handle_mouse_wheel(
@@ -2892,6 +2967,7 @@ private:
 
     void sync_system_media(const bool force)
     {
+        update_accessible_name();
         if (!system_media_controls_.available()) {
             return;
         }
@@ -2923,6 +2999,26 @@ private:
                     core::kCdSampleFramesPerSecond));
             last_system_timeline_update_ = now;
         }
+    }
+
+    void update_accessible_name()
+    {
+        std::wstring name = L"CD.404 播放器";
+        if (selected_track_ < disc_.tracks.size()) {
+            const auto& track = disc_.tracks[selected_track_];
+            name += L" — " + track.title;
+            if (!track.artist.empty()) {
+                name += L" — " + track.artist;
+            }
+        } else if (!disc_.status.empty()) {
+            name += L" — " + disc_.status;
+        }
+        if (name == accessible_name_) {
+            return;
+        }
+        accessible_name_ = std::move(name);
+        SetWindowTextW(window_, accessible_name_.c_str());
+        NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, window_, OBJID_WINDOW, CHILDID_SELF);
     }
 
     void restore_playback_position()
@@ -3078,7 +3174,7 @@ private:
                 DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
         }
         if (settings_edit_brush_ == nullptr) {
-            settings_edit_brush_ = CreateSolidBrush(RGB(29, 33, 42));
+            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
         }
         metadata_edit_ = CreateWindowExW(
             WS_EX_CLIENTEDGE,
@@ -3288,7 +3384,7 @@ private:
                 L"Segoe UI");
         }
         if (settings_edit_brush_ == nullptr) {
-            settings_edit_brush_ = CreateSolidBrush(RGB(29, 33, 42));
+            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
         }
         settings_token_edit_ = CreateWindowExW(
             0,
@@ -3822,6 +3918,8 @@ private:
 
     HINSTANCE instance_{};
     HWND window_{};
+    ThemePalette theme_{};
+    std::wstring accessible_name_;
     ComPtr<ID2D1Factory> factory_;
     ComPtr<IDWriteFactory> write_factory_;
     ComPtr<IWICImagingFactory> imaging_factory_;

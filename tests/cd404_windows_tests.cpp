@@ -17,6 +17,7 @@
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
+#include <cd404/ui/theme.hpp>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -64,6 +65,23 @@ void test_result_semantics()
     expect(
         !result.succeeded(),
         "non-terminal playback is not reported as successful");
+}
+
+void test_theme_palettes()
+{
+    const auto dark = cd404::ui::make_theme_palette(true, false);
+    const auto light = cd404::ui::make_theme_palette(false, false);
+    const auto high = cd404::ui::make_theme_palette(false, true);
+    expect(
+        dark.dark && !dark.high_contrast && !light.dark &&
+            dark.background != light.background && dark.text != light.text &&
+            dark.accent_text != dark.accent,
+        "dark and light system palettes provide distinct readable surfaces");
+    expect(
+        high.high_contrast && high.text != high.background &&
+            high.border == high.text && high.accent != high.background &&
+            high.accent_text != high.accent,
+        "high-contrast palette has explicit system-independent foreground separation");
 }
 
 void test_diagnostic_redaction_and_export()
@@ -1152,6 +1170,7 @@ int main(const int argument_count, char** arguments)
 {
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
+    test_theme_palettes();
     test_diagnostic_redaction_and_export();
     test_device_failure_classification();
     test_wasapi_negotiation_and_fallback();

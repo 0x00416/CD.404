@@ -5,12 +5,14 @@ target_sources(
     PRIVATE
         src/disc_snapshot.cpp
         src/main_window.cpp
+        src/theme.cpp
         src/ui_layout.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
             include/cd404/ui/main_window.hpp
+            include/cd404/ui/theme.hpp
 )
 
 target_compile_features(cd404_ui PUBLIC cxx_std_20)
@@ -25,6 +27,7 @@ target_link_libraries(
         dwrite
         dwmapi
         user32
+        oleacc
         windowscodecs
 )
 cd404_set_project_warnings(cd404_ui)
