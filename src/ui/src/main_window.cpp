@@ -52,6 +52,8 @@ constexpr UINT kPlaybackReadyMessage = WM_APP + 3;
 constexpr UINT kSystemMediaRequestMessage = WM_APP + 4;
 constexpr UINT kSettingsSaveMessage = WM_APP + 5;
 constexpr UINT kSettingsCloseMessage = WM_APP + 6;
+constexpr UINT kMetadataEditSaveMessage = WM_APP + 7;
+constexpr UINT kMetadataEditCloseMessage = WM_APP + 8;
 constexpr int kSettingsTokenEditId = 1'001;
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT kAnimationIntervalMs = 50;
@@ -115,6 +117,10 @@ struct UiTrack final {
     bool has_metadata_title{};
     std::wstring title;
     std::wstring artist;
+    platform::windows::MetadataSource title_source{
+        platform::windows::MetadataSource::unknown};
+    platform::windows::MetadataSource artist_source{
+        platform::windows::MetadataSource::unknown};
     std::wstring track_mbid;
     std::wstring recording_mbid;
     std::vector<std::wstring> artist_mbids;
@@ -127,9 +133,15 @@ struct DiscSnapshot final {
     core::SampleFrame total_audio_frames{};
     std::wstring album_title;
     std::wstring album_artist;
+    platform::windows::MetadataSource album_title_source{
+        platform::windows::MetadataSource::unknown};
+    platform::windows::MetadataSource album_artist_source{
+        platform::windows::MetadataSource::unknown};
     std::wstring release_mbid;
     std::wstring release_group_mbid;
     std::wstring metadata_source;
+    std::vector<platform::windows::MetadataReleaseCandidate> release_candidates;
+    std::wstring selected_release_id;
     std::filesystem::path cover_art_path;
     std::wstring status;
     bool has_cd_text{};
@@ -181,16 +193,67 @@ struct OnlineMetadataSnapshot final {
             snapshot.metadata_source = L"CD-TEXT";
             snapshot.album_title = to_wstring(cd_text_result.metadata->album_title);
             snapshot.album_artist = to_wstring(cd_text_result.metadata->album_performer);
+            if (!snapshot.album_title.empty()) {
+                snapshot.album_title_source =
+                    platform::windows::MetadataSource::cd_text;
+            }
+            if (!snapshot.album_artist.empty()) {
+                snapshot.album_artist_source =
+                    platform::windows::MetadataSource::cd_text;
+            }
             for (auto& track : snapshot.tracks) {
                 const auto& metadata = cd_text_result.metadata->tracks[track.number];
                 if (!metadata.title.empty()) {
                     track.title = to_wstring(metadata.title);
                     track.has_metadata_title = true;
+                    track.title_source = platform::windows::MetadataSource::cd_text;
                 }
                 if (!metadata.performer.empty()) {
                     track.artist = to_wstring(metadata.performer);
+                    track.artist_source = platform::windows::MetadataSource::cd_text;
                 }
             }
+        }
+        if (const auto cached = platform::windows::load_metadata_cache(
+                platform::windows::make_disc_settings_key(*snapshot.toc))) {
+            const auto merge_cached = [](
+                                          std::wstring& value,
+                                          platform::windows::MetadataSource& source,
+                                          const platform::windows::SourcedMetadataValue& incoming) {
+                platform::windows::SourcedMetadataValue destination{value, source};
+                if (platform::windows::merge_metadata_value(
+                        destination,
+                        incoming.value,
+                        incoming.source)) {
+                    value = std::move(destination.value);
+                    source = destination.source;
+                }
+            };
+            merge_cached(
+                snapshot.album_title,
+                snapshot.album_title_source,
+                cached->metadata.album_title);
+            merge_cached(
+                snapshot.album_artist,
+                snapshot.album_artist_source,
+                cached->metadata.album_artist);
+            for (std::size_t index = 0;
+                 index < std::min(snapshot.tracks.size(), cached->metadata.tracks.size());
+                 ++index) {
+                merge_cached(
+                    snapshot.tracks[index].title,
+                    snapshot.tracks[index].title_source,
+                    cached->metadata.tracks[index].title);
+                merge_cached(
+                    snapshot.tracks[index].artist,
+                    snapshot.tracks[index].artist_source,
+                    cached->metadata.tracks[index].artist);
+                snapshot.tracks[index].has_metadata_title =
+                    snapshot.tracks[index].title_source !=
+                    platform::windows::MetadataSource::unknown;
+            }
+            snapshot.selected_release_id = cached->selected_release_id;
+            snapshot.metadata_source = L"本地元数据缓存";
         }
         snapshot.status = std::format(
             L"已就绪 · {} 首音频轨",
@@ -266,6 +329,7 @@ public:
 
     ~MainWindow()
     {
+        close_metadata_edit();
         close_settings();
         stop_playback();
         user_settings_.volume = volume_;
@@ -404,6 +468,7 @@ private:
                 const auto height = static_cast<UINT32>(HIWORD(lparam));
                 static_cast<void>(render_target_->Resize(D2D1::SizeU(width, height)));
             }
+            update_metadata_edit_bounds();
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_DPICHANGED: {
@@ -509,7 +574,8 @@ private:
         case WM_KEYDOWN:
             return handle_key_down(wparam);
         case WM_CTLCOLOREDIT:
-            if (reinterpret_cast<HWND>(lparam) == settings_token_edit_) {
+            if (reinterpret_cast<HWND>(lparam) == settings_token_edit_ ||
+                reinterpret_cast<HWND>(lparam) == metadata_edit_) {
                 const auto device_context = reinterpret_cast<HDC>(wparam);
                 SetTextColor(device_context, RGB(242, 244, 248));
                 SetBkColor(device_context, RGB(29, 33, 42));
@@ -568,6 +634,12 @@ private:
         case kSettingsCloseMessage:
             close_settings();
             return 0;
+        case kMetadataEditSaveMessage:
+            commit_metadata_edit();
+            return 0;
+        case kMetadataEditCloseMessage:
+            close_metadata_edit();
+            return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
             persist_playback_position();
@@ -596,6 +668,14 @@ private:
     enum class AppPage {
         player,
         settings,
+    };
+
+    enum class MetadataEditField {
+        none,
+        album_title,
+        album_artist,
+        track_title,
+        track_artist,
     };
 
     enum class ControlIcon {
@@ -1936,7 +2016,9 @@ private:
         }
         ++disc_generation_;
         disc_ = std::move(*snapshot);
+        preferred_metadata_release_id_.clear();
         selected_track_ = first_audio_track();
+        update_metadata_source_summary();
         restore_playback_position();
         scroll_row_ = 0;
         InvalidateRect(window_, nullptr, FALSE);
@@ -2000,19 +2082,22 @@ private:
         const disc::Toc toc = *disc_.toc;
         const std::wstring album_title = disc_.album_title;
         const std::wstring album_artist = disc_.album_artist;
+        const std::wstring preferred_release_id = preferred_metadata_release_id_;
         const std::uint64_t disc_generation = disc_generation_;
         metadata_worker_ = std::jthread([
             target_window,
             toc,
             album_title,
             album_artist,
+            preferred_release_id,
             disc_generation] {
             auto snapshot = std::make_unique<OnlineMetadataSnapshot>();
             snapshot->disc_generation = disc_generation;
             snapshot->metadata = platform::windows::lookup_online_metadata(
                 toc,
                 album_title,
-                album_artist);
+                album_artist,
+                preferred_release_id);
             auto* const raw_snapshot = snapshot.release();
             if (PostMessageW(
                     target_window,
@@ -2042,19 +2127,30 @@ private:
         }
 
         const auto& metadata = *snapshot->metadata;
-        disc_.metadata_source = disc_.has_cd_text ? L"CD-TEXT" : L"";
-        for (const auto& source : metadata.sources) {
-            if (!disc_.metadata_source.empty()) {
-                disc_.metadata_source += L" · ";
+        const auto merge_ui_field = [](
+                                        std::wstring& value,
+                                        platform::windows::MetadataSource& source,
+                                        const platform::windows::SourcedMetadataValue& incoming) {
+            platform::windows::SourcedMetadataValue destination{value, source};
+            if (platform::windows::merge_metadata_value(
+                    destination,
+                    incoming.value,
+                    incoming.source)) {
+                value = std::move(destination.value);
+                source = destination.source;
             }
-            disc_.metadata_source += source;
-        }
-        if (disc_.album_title.empty()) {
-            disc_.album_title = metadata.album_title;
-        }
-        if (disc_.album_artist.empty()) {
-            disc_.album_artist = metadata.album_artist;
-        }
+        };
+        merge_ui_field(
+            disc_.album_title,
+            disc_.album_title_source,
+            metadata.editable.album_title);
+        merge_ui_field(
+            disc_.album_artist,
+            disc_.album_artist_source,
+            metadata.editable.album_artist);
+        disc_.release_candidates = metadata.release_candidates;
+        disc_.selected_release_id = metadata.selected_release_id;
+        preferred_metadata_release_id_ = metadata.selected_release_id;
         disc_.cover_art_path = metadata.cover_art_path;
         disc_.release_mbid = metadata.release_mbid;
         disc_.release_group_mbid = metadata.release_group_mbid;
@@ -2065,9 +2161,14 @@ private:
             disc_.tracks.size(),
             metadata.track_titles.size());
         for (std::size_t index = 0; index < title_count; ++index) {
-            if (!disc_.tracks[index].has_metadata_title &&
-                !metadata.track_titles[index].empty()) {
-                disc_.tracks[index].title = metadata.track_titles[index];
+            if (index < metadata.editable.tracks.size()) {
+                merge_ui_field(
+                    disc_.tracks[index].title,
+                    disc_.tracks[index].title_source,
+                    metadata.editable.tracks[index].title);
+            }
+            if (disc_.tracks[index].title_source !=
+                platform::windows::MetadataSource::unknown) {
                 disc_.tracks[index].has_metadata_title = true;
             }
         }
@@ -2075,9 +2176,11 @@ private:
             disc_.tracks.size(),
             metadata.track_artists.size());
         for (std::size_t index = 0; index < artist_count; ++index) {
-            if (disc_.tracks[index].artist.empty() &&
-                !metadata.track_artists[index].empty()) {
-                disc_.tracks[index].artist = metadata.track_artists[index];
+            if (index < metadata.editable.tracks.size()) {
+                merge_ui_field(
+                    disc_.tracks[index].artist,
+                    disc_.tracks[index].artist_source,
+                    metadata.editable.tracks[index].artist);
             }
         }
         const std::size_t identity_count = std::min(
@@ -2105,6 +2208,7 @@ private:
                 playback_track_frame_,
                 unix_time_now());
         }
+        update_metadata_source_summary();
         sync_system_media(true);
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -2256,6 +2360,20 @@ private:
         case VK_F5:
             refresh_disc();
             return 0;
+        case VK_F2: {
+            const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            begin_metadata_edit(
+                control
+                    ? (shift ? MetadataEditField::album_artist
+                             : MetadataEditField::album_title)
+                    : (shift ? MetadataEditField::track_artist
+                             : MetadataEditField::track_title));
+            return 0;
+        }
+        case 'M':
+            select_next_metadata_release();
+            return 0;
         default:
             break;
         }
@@ -2395,6 +2513,7 @@ private:
             stop_playback();
         }
         selected_track_ = track_index;
+        update_metadata_source_summary();
         playback_track_frame_ = 0;
         playback_paused_ = false;
         playback_completed_ = false;
@@ -2405,6 +2524,49 @@ private:
         } else {
             persist_playback_position();
         }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void update_metadata_source_summary()
+    {
+        if (disc_.tracks.empty() || selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        const auto& track = disc_.tracks[selected_track_];
+        disc_.metadata_source = std::format(
+            L"专辑 {} · 艺人 {} · 曲名 {} · 表演者 {}",
+            platform::windows::to_string(disc_.album_title_source),
+            platform::windows::to_string(disc_.album_artist_source),
+            platform::windows::to_string(track.title_source),
+            platform::windows::to_string(track.artist_source));
+        if (disc_.release_candidates.size() > 1U) {
+            const std::size_t selected =
+                platform::windows::select_metadata_candidate(
+                    disc_.release_candidates,
+                    disc_.selected_release_id);
+            disc_.metadata_source += std::format(
+                L" · 发行版 {}/{} (M 切换)",
+                selected + 1U,
+                disc_.release_candidates.size());
+        }
+    }
+
+    void select_next_metadata_release()
+    {
+        if (disc_.release_candidates.size() < 2U || metadata_worker_.joinable()) {
+            return;
+        }
+        const std::size_t current = platform::windows::select_metadata_candidate(
+            disc_.release_candidates,
+            disc_.selected_release_id);
+        const std::size_t next = (current + 1U) % disc_.release_candidates.size();
+        preferred_metadata_release_id_ =
+            disc_.release_candidates[next].release_id;
+        ui_message_ = std::format(
+            L"正在切换 MusicBrainz 发行版：{}",
+            disc_.release_candidates[next].album_title);
+        ui_message_is_error_ = false;
+        start_online_metadata_lookup();
         InvalidateRect(window_, nullptr, FALSE);
     }
 
@@ -3144,6 +3306,205 @@ private:
         static_cast<void>(platform::windows::save_user_settings(user_settings_));
     }
 
+    static LRESULT CALLBACK metadata_edit_window_proc(
+        const HWND edit,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        auto* self = reinterpret_cast<MainWindow*>(
+            GetWindowLongPtrW(edit, GWLP_USERDATA));
+        if (self != nullptr && message == WM_KEYDOWN) {
+            if (wparam == VK_RETURN) {
+                PostMessageW(self->window_, kMetadataEditSaveMessage, 0, 0);
+                return 0;
+            }
+            if (wparam == VK_ESCAPE) {
+                PostMessageW(self->window_, kMetadataEditCloseMessage, 0, 0);
+                return 0;
+            }
+        }
+        if (self != nullptr && message == WM_GETDLGCODE) {
+            return DLGC_WANTALLKEYS;
+        }
+        return self != nullptr && self->metadata_edit_original_proc_ != nullptr
+            ? CallWindowProcW(
+                  self->metadata_edit_original_proc_,
+                  edit,
+                  message,
+                  wparam,
+                  lparam)
+            : DefWindowProcW(edit, message, wparam, lparam);
+    }
+
+    void begin_metadata_edit(const MetadataEditField field)
+    {
+        if (!disc_.toc || selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        close_metadata_edit();
+        metadata_edit_field_ = field;
+        const std::wstring* value{};
+        switch (field) {
+        case MetadataEditField::album_title:
+            value = &disc_.album_title;
+            break;
+        case MetadataEditField::album_artist:
+            value = &disc_.album_artist;
+            break;
+        case MetadataEditField::track_title:
+            value = &disc_.tracks[selected_track_].title;
+            break;
+        case MetadataEditField::track_artist:
+            value = &disc_.tracks[selected_track_].artist;
+            break;
+        case MetadataEditField::none:
+            return;
+        }
+        if (settings_font_ == nullptr) {
+            settings_font_ = CreateFontW(
+                -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
+                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+        if (settings_edit_brush_ == nullptr) {
+            settings_edit_brush_ = CreateSolidBrush(RGB(29, 33, 42));
+        }
+        metadata_edit_ = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            value->c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 1, 1,
+            window_,
+            nullptr,
+            instance_,
+            nullptr);
+        if (metadata_edit_ == nullptr) {
+            metadata_edit_field_ = MetadataEditField::none;
+            return;
+        }
+        SendMessageW(
+            metadata_edit_,
+            WM_SETFONT,
+            reinterpret_cast<WPARAM>(settings_font_),
+            TRUE);
+        SendMessageW(metadata_edit_, EM_SETLIMITTEXT, 512, 0);
+        SetWindowLongPtrW(
+            metadata_edit_,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(this));
+        metadata_edit_original_proc_ = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(
+                metadata_edit_,
+                GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(metadata_edit_window_proc)));
+        update_metadata_edit_bounds();
+        SendMessageW(metadata_edit_, EM_SETSEL, 0, -1);
+        SetFocus(metadata_edit_);
+        ui_message_ = L"编辑元数据：Enter 保存，Esc 取消";
+        ui_message_is_error_ = false;
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void update_metadata_edit_bounds()
+    {
+        if (metadata_edit_ == nullptr || window_ == nullptr) {
+            return;
+        }
+        const float scale = static_cast<float>(GetDpiForWindow(window_)) / 96.0F;
+        const int left = static_cast<int>(std::lround(24.0F * scale));
+        const int top = static_cast<int>(std::lround(62.0F * scale));
+        RECT client{};
+        GetClientRect(window_, &client);
+        SetWindowPos(
+            metadata_edit_,
+            HWND_TOP,
+            left,
+            top,
+            std::max(static_cast<int>(client.right) - left * 2, 160),
+            static_cast<int>(std::lround(38.0F * scale)),
+            SWP_NOACTIVATE);
+    }
+
+    void close_metadata_edit()
+    {
+        if (metadata_edit_ != nullptr) {
+            DestroyWindow(metadata_edit_);
+            metadata_edit_ = nullptr;
+            metadata_edit_original_proc_ = nullptr;
+        }
+        metadata_edit_field_ = MetadataEditField::none;
+        if (window_ != nullptr) {
+            SetFocus(window_);
+        }
+    }
+
+    void commit_metadata_edit()
+    {
+        if (metadata_edit_ == nullptr || current_disc_key_.empty() ||
+            selected_track_ >= disc_.tracks.size()) {
+            close_metadata_edit();
+            return;
+        }
+        const int length = GetWindowTextLengthW(metadata_edit_);
+        std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
+        const int written = GetWindowTextW(metadata_edit_, value.data(), length + 1);
+        value.resize(static_cast<std::size_t>(std::max(written, 0)));
+
+        switch (metadata_edit_field_) {
+        case MetadataEditField::album_title:
+            disc_.album_title = value;
+            disc_.album_title_source = platform::windows::MetadataSource::user;
+            break;
+        case MetadataEditField::album_artist:
+            disc_.album_artist = value;
+            disc_.album_artist_source = platform::windows::MetadataSource::user;
+            break;
+        case MetadataEditField::track_title:
+            disc_.tracks[selected_track_].title = value;
+            disc_.tracks[selected_track_].title_source =
+                platform::windows::MetadataSource::user;
+            disc_.tracks[selected_track_].has_metadata_title = true;
+            break;
+        case MetadataEditField::track_artist:
+            disc_.tracks[selected_track_].artist = value;
+            disc_.tracks[selected_track_].artist_source =
+                platform::windows::MetadataSource::user;
+            break;
+        case MetadataEditField::none:
+            close_metadata_edit();
+            return;
+        }
+
+        platform::windows::MetadataCacheEntry entry;
+        entry.disc_key = current_disc_key_;
+        entry.selected_release_id = disc_.selected_release_id;
+        entry.updated_unix_seconds = unix_time_now();
+        entry.metadata.album_title = {
+            disc_.album_title,
+            disc_.album_title_source};
+        entry.metadata.album_artist = {
+            disc_.album_artist,
+            disc_.album_artist_source};
+        for (const auto& track : disc_.tracks) {
+            entry.metadata.tracks.push_back({
+                {track.title, track.title_source},
+                {track.artist, track.artist_source},
+            });
+        }
+        const bool saved = platform::windows::save_metadata_cache(entry);
+        close_metadata_edit();
+        update_metadata_source_summary();
+        sync_system_media(true);
+        ui_message_ = saved
+            ? L"元数据修订已保存（F2/Shift/Ctrl 可编辑其他字段）"
+            : L"元数据修订未能写入本地缓存";
+        ui_message_is_error_ = !saved;
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
     static LRESULT CALLBACK settings_edit_window_proc(
         const HWND edit,
         const UINT message,
@@ -3745,6 +4106,7 @@ private:
     std::int32_t audio_endpoint_status_{};
     float volume_{1.0F};
     std::wstring current_disc_key_;
+    std::wstring preferred_metadata_release_id_;
     unsigned int last_persisted_track_number_{};
     core::SampleFrame last_persisted_frame_{-1};
     ULONGLONG last_position_save_tick_{};
@@ -3756,6 +4118,9 @@ private:
     WNDPROC settings_edit_original_proc_{};
     HFONT settings_font_{};
     HBRUSH settings_edit_brush_{};
+    HWND metadata_edit_{};
+    WNDPROC metadata_edit_original_proc_{};
+    MetadataEditField metadata_edit_field_{MetadataEditField::none};
     platform::windows::CddaPlaybackEngine playback_engine_;
     audio::PlaybackRecoveryCoordinator playback_recovery_;
     platform::windows::ListenBrainzReporter listenbrainz_reporter_;

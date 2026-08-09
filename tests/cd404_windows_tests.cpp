@@ -10,6 +10,7 @@
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/musicbrainz_client.hpp>
+#include <cd404/platform/windows/metadata_store.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
@@ -578,6 +579,104 @@ void test_musicbrainz_exact_lookup_paths()
         "MusicBrainz performs exact Disc ID lookup before TOC fuzzy fallback");
 }
 
+void test_musicbrainz_multiple_release_parsing()
+{
+    using namespace cd404::platform::windows;
+    const std::string xml =
+        "<metadata><release-list>"
+        "<release id='release-a'><title>Album A</title>"
+        "<artist-credit><name-credit><artist id='artist-a'><name>Artist A</name>"
+        "</artist></name-credit></artist-credit><release-group id='group-a'/>"
+        "<medium-list><medium><track-list count='1'><track id='track-a'>"
+        "<length>60000</length><recording id='recording-a'><title>Song A</title>"
+        "<artist-credit><name-credit><artist id='artist-a'><name>Artist A</name>"
+        "</artist></name-credit></artist-credit></recording></track></track-list>"
+        "</medium></medium-list></release>"
+        "<release id='release-b'><title>Album B</title>"
+        "<artist-credit><name-credit><artist id='artist-b'><name>Artist B</name>"
+        "</artist></name-credit></artist-credit><release-group id='group-b'/>"
+        "<medium-list><medium><track-list count='1'><track id='track-b'>"
+        "<length>60500</length><recording id='recording-b'><title>Song B</title>"
+        "<artist-credit><name-credit><artist id='artist-b'><name>Artist B</name>"
+        "</artist></name-credit></artist-credit></recording></track></track-list>"
+        "</medium></medium-list></release>"
+        "</release-list></metadata>";
+    const std::vector<std::uint8_t> body(xml.begin(), xml.end());
+    constexpr std::array<std::uint64_t, 1> expected_lengths{60'000};
+    const auto candidates = parse_musicbrainz_candidates(
+        body,
+        expected_lengths,
+        true);
+    expect(
+        candidates.size() == 2U &&
+            candidates[0].release_id == L"release-a" &&
+            candidates[1].release_id == L"release-b" &&
+            candidates[0].track_titles == std::vector{std::wstring(L"Song A")} &&
+            candidates[0].exact_disc_id_match &&
+            candidates[1].exact_disc_id_match,
+        "MusicBrainz parser retains all duration-compatible exact release candidates");
+}
+
+void test_metadata_revision_selection_and_cache()
+{
+    using namespace cd404::platform::windows;
+
+    SourcedMetadataValue title{L"CD title", MetadataSource::cd_text};
+    expect(
+        !merge_metadata_value(title, L"Catalog title", MetadataSource::itunes) &&
+            title.value == L"CD title" && title.source == MetadataSource::cd_text,
+        "lower-priority online metadata cannot replace CD-TEXT");
+    revise_metadata_value(title, L"My corrected title");
+    expect(
+        !merge_metadata_value(title, L"Remote refresh", MetadataSource::musicbrainz) &&
+            title.value == L"My corrected title" &&
+            title.source == MetadataSource::user,
+        "refresh never overwrites a user revision");
+
+    const std::vector<MetadataReleaseCandidate> candidates{
+        {L"release-a", L"First", L"Artist"},
+        {L"release-b", L"Second", L"Artist"},
+    };
+    expect(
+        select_metadata_candidate(candidates, L"release-b") == 1U &&
+            select_metadata_candidate(candidates, L"missing") == 0U,
+        "remembered release selection wins and missing choices safely use first candidate");
+
+    MetadataCacheEntry entry;
+    entry.disc_key = L"deadbeef";
+    entry.selected_release_id = L"release-b";
+    entry.updated_unix_seconds = 1'700'000'000;
+    entry.metadata.album_title = title;
+    entry.metadata.album_artist = {L"Artist", MetadataSource::musicbrainz};
+    entry.metadata.tracks.push_back({
+        {L"Track", MetadataSource::user},
+        {L"Performer", MetadataSource::cd_text},
+    });
+    const std::wstring encoded = encode_metadata_cache(entry);
+    const auto decoded = decode_metadata_cache(encoded);
+    expect(
+        decoded && decoded->disc_key == entry.disc_key &&
+            decoded->selected_release_id == L"release-b" &&
+            decoded->metadata.album_title.source == MetadataSource::user &&
+            decoded->metadata.tracks.size() == 1U &&
+            decoded->metadata.tracks[0].artist.source == MetadataSource::cd_text,
+        "versioned metadata cache round-trips field-level provenance and revisions");
+    expect(
+        metadata_cache_is_fresh(*decoded, 1'700'000'100, 3'600) &&
+            !metadata_cache_is_fresh(*decoded, 1'700'004'000, 3'600) &&
+            !decode_metadata_cache(L"{not-json"),
+        "cache freshness and corrupt-cache fallback are deterministic");
+    const auto migrated = decode_metadata_cache(
+        L"{\"disc_key\":\"a1b2\",\"album_title\":\"Legacy\","
+        L"\"album_artist\":\"Artist\",\"tracks\":[{\"title\":\"T\","
+        L"\"artist\":\"A\"}]}");
+    expect(
+        migrated && migrated->metadata.album_title.value == L"Legacy" &&
+            migrated->metadata.album_title.source == MetadataSource::unknown &&
+            migrated->metadata.tracks.size() == 1U,
+        "legacy unversioned metadata cache migrates to explicit unknown provenance");
+}
+
 void test_diagnostic_names()
 {
     using namespace cd404;
@@ -762,6 +861,8 @@ int main(const int argument_count, char** arguments)
     test_system_media_controls_with_window();
     test_user_settings_round_trip();
     test_musicbrainz_exact_lookup_paths();
+    test_musicbrainz_multiple_release_parsing();
+    test_metadata_revision_selection_and_cache();
     test_diagnostic_names();
     if (argument_count == 2 &&
         std::string_view(arguments[1]) == "--hardware-cancel") {
