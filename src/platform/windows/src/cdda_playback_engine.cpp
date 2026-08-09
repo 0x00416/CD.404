@@ -200,6 +200,82 @@ bool CddaPlaybackResult::succeeded() const noexcept
            final_state == audio::PlaybackState::completed;
 }
 
+CddaSessionSeekPlan plan_cdda_session_seek(
+    const disc::Toc& toc,
+    const unsigned int session_first_track,
+    const unsigned int session_final_track,
+    const unsigned int target_track,
+    const core::SampleFrame target_offset_frames) noexcept
+{
+    const auto& tracks = toc.tracks();
+    const std::size_t first_index = find_track_index(toc, session_first_track);
+    const std::size_t final_index = find_track_index(toc, session_final_track);
+    const auto* const target = toc.find_track(
+        static_cast<std::uint8_t>(target_track));
+    if (target == nullptr || !target->is_audio) {
+        return {CddaSeekRequestResult::invalid_track, 0, 0};
+    }
+    if (first_index >= tracks.size() || final_index >= tracks.size() ||
+        first_index > final_index) {
+        return {CddaSeekRequestResult::outside_session, 0, 0};
+    }
+    for (std::size_t index = first_index; index <= final_index; ++index) {
+        if (!tracks[index].is_audio ||
+            (index != first_index &&
+             tracks[index - 1].end_lba != tracks[index].start_lba)) {
+            return {CddaSeekRequestResult::outside_session, 0, 0};
+        }
+    }
+    const std::size_t target_index = static_cast<std::size_t>(
+        target - tracks.data());
+    if (target_index < first_index || target_index > final_index) {
+        return {CddaSeekRequestResult::outside_session, 0, 0};
+    }
+    if (target_offset_frames < 0 ||
+        target_offset_frames >= target->frame_count) {
+        return {CddaSeekRequestResult::invalid_range, 0, 0};
+    }
+
+    const auto& first = tracks[first_index];
+    const auto& final = tracks[final_index];
+    const core::SampleFrame stream_offset =
+        target->start_disc_frame - first.start_disc_frame + target_offset_frames;
+    const core::SampleFrame stream_end =
+        final.start_disc_frame - first.start_disc_frame + final.frame_count;
+    return {
+        CddaSeekRequestResult::queued,
+        stream_offset,
+        stream_end - stream_offset,
+    };
+}
+
+CddaSeekRequestReceipt LatestCddaSeekCommand::queue(
+    const unsigned int track_number,
+    const core::SampleFrame offset_frames) noexcept
+{
+    const std::uint64_t sequence = ++next_sequence_;
+    pending_ = CddaSeekCommand{track_number, offset_frames, sequence};
+    return {CddaSeekRequestResult::queued, sequence};
+}
+
+std::optional<CddaSeekCommand> LatestCddaSeekCommand::take_latest() noexcept
+{
+    auto command = pending_;
+    pending_.reset();
+    return command;
+}
+
+bool LatestCddaSeekCommand::has_pending() const noexcept
+{
+    return pending_.has_value();
+}
+
+void LatestCddaSeekCommand::reset() noexcept
+{
+    pending_.reset();
+    next_sequence_ = 0;
+}
+
 bool is_recoverable_default_endpoint_failure(
     const CddaPlaybackResult& result) noexcept
 {
@@ -256,6 +332,16 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     ActiveReset active_reset{active_};
 
     stop_requested_.store(false, std::memory_order_release);
+    {
+        std::scoped_lock lock(control_mutex_);
+        seek_commands_.reset();
+    }
+    stream_generation_.store(0, std::memory_order_release);
+    applied_seek_sequence_.store(0, std::memory_order_release);
+    base_track_number_.store(0, std::memory_order_release);
+    base_track_offset_frames_.store(0, std::memory_order_release);
+    session_first_track_number_.store(0, std::memory_order_release);
+    session_final_track_number_.store(0, std::memory_order_release);
     target_frames_.store(0, std::memory_order_release);
     frames_produced_.store(0, std::memory_order_release);
     frames_submitted_.store(0, std::memory_order_release);
@@ -324,6 +410,12 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     }
 
     const auto& tracks = selected_toc->tracks();
+    std::size_t run_start_index = selected_track_index;
+    while (run_start_index > 0 && tracks[run_start_index - 1].is_audio &&
+           tracks[run_start_index - 1].end_lba ==
+               tracks[run_start_index].start_lba) {
+        --run_start_index;
+    }
     std::size_t run_end_index = selected_track_index;
     while (run_end_index + 1 < tracks.size() &&
            tracks[run_end_index + 1].is_audio &&
@@ -331,13 +423,14 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
         ++run_end_index;
     }
     const auto& selected_track = tracks[selected_track_index];
+    const auto& first_track = tracks[run_start_index];
     const auto& final_track = tracks[run_end_index];
     result.first_track_number = selected_track.number;
     result.final_track_number = final_track.number;
 
     auto source_result = open_raw_cdda_source(
         *selected_drive,
-        selected_track.start_lba,
+        first_track.start_lba,
         final_track.end_lba);
     if (!source_result.source) {
         result.system_error = source_result.system_error;
@@ -349,17 +442,23 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     audio::ReliableCddaSectorSource reliable_source(*source_result.source);
     audio::ContinuousCddaStream stream(
         reliable_source,
-        selected_track.start_lba,
+        first_track.start_lba,
         final_track.end_lba);
     if (!stream.valid()) {
         return finish_failed(CddaPlaybackError::invalid_stream);
     }
-    if (request.offset_frames >= stream.total_frames() ||
-        !stream.seek(request.offset_frames)) {
+    const auto initial_seek = plan_cdda_session_seek(
+        *selected_toc,
+        first_track.number,
+        final_track.number,
+        selected_track.number,
+        request.offset_frames);
+    if (initial_seek.result != CddaSeekRequestResult::queued ||
+        !stream.seek(initial_seek.stream_offset_frames)) {
         return finish_failed(CddaPlaybackError::invalid_range);
     }
 
-    SampleFrame target_frames = stream.total_frames() - request.offset_frames;
+    SampleFrame target_frames = initial_seek.remaining_frames;
     if (request.maximum_frames) {
         target_frames = std::min(target_frames, *request.maximum_frames);
     }
@@ -368,6 +467,11 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     }
     result.target_frames = target_frames;
     target_frames_.store(target_frames, std::memory_order_release);
+    stream_generation_.store(1, std::memory_order_release);
+    base_track_number_.store(selected_track.number, std::memory_order_release);
+    base_track_offset_frames_.store(request.offset_frames, std::memory_order_release);
+    session_first_track_number_.store(first_track.number, std::memory_order_release);
+    session_final_track_number_.store(final_track.number, std::memory_order_release);
 
     WasapiOutput output;
     const std::int32_t open_status = output.open_default_shared();
@@ -398,16 +502,17 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     });
-    const ProducerContext producer_context{
-        stream,
-        ring,
-        stream_state,
-        frames_produced_,
-        target_frames,
-    };
-    std::thread producer(produce_pcm, producer_context);
-
-    {
+    std::thread producer;
+    const auto start_producer = [&] {
+        producer = std::thread(
+            produce_pcm,
+            ProducerContext{
+                stream,
+                ring,
+                stream_state,
+                frames_produced_,
+                target_frames,
+            });
         std::unique_lock lock(stream_state.mutex);
         const std::size_t prebuffer_target =
             std::min(kPrebufferFrames, static_cast<std::size_t>(target_frames));
@@ -415,7 +520,8 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
                !stop_requested_.load(std::memory_order_acquire)) {
             stream_state.changed.wait_for(lock, kQueueWait);
         }
-    }
+    };
+    start_producer();
 
     SampleFrame submitted_frames{};
     bool output_started{};
@@ -426,7 +532,66 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     std::int32_t playback_status{S_OK};
     static_cast<void>(advance(audio::PlaybackEvent::prebuffer_ready));
 
+    const auto take_pending_seek = [this]() -> std::optional<CddaSeekCommand> {
+        std::scoped_lock lock(control_mutex_);
+        return seek_commands_.take_latest();
+    };
+
     while (!stop_requested_.load(std::memory_order_acquire)) {
+        if (const auto pending_seek = take_pending_seek()) {
+            const auto plan = plan_cdda_session_seek(
+                *selected_toc,
+                first_track.number,
+                final_track.number,
+                pending_seek->track_number,
+                pending_seek->offset_frames);
+            if (plan.result == CddaSeekRequestResult::queued) {
+                stream_state.stop_requested.store(true, std::memory_order_release);
+                stream_state.changed.notify_all();
+                if (producer.joinable()) {
+                    producer.join();
+                }
+                playback_status = output.stop();
+                if (playback_status < 0 ||
+                    !audio::reposition_cdda_stream(
+                        stream,
+                        ring,
+                        plan.stream_offset_frames)) {
+                    break;
+                }
+
+                output_started = false;
+                stream_state.stop_requested.store(false, std::memory_order_release);
+                stream_state.terminal_status = audio::ReadStatus::ok;
+                stream_state.native_error = 0;
+                stream_state.frames_produced = 0;
+                target_frames = plan.remaining_frames;
+                if (request.maximum_frames) {
+                    target_frames = std::min(target_frames, *request.maximum_frames);
+                }
+                submitted_frames = 0;
+                frames_produced_.store(0, std::memory_order_release);
+                frames_submitted_.store(0, std::memory_order_release);
+                frames_rendered_.store(0, std::memory_order_release);
+                target_frames_.store(target_frames, std::memory_order_release);
+                base_track_number_.store(
+                    pending_seek->track_number,
+                    std::memory_order_release);
+                base_track_offset_frames_.store(
+                    pending_seek->offset_frames,
+                    std::memory_order_release);
+                stream_generation_.fetch_add(1, std::memory_order_acq_rel);
+                applied_seek_sequence_.store(
+                    pending_seek->sequence,
+                    std::memory_order_release);
+                result.first_track_number = pending_seek->track_number;
+                result.target_frames = target_frames;
+                ++result.session_seek_count;
+                waiting_for_producer = false;
+                start_producer();
+                continue;
+            }
+        }
         if (pause_requested_.load(std::memory_order_acquire)) {
             std::uint32_t padding{};
             if (output.get_current_padding(padding) >= 0) {
@@ -447,11 +612,15 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
                 std::unique_lock lock(control_mutex_);
                 control_changed_.wait(lock, [this] {
                     return stop_requested_.load(std::memory_order_acquire) ||
-                           !pause_requested_.load(std::memory_order_acquire);
+                           !pause_requested_.load(std::memory_order_acquire) ||
+                           seek_commands_.has_pending();
                 });
             }
             if (stop_requested_.load(std::memory_order_acquire)) {
                 break;
+            }
+            if (pause_requested_.load(std::memory_order_acquire)) {
+                continue;
             }
             if (output_started) {
                 playback_status = output.start();
@@ -542,7 +711,9 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     if (cancelled) {
         request_stream_stop(stream_state, *source_result.source);
     }
-    producer.join();
+    if (producer.joinable()) {
+        producer.join();
+    }
 
     result.frames_produced = stream_state.frames_produced;
     result.frames_submitted = submitted_frames;
@@ -620,6 +791,40 @@ void CddaPlaybackEngine::request_resume() noexcept
     control_changed_.notify_all();
 }
 
+CddaSeekRequestReceipt CddaPlaybackEngine::request_seek(
+    const unsigned int track_number,
+    const core::SampleFrame offset_frames) noexcept
+{
+    if (track_number == 0) {
+        return {CddaSeekRequestResult::invalid_track, 0};
+    }
+    if (offset_frames < 0) {
+        return {CddaSeekRequestResult::invalid_range, 0};
+    }
+    if (!active_.load(std::memory_order_acquire)) {
+        return {CddaSeekRequestResult::not_active, 0};
+    }
+
+    const unsigned int first =
+        session_first_track_number_.load(std::memory_order_acquire);
+    const unsigned int final =
+        session_final_track_number_.load(std::memory_order_acquire);
+    if (first == 0 || track_number < first || track_number > final) {
+        return {CddaSeekRequestResult::outside_session, 0};
+    }
+
+    CddaSeekRequestReceipt receipt;
+    {
+        std::scoped_lock lock(control_mutex_);
+        if (!active_.load(std::memory_order_acquire)) {
+            return {CddaSeekRequestResult::not_active, 0};
+        }
+        receipt = seek_commands_.queue(track_number, offset_frames);
+    }
+    control_changed_.notify_all();
+    return receipt;
+}
+
 void CddaPlaybackEngine::set_volume(const float volume) noexcept
 {
     const float finite_volume = std::isfinite(volume) ? volume : 1.0F;
@@ -635,11 +840,32 @@ CddaPlaybackProgress CddaPlaybackEngine::progress() const noexcept
 {
     return {
         state_.load(std::memory_order_acquire),
+        stream_generation_.load(std::memory_order_acquire),
+        applied_seek_sequence_.load(std::memory_order_acquire),
+        base_track_number_.load(std::memory_order_acquire),
+        base_track_offset_frames_.load(std::memory_order_acquire),
         target_frames_.load(std::memory_order_acquire),
         frames_produced_.load(std::memory_order_acquire),
         frames_submitted_.load(std::memory_order_acquire),
         frames_rendered_.load(std::memory_order_acquire),
     };
+}
+
+const char* to_string(const CddaSeekRequestResult result) noexcept
+{
+    switch (result) {
+    case CddaSeekRequestResult::queued:
+        return "queued";
+    case CddaSeekRequestResult::not_active:
+        return "not_active";
+    case CddaSeekRequestResult::invalid_track:
+        return "invalid_track";
+    case CddaSeekRequestResult::invalid_range:
+        return "invalid_range";
+    case CddaSeekRequestResult::outside_session:
+        return "outside_session";
+    }
+    return "unknown";
 }
 
 const char* to_string(const CddaPlaybackError error) noexcept

@@ -526,6 +526,48 @@ void test_continuous_cdda_stream()
     expect(!overflowing_stream.valid(), "stream rejects an overflowing LBA range");
 }
 
+void test_repeated_cross_track_repositioning()
+{
+    using namespace cd404;
+
+    PatternSectorSource source(0, 24);
+    audio::ContinuousCddaStream stream(source, 0, 24);
+    audio::Pcm16SpscRingBuffer ring(16);
+    const core::SampleFrame boundary =
+        12 * core::kCdSampleFramesPerSector;
+
+    for (std::size_t iteration = 0; iteration < 128; ++iteration) {
+        const std::array<std::int16_t, 4> stale_samples{
+            static_cast<std::int16_t>(iteration),
+            -1,
+            static_cast<std::int16_t>(iteration),
+            -1,
+        };
+        expect(
+            ring.push(stale_samples).frames_transferred == 2,
+            "reposition stress queues old-timeline samples");
+
+        const core::SampleFrame jitter = static_cast<core::SampleFrame>(
+            static_cast<int>(iteration % 11) - 5);
+        const core::SampleFrame target = boundary + jitter;
+        expect(
+            audio::reposition_cdda_stream(stream, ring, target),
+            "reposition stress accepts exact cross-track targets");
+        expect(
+            ring.readable_frames() == 0 && !ring.closed(),
+            "reposition stress discards every old-timeline frame");
+
+        std::array<std::byte, 3 * core::kCdBytesPerSampleFrame> bytes{};
+        const auto read = stream.read_frames(bytes);
+        expect(
+            read.status == audio::ReadStatus::ok && read.frames_read == 3 &&
+                read_pattern_frame(bytes, 0) == target &&
+                read_pattern_frame(bytes, 1) == target + 1 &&
+                read_pattern_frame(bytes, 2) == target + 2,
+            "reposition stress resumes with three exact consecutive frames");
+    }
+}
+
 void test_reliable_cdda_sector_source()
 {
     using namespace cd404;
@@ -1100,6 +1142,7 @@ int main()
     test_cd_text_parsing();
     test_gnudb_identity_and_entry();
     test_continuous_cdda_stream();
+    test_repeated_cross_track_repositioning();
     test_reliable_cdda_sector_source();
     test_playback_state_machine();
     test_playback_recovery_coordinator();

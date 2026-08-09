@@ -2152,7 +2152,11 @@ private:
                 if (hit.track_index < disc_.tracks.size() &&
                     disc_.tracks[hit.track_index].is_audio) {
                     select_track(hit.track_index, false);
-                    start_playback(0);
+                    if (playback_active_) {
+                        resume_playback();
+                    } else {
+                        start_playback(0);
+                    }
                 }
                 return;
             }
@@ -2351,6 +2355,10 @@ private:
             !disc_.tracks[track_index].is_audio) {
             return;
         }
+        if (playback_active_ &&
+            seek_in_active_session(track_index, 0)) {
+            return;
+        }
         const bool should_continue = continue_active_playback &&
             playback_active_ && !playback_paused_;
         if (playback_active_) {
@@ -2436,6 +2444,7 @@ private:
         if (!endpoint_recovery) {
             playback_recovery_.begin_playback_intent();
         }
+        playback_seek_pending_ = false;
         const bool resume_session =
             (playback_paused_ || preserve_listen_session) &&
             listenbrainz_tracker_.active();
@@ -2523,6 +2532,7 @@ private:
             playback_result_.reset();
         }
         playback_active_ = false;
+        playback_seek_pending_ = false;
         if (!preserve_position) {
             playback_paused_ = false;
             playback_track_frame_ = 0;
@@ -2547,9 +2557,24 @@ private:
         if (progress.frames_rendered >= core::kCdSampleFramesPerSecond) {
             playback_recovery_.playback_became_stable();
         }
+        if (playback_seek_pending_) {
+            if (progress.applied_seek_sequence < playback_seek_sequence_) {
+                return;
+            }
+            playback_seek_pending_ = false;
+        }
+        std::size_t track_index = disc_.tracks.size();
+        for (std::size_t index = 0; index < disc_.tracks.size(); ++index) {
+            if (disc_.tracks[index].number == progress.base_track_number) {
+                track_index = index;
+                break;
+            }
+        }
+        if (track_index == disc_.tracks.size()) {
+            return;
+        }
         core::SampleFrame track_frame =
-            playback_start_offset_frames_ + progress.frames_rendered;
-        std::size_t track_index = playback_start_track_;
+            progress.base_track_offset_frames + progress.frames_rendered;
         std::optional<std::size_t> last_audio_track;
         while (track_index < disc_.tracks.size()) {
             if (!disc_.tracks[track_index].is_audio) {
@@ -2635,6 +2660,7 @@ private:
         }
         playback_active_ = false;
         playback_paused_ = false;
+        playback_seek_pending_ = false;
         system_media_controls_.set_playback_state(
             platform::windows::SystemMediaPlaybackState::stopped);
         sync_system_media(true);
@@ -2746,9 +2772,64 @@ private:
             disc_.tracks[selected_track_].frame_count;
         const core::SampleFrame offset = static_cast<core::SampleFrame>(
             std::floor(static_cast<double>(total_frames) * ratio));
-        start_playback(std::min(offset, std::max<core::SampleFrame>(
+        const core::SampleFrame target = std::min(
+            offset,
+            std::max<core::SampleFrame>(0, total_frames - 1));
+        if (!seek_in_active_session(selected_track_, target)) {
+            start_playback(target, true);
+        }
+    }
+
+    [[nodiscard]] bool seek_in_active_session(
+        const std::size_t track_index,
+        const core::SampleFrame offset_frames)
+    {
+        if (!playback_active_ || track_index >= disc_.tracks.size() ||
+            !disc_.tracks[track_index].is_audio) {
+            return false;
+        }
+        const auto& track = disc_.tracks[track_index];
+        const core::SampleFrame target = std::clamp<core::SampleFrame>(
+            offset_frames,
             0,
-            total_frames - 1)), true);
+            std::max<core::SampleFrame>(0, track.frame_count - 1));
+        const auto seek_result = playback_engine_.request_seek(
+            track.number,
+            target);
+        if (seek_result.result !=
+            platform::windows::CddaSeekRequestResult::queued) {
+            return false;
+        }
+
+        const bool track_changed = selected_track_ != track_index;
+        selected_track_ = track_index;
+        playback_track_frame_ = target;
+        playback_start_track_ = track_index;
+        playback_start_offset_frames_ = target;
+        playback_completed_ = false;
+        playback_seek_pending_ = true;
+        playback_seek_sequence_ = seek_result.sequence;
+        ensure_selected_track_visible();
+
+        if (listenbrainz_tracker_.active()) {
+            if (track_changed) {
+                if (playback_paused_) {
+                    listenbrainz_tracker_.end();
+                    listenbrainz_reporter_.clear_playing_now();
+                } else {
+                    listenbrainz_tracker_.begin(
+                        listen_metadata(track_index),
+                        target,
+                        unix_time_now());
+                }
+            } else {
+                listenbrainz_tracker_.seek(target);
+            }
+        }
+        sync_system_media(true);
+        persist_playback_position();
+        InvalidateRect(window_, nullptr, FALSE);
+        return true;
     }
 
     void set_volume(const float volume)
@@ -2823,12 +2904,22 @@ private:
             select_relative_track(1);
             break;
         case SystemMediaCommand::seek:
-            start_playback(static_cast<core::SampleFrame>(
-                std::min<std::uint64_t>(
-                    request.position_milliseconds,
-                    86'400'000U) *
-                static_cast<std::uint64_t>(core::kCdSampleFramesPerSecond) /
-                1'000U), true);
+            if (!seek_in_active_session(
+                    selected_track_,
+                    static_cast<core::SampleFrame>(
+                        std::min<std::uint64_t>(
+                            request.position_milliseconds,
+                            86'400'000U) *
+                        static_cast<std::uint64_t>(
+                            core::kCdSampleFramesPerSecond) /
+                        1'000U))) {
+                start_playback(static_cast<core::SampleFrame>(
+                    std::min<std::uint64_t>(
+                        request.position_milliseconds,
+                        86'400'000U) *
+                    static_cast<std::uint64_t>(core::kCdSampleFramesPerSecond) /
+                    1'000U), true);
+            }
             break;
         }
     }
@@ -3509,6 +3600,8 @@ private:
     std::size_t playback_start_track_{};
     core::SampleFrame playback_start_offset_frames_{};
     core::SampleFrame playback_track_frame_{};
+    bool playback_seek_pending_{};
+    std::uint64_t playback_seek_sequence_{};
     std::wstring ui_message_;
     bool ui_message_is_error_{};
 };

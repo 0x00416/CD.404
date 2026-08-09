@@ -144,6 +144,10 @@ void test_invalid_requests_without_device_access()
             initial.target_frames == 0 && initial.frames_produced == 0 &&
             initial.frames_submitted == 0 && initial.frames_rendered == 0,
         "new playback engine exposes an idle zero progress snapshot");
+    expect(
+        engine.request_seek(1, 0).result ==
+            platform::windows::CddaSeekRequestResult::not_active,
+        "an idle engine rejects seek commands without touching hardware");
 
     platform::windows::CddaPlaybackRequest negative_offset;
     negative_offset.offset_frames = -1;
@@ -170,6 +174,71 @@ void test_invalid_requests_without_device_access()
             empty_result.frames_submitted == 0 &&
             empty_result.frames_rendered == 0,
         "invalid request cannot publish stale progress from the prior session");
+}
+
+void test_playback_session_seek_planning()
+{
+    using namespace cd404;
+    using namespace platform::windows;
+
+    constexpr std::array entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 100, true},
+        disc::RawTocEntry{3, 200, false},
+        disc::RawTocEntry{4, 300, true},
+    };
+    disc::TocError error{};
+    const auto toc = disc::Toc::create(entries, 400, error);
+    expect(toc.has_value(), "seek planner test creates a mixed-mode TOC");
+    if (!toc) {
+        return;
+    }
+
+    const auto track_two = plan_cdda_session_seek(*toc, 1, 2, 2, 37);
+    expect(
+        track_two.result == CddaSeekRequestResult::queued &&
+            track_two.stream_offset_frames ==
+                100 * core::kCdSampleFramesPerSector + 37 &&
+            track_two.remaining_frames ==
+                100 * core::kCdSampleFramesPerSector - 37,
+        "a forward track switch reuses the contiguous audio session exactly");
+
+    const auto track_one = plan_cdda_session_seek(*toc, 1, 2, 1, 11);
+    expect(
+        track_one.result == CddaSeekRequestResult::queued &&
+            track_one.stream_offset_frames == 11,
+        "a backward track switch reuses the same audio session");
+    expect(
+        plan_cdda_session_seek(*toc, 1, 2, 4, 0).result ==
+            CddaSeekRequestResult::outside_session,
+        "a track beyond a data gap requests an explicit session fallback");
+    expect(
+        plan_cdda_session_seek(*toc, 1, 2, 3, 0).result ==
+            CddaSeekRequestResult::invalid_track,
+        "a data track can never enter the CDDA seek path");
+    expect(
+        plan_cdda_session_seek(
+            *toc,
+            1,
+            2,
+            2,
+            100 * core::kCdSampleFramesPerSector).result ==
+            CddaSeekRequestResult::invalid_range,
+        "a seek at the track end is rejected instead of reading the next track");
+
+    LatestCddaSeekCommand commands;
+    const auto first = commands.queue(1, 10);
+    const auto latest = commands.queue(2, 20);
+    const auto taken = commands.take_latest();
+    expect(
+        first.sequence != 0 && latest.sequence > first.sequence && taken &&
+            taken->sequence == latest.sequence && taken->track_number == 2 &&
+            taken->offset_frames == 20 && !commands.has_pending(),
+        "rapid seek commands coalesce to the newest monotonic sequence");
+    commands.reset();
+    expect(
+        commands.queue(1, 0).sequence == 1,
+        "a new playback session resets the seek command sequence");
 }
 
 void test_volume_control_boundaries()
@@ -406,6 +475,19 @@ void test_diagnostic_names()
             "every playback error has a diagnostic name");
     }
 
+    constexpr std::array seek_results{
+        platform::windows::CddaSeekRequestResult::queued,
+        platform::windows::CddaSeekRequestResult::not_active,
+        platform::windows::CddaSeekRequestResult::invalid_track,
+        platform::windows::CddaSeekRequestResult::invalid_range,
+        platform::windows::CddaSeekRequestResult::outside_session,
+    };
+    for (const auto result : seek_results) {
+        expect(
+            std::string_view(platform::windows::to_string(result)) != "unknown",
+            "every seek request result has a diagnostic name");
+    }
+
     constexpr std::array listenbrainz_states{
         platform::windows::ListenBrainzState::disabled,
         platform::windows::ListenBrainzState::token_missing,
@@ -526,6 +608,7 @@ int main(const int argument_count, char** arguments)
     test_device_failure_classification();
     test_device_lifecycle_message_classification();
     test_invalid_requests_without_device_access();
+    test_playback_session_seek_planning();
     test_volume_control_boundaries();
     test_listenbrainz_payload_contract();
     test_system_media_controls_safe_fallback();

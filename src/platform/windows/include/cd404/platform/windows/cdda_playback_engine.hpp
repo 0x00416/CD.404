@@ -50,6 +50,10 @@ struct PlaybackBufferStatistics final {
 
 struct CddaPlaybackProgress final {
     audio::PlaybackState state{audio::PlaybackState::idle};
+    std::uint64_t stream_generation{};
+    std::uint64_t applied_seek_sequence{};
+    unsigned int base_track_number{};
+    core::SampleFrame base_track_offset_frames{};
     core::SampleFrame target_frames{};
     core::SampleFrame frames_produced{};
     core::SampleFrame frames_submitted{};
@@ -70,9 +74,58 @@ struct CddaPlaybackResult final {
     core::SampleFrame frames_rendered{};
     audio::ReliableReadStatistics read_statistics;
     PlaybackBufferStatistics buffer_statistics;
+    std::uint64_t session_seek_count{};
 
     [[nodiscard]] bool succeeded() const noexcept;
 };
+
+enum class CddaSeekRequestResult {
+    queued,
+    not_active,
+    invalid_track,
+    invalid_range,
+    outside_session,
+};
+
+struct CddaSeekRequestReceipt final {
+    CddaSeekRequestResult result{CddaSeekRequestResult::not_active};
+    std::uint64_t sequence{};
+};
+
+struct CddaSeekCommand final {
+    unsigned int track_number{};
+    core::SampleFrame offset_frames{};
+    std::uint64_t sequence{};
+};
+
+// Latest-wins mailbox. Callers provide synchronization so the same behavior
+// can be exercised deterministically without a CD drive or WASAPI endpoint.
+class LatestCddaSeekCommand final {
+public:
+    [[nodiscard]] CddaSeekRequestReceipt queue(
+        unsigned int track_number,
+        core::SampleFrame offset_frames) noexcept;
+    [[nodiscard]] std::optional<CddaSeekCommand> take_latest() noexcept;
+    [[nodiscard]] bool has_pending() const noexcept;
+    void reset() noexcept;
+
+private:
+    std::optional<CddaSeekCommand> pending_;
+    std::uint64_t next_sequence_{};
+};
+
+struct CddaSessionSeekPlan final {
+    CddaSeekRequestResult result{CddaSeekRequestResult::invalid_track};
+    core::SampleFrame stream_offset_frames{};
+    core::SampleFrame remaining_frames{};
+};
+
+[[nodiscard]] CddaSessionSeekPlan plan_cdda_session_seek(
+    const disc::Toc& toc,
+    unsigned int session_first_track,
+    unsigned int session_final_track,
+    unsigned int target_track,
+    core::SampleFrame target_offset_frames) noexcept;
 
 // These classifiers keep Win32/WASAPI error details at the platform boundary
 // and expose deterministic recovery decisions to the UI and synthetic tests.
@@ -97,6 +150,9 @@ public:
     void request_stop() noexcept;
     void request_pause() noexcept;
     void request_resume() noexcept;
+    [[nodiscard]] CddaSeekRequestReceipt request_seek(
+        unsigned int track_number,
+        core::SampleFrame offset_frames) noexcept;
     void set_volume(float volume) noexcept;
     [[nodiscard]] float volume() const noexcept;
     [[nodiscard]] CddaPlaybackProgress progress() const noexcept;
@@ -107,8 +163,15 @@ private:
     std::atomic_bool pause_requested_{};
     std::mutex control_mutex_;
     std::condition_variable control_changed_;
+    LatestCddaSeekCommand seek_commands_;
     std::atomic<float> volume_{1.0F};
     std::atomic<audio::PlaybackState> state_{audio::PlaybackState::idle};
+    std::atomic<std::uint64_t> stream_generation_{};
+    std::atomic<std::uint64_t> applied_seek_sequence_{};
+    std::atomic<unsigned int> base_track_number_{};
+    std::atomic<core::SampleFrame> base_track_offset_frames_{};
+    std::atomic<unsigned int> session_first_track_number_{};
+    std::atomic<unsigned int> session_final_track_number_{};
     std::atomic<core::SampleFrame> target_frames_{};
     std::atomic<core::SampleFrame> frames_produced_{};
     std::atomic<core::SampleFrame> frames_submitted_{};
@@ -116,5 +179,6 @@ private:
 };
 
 [[nodiscard]] const char* to_string(CddaPlaybackError error) noexcept;
+[[nodiscard]] const char* to_string(CddaSeekRequestResult result) noexcept;
 
 } // namespace cd404::platform::windows
