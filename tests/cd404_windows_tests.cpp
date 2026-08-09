@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <string_view>
 #include <thread>
 
@@ -169,6 +170,11 @@ public:
 void test_wasapi_negotiation_and_fallback()
 {
     using namespace cd404::platform::windows;
+
+    expect(
+        uses_event_driven_wasapi_buffering(WasapiShareMode::shared) &&
+            !uses_event_driven_wasapi_buffering(WasapiShareMode::exclusive),
+        "exclusive rendering polls exact available frames instead of requiring padded event packets");
 
     ScriptedWasapiBackend shared_backend;
     const auto shared = open_wasapi_session(shared_backend, {});
@@ -385,6 +391,41 @@ void test_playback_session_seek_planning()
     expect(
         commands.queue(1, 0).sequence == 1,
         "a new playback session resets the seek command sequence");
+
+    constexpr std::uint64_t kSeed = 0xCD4047A11ULL;
+    std::mt19937_64 random(kSeed);
+    LatestCddaSeekCommand random_commands;
+    std::uint64_t previous_sequence{};
+    bool all_exact = true;
+    for (std::size_t iteration = 0; iteration < 4'096 && all_exact; ++iteration) {
+        const auto track = static_cast<std::uint8_t>(1 + random() % 2);
+        const auto track_frames =
+            static_cast<core::SampleFrame>(100 * core::kCdSampleFramesPerSector);
+        const auto offset = static_cast<core::SampleFrame>(
+            random() % static_cast<std::uint64_t>(track_frames));
+        const auto plan = plan_cdda_session_seek(*toc, 1, 2, track, offset);
+        const auto command = random_commands.queue(track, offset);
+        const auto latest_command = random_commands.take_latest();
+
+        const auto expected_stream_offset =
+            static_cast<core::SampleFrame>((track - 1) * track_frames) + offset;
+        all_exact = plan.result == CddaSeekRequestResult::queued &&
+            plan.stream_offset_frames == expected_stream_offset &&
+            plan.remaining_frames == 2 * track_frames - expected_stream_offset &&
+            command.sequence > previous_sequence && latest_command &&
+            latest_command->sequence == command.sequence &&
+            latest_command->track_number == track &&
+            latest_command->offset_frames == offset;
+        if (!all_exact) {
+            std::cerr << "track-switch seed=0xCD4047A11 iteration="
+                      << iteration << " track=" << static_cast<unsigned int>(track)
+                      << " offset=" << offset << '\n';
+        }
+        previous_sequence = command.sequence;
+    }
+    expect(
+        all_exact,
+        "seed 0xCD4047A11 random track switches preserve session offsets and newest-command ordering");
 }
 
 void test_volume_control_boundaries()

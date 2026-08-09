@@ -39,6 +39,16 @@ constexpr DWORD kEventWaitMilliseconds = 2'000;
     const HANDLE audio_event,
     const HANDLE cancel_event) noexcept
 {
+    if (audio_event == nullptr) {
+        const DWORD wait_result = WaitForSingleObject(cancel_event, 2);
+        if (wait_result == WAIT_OBJECT_0) {
+            return operation_cancelled();
+        }
+        if (wait_result == WAIT_TIMEOUT) {
+            return S_OK;
+        }
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
     // Cancellation is first so it wins when both handles are already signaled.
     const HANDLE handles[]{cancel_event, audio_event};
     const DWORD wait_result = WaitForMultipleObjects(
@@ -106,6 +116,11 @@ WasapiOpenResult open_wasapi_session(
 const wchar_t* to_string(const WasapiShareMode mode) noexcept
 {
     return mode == WasapiShareMode::exclusive ? L"独占" : L"共享";
+}
+
+bool uses_event_driven_wasapi_buffering(const WasapiShareMode mode) noexcept
+{
+    return mode == WasapiShareMode::shared;
 }
 
 std::wstring describe_wasapi_status(const std::int32_t status)
@@ -439,9 +454,10 @@ WasapiOpenResult WasapiOutput::open(const WasapiOpenOptions& options) noexcept
             }
             WAVEFORMATEX format = make_format(input);
             const bool exclusive = mode == WasapiShareMode::exclusive;
-            DWORD stream_flags =
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
-                AUDCLNT_STREAMFLAGS_NOPERSIST;
+            DWORD stream_flags = AUDCLNT_STREAMFLAGS_NOPERSIST;
+            if (uses_event_driven_wasapi_buffering(mode)) {
+                stream_flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+            }
             REFERENCE_TIME period{};
             if (exclusive) {
                 REFERENCE_TIME default_period{};
@@ -499,22 +515,25 @@ WasapiOpenResult WasapiOutput::open(const WasapiOpenOptions& options) noexcept
                 return status;
             }
 
-            state.buffer_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (state.buffer_event == nullptr) {
-                status = HRESULT_FROM_WIN32(GetLastError());
-                state.release_session_resources();
-                return status;
-            }
             state.cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             if (state.cancel_event == nullptr) {
                 status = HRESULT_FROM_WIN32(GetLastError());
                 state.release_session_resources();
                 return status;
             }
-            status = state.audio_client->SetEventHandle(state.buffer_event);
-            if (FAILED(status)) {
-                state.release_session_resources();
-                return status;
+            if (uses_event_driven_wasapi_buffering(mode)) {
+                state.buffer_event =
+                    CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (state.buffer_event == nullptr) {
+                    status = HRESULT_FROM_WIN32(GetLastError());
+                    state.release_session_resources();
+                    return status;
+                }
+                status = state.audio_client->SetEventHandle(state.buffer_event);
+                if (FAILED(status)) {
+                    state.release_session_resources();
+                    return status;
+                }
             }
             status = state.audio_client->GetService(
                 IID_PPV_ARGS(&state.render_client));

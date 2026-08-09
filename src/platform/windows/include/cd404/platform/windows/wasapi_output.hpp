@@ -66,6 +66,10 @@ public:
     std::int32_t* status = nullptr) noexcept;
 [[nodiscard]] std::wstring describe_wasapi_status(std::int32_t status);
 [[nodiscard]] const wchar_t* to_string(WasapiShareMode mode) noexcept;
+// Shared mode uses event callbacks. Exclusive mode deliberately uses polling
+// so arbitrary exact frame counts never need fabricated full-buffer packets.
+[[nodiscard]] bool uses_event_driven_wasapi_buffering(
+    WasapiShareMode mode) noexcept;
 
 // Result of a possibly partial write. `frames_written` is always safe to retry
 // from; `status` is S_OK only when every requested frame was accepted.

@@ -10,6 +10,7 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - [产品与工程规划](docs/PRODUCT_PLAN.md)
 - [公开测试版执行计划](docs/PUBLIC_BETA_PLAN.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
+- [真实硬件验证手册](docs/HARDWARE_VALIDATION.md)
 
 ## 预定技术栈
 
@@ -126,6 +127,17 @@ ctest --preset vs2026-debug
 ```powershell
 .\out\build\ninja-msvc-x64\tools\probes\metadata\cd404_metadata_probe.exe
 ```
+
+枚举音频端点，以及显式执行共享回环或独占标记音验证：
+
+```powershell
+.\out\build\ninja-msvc-x64\tools\probes\wasapi\cd404_wasapi_probe.exe --list
+.\out\build\ninja-msvc-x64\tools\probes\wasapi\cd404_wasapi_probe.exe --loopback-shared
+.\out\build\ninja-msvc-x64\tools\probes\wasapi\cd404_wasapi_probe.exe --render-exclusive
+```
+
+后两条命令会输出一秒低幅 997 Hz 标记音；无活动端点时工具打印 `SKIP` 并返回 2，
+不会把缺少硬件误报为成功。端点选择、外部采集和硬件矩阵见验证手册。
 
 播放当前音频 CD 的首个音轨，默认播放 15 秒：
 

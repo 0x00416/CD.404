@@ -28,6 +28,7 @@ if(WIN32)
         add_subdirectory(tools/probes/drive)
         add_subdirectory(tools/probes/cdda)
         add_subdirectory(tools/probes/metadata)
+        add_subdirectory(tools/probes/wasapi)
     endif()
 endif()
 

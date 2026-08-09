@@ -20,6 +20,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -602,6 +603,50 @@ void test_repeated_cross_track_repositioning()
                 read_pattern_frame(bytes, 2) == target + 2,
             "reposition stress resumes with three exact consecutive frames");
     }
+
+    constexpr std::uint64_t kSeed = 0xCD4045EEDULL;
+    std::mt19937_64 random(kSeed);
+    PatternSectorSource long_source(0, 96);
+    audio::ContinuousCddaStream long_stream(long_source, 0, 96);
+    audio::Pcm16SpscRingBuffer long_ring(32);
+    const auto total_frames = long_stream.total_frames();
+
+    bool all_exact = true;
+    for (std::size_t iteration = 0; iteration < 4'096 && all_exact; ++iteration) {
+        const auto read_frames = static_cast<std::size_t>(1 + random() % 16);
+        const auto target = static_cast<core::SampleFrame>(
+            random() % static_cast<std::uint64_t>(total_frames - read_frames));
+        const std::array<std::int16_t, 4> stale_samples{
+            static_cast<std::int16_t>(iteration),
+            static_cast<std::int16_t>(~iteration),
+            static_cast<std::int16_t>(iteration),
+            static_cast<std::int16_t>(~iteration),
+        };
+        const auto queued = long_ring.push(stale_samples);
+        const bool repositioned =
+            audio::reposition_cdda_stream(long_stream, long_ring, target);
+        std::vector<std::byte> bytes(
+            read_frames * static_cast<std::size_t>(core::kCdBytesPerSampleFrame));
+        const auto read = long_stream.read_frames(bytes);
+
+        bool exact = queued.frames_transferred == 2 && repositioned &&
+            long_ring.readable_frames() == 0 && !long_ring.closed() &&
+            read.status == audio::ReadStatus::ok &&
+            read.frames_read == read_frames;
+        for (std::size_t frame = 0; exact && frame < read_frames; ++frame) {
+            exact = read_pattern_frame(bytes, frame) ==
+                static_cast<std::uint64_t>(target) + frame;
+        }
+        if (!exact) {
+            std::cerr << "reposition seed=0xCD4045EED iteration=" << iteration
+                      << " target=" << target << " frames=" << read_frames
+                      << '\n';
+            all_exact = false;
+        }
+    }
+    expect(
+        all_exact,
+        "seed 0xCD4045EED random reposition preserves exact frames and clears stale data");
 }
 
 void test_reliable_cdda_sector_source()
