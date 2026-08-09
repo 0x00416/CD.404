@@ -3,6 +3,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 
+#include <optional>
 #include <string_view>
 
 namespace cd404::ui::detail {
@@ -31,7 +32,9 @@ void draw_text(
     IDWriteTextFormat* format,
     D2D1_RECT_F rectangle,
     ID2D1Brush* brush,
-    DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING);
+    DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING,
+    std::optional<DWRITE_PARAGRAPH_ALIGNMENT> paragraph_alignment =
+        std::nullopt);
 
 void draw_toggle(
     ID2D1RenderTarget* target,

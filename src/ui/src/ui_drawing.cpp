@@ -144,13 +144,22 @@ void draw_text(
     IDWriteTextFormat* format,
     const D2D1_RECT_F rectangle,
     ID2D1Brush* brush,
-    const DWRITE_TEXT_ALIGNMENT alignment)
+    const DWRITE_TEXT_ALIGNMENT alignment,
+    const std::optional<DWRITE_PARAGRAPH_ALIGNMENT> paragraph_alignment)
 {
     const DWRITE_TEXT_ALIGNMENT previous = format->GetTextAlignment();
+    const DWRITE_PARAGRAPH_ALIGNMENT previous_paragraph =
+        format->GetParagraphAlignment();
     format->SetTextAlignment(alignment);
+    if (paragraph_alignment) {
+        format->SetParagraphAlignment(*paragraph_alignment);
+    }
     target->DrawTextW(text.data(), static_cast<UINT32>(text.size()), format,
         rectangle, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
     format->SetTextAlignment(previous);
+    if (paragraph_alignment) {
+        format->SetParagraphAlignment(previous_paragraph);
+    }
 }
 
 void draw_toggle(

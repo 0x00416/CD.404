@@ -49,9 +49,14 @@ Layout calculate_layout(const float width, const float height) noexcept
         result.settings_back.left - 164.0F, 88.0F,
         result.settings_back.left - 12.0F, 128.0F);
     result.settings_audio_card = D2D1::RectF(margin, 148.0F, width - margin, 300.0F);
-    result.settings_audio_endpoint = D2D1::RectF(
+    result.settings_audio_engine = D2D1::RectF(
         result.settings_audio_card.left + 24.0F,
-        result.settings_audio_card.top + 72.0F,
+        result.settings_audio_card.top + 76.0F,
+        result.settings_audio_card.left + 260.0F,
+        result.settings_audio_card.top + 120.0F);
+    result.settings_audio_endpoint = D2D1::RectF(
+        result.settings_audio_card.left + 276.0F,
+        result.settings_audio_card.top + 76.0F,
         result.settings_audio_card.right - 230.0F,
         result.settings_audio_card.top + 120.0F);
     result.settings_audio_exclusive_toggle = D2D1::RectF(

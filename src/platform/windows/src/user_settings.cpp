@@ -126,13 +126,16 @@ std::wstring make_disc_settings_key(const disc::Toc& toc)
 std::wstring encode_user_settings(const UserSettings& settings)
 {
     JsonObject root;
-    root.Insert(L"version", JsonValue::CreateNumberValue(2));
+    root.Insert(L"version", JsonValue::CreateNumberValue(3));
     root.Insert(
         L"volume",
         JsonValue::CreateNumberValue(std::clamp(settings.volume, 0.0F, 1.0F)));
     root.Insert(
         L"listenbrainz_reporting_enabled",
         JsonValue::CreateBooleanValue(settings.listenbrainz_reporting_enabled));
+    root.Insert(
+        L"audio_output_engine",
+        JsonValue::CreateStringValue(L"wasapi"));
     if (!settings.audio_endpoint_id.empty() &&
         settings.audio_endpoint_id.size() <= kMaximumEndpointIdCharacters) {
         root.Insert(
@@ -181,6 +184,12 @@ UserSettings decode_user_settings(const std::wstring& json) noexcept
         settings.listenbrainz_reporting_enabled = root.GetNamedBoolean(
             L"listenbrainz_reporting_enabled",
             settings.listenbrainz_reporting_enabled);
+        const std::wstring output_engine = root.GetNamedString(
+            L"audio_output_engine",
+            L"wasapi").c_str();
+        settings.audio_output_engine = output_engine == L"wasapi"
+            ? AudioOutputEngine::wasapi
+            : AudioOutputEngine::wasapi;
         settings.audio_endpoint_id = root.GetNamedString(
             L"audio_endpoint_id",
             L"").c_str();

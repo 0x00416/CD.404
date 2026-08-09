@@ -30,6 +30,43 @@ bool select_next_audio_endpoint(
     return true;
 }
 
+bool select_audio_endpoint(
+    const std::span<const platform::windows::WasapiEndpoint> endpoints,
+    const std::size_t requested_index,
+    std::size_t& selected_index,
+    platform::windows::UserSettings& settings)
+{
+    if (requested_index >= endpoints.size()) {
+        return false;
+    }
+    selected_index = requested_index;
+    settings.audio_endpoint_id = endpoints[selected_index].id;
+    return true;
+}
+
+std::size_t audio_output_engine_count() noexcept
+{
+    return 1U;
+}
+
+std::optional<platform::windows::AudioOutputEngine>
+audio_output_engine_at(const std::size_t index) noexcept
+{
+    return index == 0U
+        ? std::optional{platform::windows::AudioOutputEngine::wasapi}
+        : std::nullopt;
+}
+
+std::wstring_view audio_output_engine_label(
+    const platform::windows::AudioOutputEngine engine) noexcept
+{
+    switch (engine) {
+    case platform::windows::AudioOutputEngine::wasapi:
+        return L"WASAPI（Windows 音频）";
+    }
+    return L"WASAPI（Windows 音频）";
+}
+
 void toggle_exclusive_output(
     platform::windows::UserSettings& settings) noexcept
 {

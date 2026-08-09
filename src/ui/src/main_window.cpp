@@ -328,6 +328,7 @@ private:
                 static_cast<void>(render_target_->Resize(D2D1::SizeU(width, height)));
             }
             update_metadata_edit_bounds();
+            update_settings_control_bounds();
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_DPICHANGED: {
@@ -344,6 +345,8 @@ private:
                 const float dpi = static_cast<float>(HIWORD(wparam));
                 render_target_->SetDpi(dpi, dpi);
             }
+            update_metadata_edit_bounds();
+            update_settings_control_bounds();
             return 0;
         }
         case WM_GETMINMAXINFO: {
@@ -376,6 +379,8 @@ private:
             return 0;
         case WM_MOUSEWHEEL:
             if (active_page_ == AppPage::settings) {
+                handle_settings_dropdown_wheel(
+                    GET_WHEEL_DELTA_WPARAM(wparam));
                 return 0;
             }
             handle_mouse_wheel(
@@ -432,6 +437,12 @@ private:
             return 0;
         case WM_KEYDOWN:
             return handle_key_down(wparam);
+        case WM_COMMAND:
+            if (LOWORD(wparam) == kSettingsTokenEditId &&
+                HIWORD(wparam) == EN_SETFOCUS) {
+                close_settings_dropdown();
+            }
+            break;
         case WM_CTLCOLOREDIT:
             if (reinterpret_cast<HWND>(lparam) == settings_token_edit_ ||
                 reinterpret_cast<HWND>(lparam) == metadata_edit_) {
@@ -527,6 +538,17 @@ private:
     enum class AppPage {
         player,
         settings,
+    };
+
+    enum class SettingsDropdown {
+        none,
+        audio_engine,
+        audio_endpoint,
+    };
+
+    struct SettingsDropdownHit final {
+        D2D1_RECT_F rectangle{};
+        std::size_t option_index{};
     };
 
     enum class MetadataEditField {
@@ -852,7 +874,7 @@ private:
             layout_ = detail::calculate_layout(size.width, size.height);
             draw_header();
             if (active_page_ == AppPage::settings) {
-                update_settings_edit_bounds();
+                update_settings_control_bounds();
                 draw_settings_page();
             } else {
                 draw_content();
@@ -1283,18 +1305,23 @@ private:
                 caption_format_.Get(),
                 D2D1::RectF(row.left + 8.0F, top + 5.0F, row.left + 49.0F, top + row_height - 4.0F),
                 track.is_audio ? (selected ? accent_brush_.Get() : secondary_brush_.Get())
-                               : muted_brush_.Get());
+                               : muted_brush_.Get(),
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             draw_text(
                 track.title,
                 track_format_.Get(),
                 D2D1::RectF(row.left + 56.0F, top, row.right - 88.0F, top + row_height),
-                track.is_audio ? text_brush_.Get() : muted_brush_.Get());
+                track.is_audio ? text_brush_.Get() : muted_brush_.Get(),
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             draw_text(
                 track.is_audio ? format_duration(track.frame_count) : L"数据",
                 track_duration_format_.Get(),
                 D2D1::RectF(row.right - 76.0F, top, row.right - 12.0F, top + row_height),
                 track.is_audio ? secondary_brush_.Get() : warning_brush_.Get(),
-                DWRITE_TEXT_ALIGNMENT_TRAILING);
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             track_hits_.push_back(TrackHit{row, index});
         }
         render_target_->PopAxisAlignedClip();
@@ -1549,7 +1576,8 @@ private:
             caption_format_.Get(),
             capsule.rect,
             text_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
 
     void draw_text(
@@ -1557,10 +1585,13 @@ private:
         IDWriteTextFormat* format,
         const D2D1_RECT_F rectangle,
         ID2D1Brush* brush,
-        const DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING)
+        const DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING,
+        const std::optional<DWRITE_PARAGRAPH_ALIGNMENT> paragraph_alignment =
+            std::nullopt)
     {
         detail::draw_text(
-            render_target_.Get(), text, format, rectangle, brush, alignment);
+            render_target_.Get(), text, format, rectangle, brush, alignment,
+            paragraph_alignment);
     }
 
     void refresh_disc()
@@ -1848,6 +1879,7 @@ private:
         }
 
         if (active_page_ == AppPage::settings) {
+            update_settings_dropdown_hover(point);
             const bool changed = hovered_track_.has_value() ||
                 hovered_control_ != HoveredControl::none;
             hovered_track_.reset();
@@ -1940,12 +1972,17 @@ private:
             return 0;
         }
         if (active_page_ == AppPage::settings) {
+            if (handle_settings_dropdown_key(key)) {
+                return 0;
+            }
             if (key == VK_ESCAPE) {
                 close_settings();
             } else if (key == VK_RETURN) {
                 save_settings();
             } else if (key == 'D') {
-                select_next_audio_endpoint();
+                open_settings_dropdown(SettingsDropdown::audio_endpoint);
+            } else if (key == 'E') {
+                open_settings_dropdown(SettingsDropdown::audio_engine);
             } else if (key == 'X') {
                 toggle_exclusive_output();
             } else if (key == 'F') {
@@ -3229,14 +3266,15 @@ private:
                     settings_token_edit_,
                     GWLP_WNDPROC,
                     reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
-            update_settings_edit_bounds();
             SetFocus(settings_token_edit_);
         }
+        update_settings_control_bounds();
         InvalidateRect(window_, nullptr, FALSE);
     }
 
     void close_settings()
     {
+        close_settings_dropdown();
         if (settings_token_edit_ != nullptr) {
             DestroyWindow(settings_token_edit_);
             settings_token_edit_ = nullptr;
@@ -3318,6 +3356,29 @@ private:
 
     void handle_settings_click(const D2D1_POINT_2F point)
     {
+        for (const auto& hit : settings_dropdown_hits_) {
+            if (contains(hit.rectangle, point)) {
+                apply_settings_dropdown_option(hit.option_index);
+                return;
+            }
+        }
+        if (contains(layout_.settings_audio_engine, point)) {
+            if (settings_dropdown_ == SettingsDropdown::audio_engine) {
+                close_settings_dropdown();
+            } else {
+                open_settings_dropdown(SettingsDropdown::audio_engine);
+            }
+            return;
+        }
+        if (contains(layout_.settings_audio_endpoint, point)) {
+            if (settings_dropdown_ == SettingsDropdown::audio_endpoint) {
+                close_settings_dropdown();
+            } else {
+                open_settings_dropdown(SettingsDropdown::audio_endpoint);
+            }
+            return;
+        }
+        close_settings_dropdown();
         if (contains(layout_.settings_diagnostics_export, point)) {
             export_diagnostics();
         } else if (contains(layout_.settings_save, point)) {
@@ -3336,8 +3397,6 @@ private:
             settings_save_failed_ = !settings_saved_;
             settings_input_required_ = false;
             InvalidateRect(window_, nullptr, FALSE);
-        } else if (contains(layout_.settings_audio_endpoint, point)) {
-            select_next_audio_endpoint();
         } else if (contains(
                        layout_.settings_audio_exclusive_toggle,
                        point)) {
@@ -3379,14 +3438,198 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
-    void select_next_audio_endpoint()
+    [[nodiscard]] std::size_t settings_dropdown_option_count(
+        const SettingsDropdown dropdown) const noexcept
     {
-        if (!ui::select_next_audio_endpoint(
-                audio_endpoints_, selected_audio_endpoint_, user_settings_)) {
+        switch (dropdown) {
+        case SettingsDropdown::audio_engine:
+            return audio_output_engine_count();
+        case SettingsDropdown::audio_endpoint:
+            return audio_endpoints_.size();
+        case SettingsDropdown::none:
+            return 0U;
+        }
+        return 0U;
+    }
+
+    [[nodiscard]] std::wstring settings_dropdown_option_label(
+        const SettingsDropdown dropdown,
+        const std::size_t index) const
+    {
+        if (dropdown == SettingsDropdown::audio_engine) {
+            const auto engine = audio_output_engine_at(index);
+            return engine
+                ? std::wstring(audio_output_engine_label(*engine))
+                : std::wstring{};
+        }
+        if (dropdown == SettingsDropdown::audio_endpoint &&
+            index < audio_endpoints_.size()) {
+            return audio_endpoints_[index].name;
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::size_t current_settings_dropdown_option(
+        const SettingsDropdown dropdown) const noexcept
+    {
+        if (dropdown == SettingsDropdown::audio_endpoint) {
+            return selected_audio_endpoint_;
+        }
+        return 0U;
+    }
+
+    [[nodiscard]] D2D1_RECT_F settings_dropdown_anchor(
+        const SettingsDropdown dropdown) const noexcept
+    {
+        return dropdown == SettingsDropdown::audio_engine
+            ? layout_.settings_audio_engine
+            : layout_.settings_audio_endpoint;
+    }
+
+    void open_settings_dropdown(const SettingsDropdown dropdown)
+    {
+        const std::size_t count = settings_dropdown_option_count(dropdown);
+        if (dropdown == SettingsDropdown::none || count == 0U) {
             return;
         }
+        settings_dropdown_ = dropdown;
+        settings_dropdown_highlight_ = std::min(
+            current_settings_dropdown_option(dropdown), count - 1U);
+        constexpr std::size_t visible_options = 4U;
+        settings_dropdown_scroll_ = settings_dropdown_highlight_ >= visible_options
+            ? settings_dropdown_highlight_ - visible_options + 1U
+            : 0U;
+        settings_dropdown_hits_.clear();
+        if (window_ != nullptr) {
+            SetFocus(window_);
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+    }
+
+    void close_settings_dropdown()
+    {
+        if (settings_dropdown_ == SettingsDropdown::none) {
+            return;
+        }
+        settings_dropdown_ = SettingsDropdown::none;
+        settings_dropdown_scroll_ = 0U;
+        settings_dropdown_highlight_ = 0U;
+        settings_dropdown_hits_.clear();
+        if (window_ != nullptr) {
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+    }
+
+    void apply_audio_engine_selection(const std::size_t selected)
+    {
+        const auto engine = audio_output_engine_at(selected);
+        if (!engine) {
+            return;
+        }
+        user_settings_.audio_output_engine = *engine;
         persist_user_settings();
+    }
+
+    void apply_audio_endpoint_selection(const std::size_t selected)
+    {
+        if (!ui::select_audio_endpoint(
+                audio_endpoints_,
+                selected,
+                selected_audio_endpoint_,
+                user_settings_)) {
+            return;
+        }
+        diagnostics_.record(
+            L"audio",
+            std::format(
+                L"output endpoint selection changed default={} index={} count={}",
+                user_settings_.audio_endpoint_id.empty() ? 1 : 0,
+                selected_audio_endpoint_,
+                audio_endpoints_.size()));
+        persist_user_settings();
+    }
+
+    void apply_settings_dropdown_option(const std::size_t selected)
+    {
+        if (settings_dropdown_ == SettingsDropdown::audio_engine) {
+            apply_audio_engine_selection(selected);
+        } else if (settings_dropdown_ == SettingsDropdown::audio_endpoint) {
+            apply_audio_endpoint_selection(selected);
+        }
+        close_settings_dropdown();
+    }
+
+    [[nodiscard]] bool handle_settings_dropdown_key(const WPARAM key)
+    {
+        if (settings_dropdown_ == SettingsDropdown::none) {
+            return false;
+        }
+        const std::size_t count = settings_dropdown_option_count(
+            settings_dropdown_);
+        if (count == 0U) {
+            close_settings_dropdown();
+            return true;
+        }
+        if (key == VK_ESCAPE) {
+            close_settings_dropdown();
+            return true;
+        }
+        if (key == VK_RETURN || key == VK_SPACE) {
+            apply_settings_dropdown_option(settings_dropdown_highlight_);
+            return true;
+        }
+        if (key == VK_UP && settings_dropdown_highlight_ > 0U) {
+            --settings_dropdown_highlight_;
+        } else if (key == VK_DOWN && settings_dropdown_highlight_ + 1U < count) {
+            ++settings_dropdown_highlight_;
+        } else if (key == VK_HOME) {
+            settings_dropdown_highlight_ = 0U;
+        } else if (key == VK_END) {
+            settings_dropdown_highlight_ = count - 1U;
+        } else {
+            return true;
+        }
+        constexpr std::size_t visible_options = 4U;
+        if (settings_dropdown_highlight_ < settings_dropdown_scroll_) {
+            settings_dropdown_scroll_ = settings_dropdown_highlight_;
+        } else if (settings_dropdown_highlight_ >=
+                   settings_dropdown_scroll_ + visible_options) {
+            settings_dropdown_scroll_ =
+                settings_dropdown_highlight_ - visible_options + 1U;
+        }
         InvalidateRect(window_, nullptr, FALSE);
+        return true;
+    }
+
+    void handle_settings_dropdown_wheel(const short delta)
+    {
+        if (settings_dropdown_ == SettingsDropdown::none) {
+            return;
+        }
+        constexpr std::size_t visible_options = 4U;
+        const std::size_t count = settings_dropdown_option_count(
+            settings_dropdown_);
+        const std::size_t maximum_scroll = count > visible_options
+            ? count - visible_options
+            : 0U;
+        if (delta > 0 && settings_dropdown_scroll_ > 0U) {
+            --settings_dropdown_scroll_;
+        } else if (delta < 0 && settings_dropdown_scroll_ < maximum_scroll) {
+            ++settings_dropdown_scroll_;
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void update_settings_dropdown_hover(const D2D1_POINT_2F point)
+    {
+        for (const auto& hit : settings_dropdown_hits_) {
+            if (contains(hit.rectangle, point) &&
+                settings_dropdown_highlight_ != hit.option_index) {
+                settings_dropdown_highlight_ = hit.option_index;
+                InvalidateRect(window_, nullptr, FALSE);
+                return;
+            }
+        }
     }
 
     void toggle_exclusive_output()
@@ -3405,7 +3648,115 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
-    void update_settings_edit_bounds()
+    void draw_settings_dropdown_field(
+        const D2D1_RECT_F rectangle,
+        const std::wstring& label,
+        const bool open)
+    {
+        const auto field = D2D1::RoundedRect(rectangle, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(field, elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            field, open ? accent_brush_.Get() : border_brush_.Get(),
+            open ? 2.0F : 1.0F);
+        draw_text(
+            label,
+            body_format_.Get(),
+            D2D1::RectF(
+                rectangle.left + 14.0F,
+                rectangle.top,
+                rectangle.right - 42.0F,
+                rectangle.bottom),
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        const float center_x = rectangle.right - 20.0F;
+        const float center_y = (rectangle.top + rectangle.bottom) * 0.5F;
+        const float direction = open ? -1.0F : 1.0F;
+        render_target_->DrawLine(
+            D2D1::Point2F(center_x - 5.0F, center_y - 2.0F * direction),
+            D2D1::Point2F(center_x, center_y + 3.0F * direction),
+            secondary_brush_.Get(),
+            1.5F);
+        render_target_->DrawLine(
+            D2D1::Point2F(center_x, center_y + 3.0F * direction),
+            D2D1::Point2F(center_x + 5.0F, center_y - 2.0F * direction),
+            secondary_brush_.Get(),
+            1.5F);
+    }
+
+    void draw_settings_dropdown_popup()
+    {
+        settings_dropdown_hits_.clear();
+        if (settings_dropdown_ == SettingsDropdown::none) {
+            return;
+        }
+        constexpr std::size_t maximum_visible = 4U;
+        constexpr float item_height = 32.0F;
+        const std::size_t count = settings_dropdown_option_count(
+            settings_dropdown_);
+        const std::size_t first = std::min(settings_dropdown_scroll_, count);
+        const std::size_t visible = std::min(maximum_visible, count - first);
+        if (visible == 0U) {
+            return;
+        }
+        const D2D1_RECT_F anchor = settings_dropdown_anchor(settings_dropdown_);
+        const D2D1_RECT_F popup_rect = D2D1::RectF(
+            anchor.left,
+            anchor.bottom + 6.0F,
+            anchor.right,
+            anchor.bottom + 14.0F +
+                static_cast<float>(visible) * item_height);
+        const auto popup = D2D1::RoundedRect(popup_rect, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(popup, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(popup, border_brush_.Get(), 1.0F);
+
+        const std::size_t selected = current_settings_dropdown_option(
+            settings_dropdown_);
+        for (std::size_t local = 0; local < visible; ++local) {
+            const std::size_t index = first + local;
+            const float top = popup_rect.top + 4.0F +
+                static_cast<float>(local) * item_height;
+            const D2D1_RECT_F item_rect = D2D1::RectF(
+                popup_rect.left + 4.0F,
+                top,
+                popup_rect.right - 4.0F,
+                top + item_height);
+            if (index == settings_dropdown_highlight_) {
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(item_rect, 7.0F, 7.0F),
+                    selection_brush_.Get());
+            }
+            draw_text(
+                settings_dropdown_option_label(settings_dropdown_, index),
+                small_format_.Get(),
+                D2D1::RectF(
+                    item_rect.left + 10.0F,
+                    item_rect.top,
+                    item_rect.right - 32.0F,
+                    item_rect.bottom),
+                index == settings_dropdown_highlight_
+                    ? text_brush_.Get()
+                    : secondary_brush_.Get(),
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            if (index == selected) {
+                draw_text(
+                    L"✓",
+                    caption_format_.Get(),
+                    D2D1::RectF(
+                        item_rect.right - 28.0F,
+                        item_rect.top,
+                        item_rect.right - 8.0F,
+                        item_rect.bottom),
+                    accent_brush_.Get(),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                    DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
+            settings_dropdown_hits_.push_back({item_rect, index});
+        }
+    }
+
+    void update_settings_control_bounds()
     {
         if (settings_token_edit_ == nullptr) {
             return;
@@ -3461,7 +3812,8 @@ private:
             button_format_.Get(),
             layout_.settings_back,
             text_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         const auto diagnostic_export = D2D1::RoundedRect(
             layout_.settings_diagnostics_export, 10.0F, 10.0F);
@@ -3473,7 +3825,8 @@ private:
             button_format_.Get(),
             layout_.settings_diagnostics_export,
             text_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         const auto audio_card = D2D1::RoundedRect(
             layout_.settings_audio_card,
@@ -3490,22 +3843,38 @@ private:
                 audio_card.rect.right - 24.0F,
                 audio_card.rect.top + 50.0F),
             text_brush_.Get());
-        const auto endpoint_box = D2D1::RoundedRect(
-            layout_.settings_audio_endpoint,
-            10.0F,
-            10.0F);
-        render_target_->FillRoundedRectangle(endpoint_box, elevated_brush_.Get());
-        render_target_->DrawRoundedRectangle(endpoint_box, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"音频引擎",
+            caption_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_audio_engine.left,
+                audio_card.rect.top + 52.0F,
+                layout_.settings_audio_engine.right,
+                audio_card.rect.top + 72.0F),
+            muted_brush_.Get());
+        draw_text(
+            L"输出设备",
+            caption_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_audio_endpoint.left,
+                audio_card.rect.top + 52.0F,
+                layout_.settings_audio_endpoint.right,
+                audio_card.rect.top + 72.0F),
+            muted_brush_.Get());
+        draw_settings_dropdown_field(
+            layout_.settings_audio_engine,
+            std::wstring(audio_output_engine_label(
+                user_settings_.audio_output_engine)),
+            settings_dropdown_ == SettingsDropdown::audio_engine);
         const std::wstring endpoint_name = audio_endpoints_.empty()
             ? L"系统默认设备"
             : audio_endpoints_[std::min(
                   selected_audio_endpoint_,
                   audio_endpoints_.size() - 1U)].name;
-        draw_text(
-            endpoint_name + L"  ›",
-            body_format_.Get(),
+        draw_settings_dropdown_field(
             layout_.settings_audio_endpoint,
-            text_brush_.Get());
+            endpoint_name,
+            settings_dropdown_ == SettingsDropdown::audio_endpoint);
         draw_text(
             user_settings_.audio_exclusive_mode ? L"独占模式 (X)" : L"共享模式 (X)",
             small_format_.Get(),
@@ -3515,7 +3884,8 @@ private:
                 audio_card.rect.right - 88.0F,
                 audio_card.rect.top + 84.0F),
             secondary_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_TRAILING);
+            DWRITE_TEXT_ALIGNMENT_TRAILING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         draw_toggle(
             layout_.settings_audio_exclusive_toggle,
             user_settings_.audio_exclusive_mode);
@@ -3530,7 +3900,8 @@ private:
             user_settings_.audio_exclusive_mode
                 ? secondary_brush_.Get()
                 : muted_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_TRAILING);
+            DWRITE_TEXT_ALIGNMENT_TRAILING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         draw_toggle(
             layout_.settings_audio_fallback_toggle,
             user_settings_.audio_exclusive_mode &&
@@ -3538,7 +3909,7 @@ private:
         draw_text(
             audio_endpoint_status_ < 0
                 ? platform::windows::describe_wasapi_status(audio_endpoint_status_)
-                : L"44.1 kHz / 16 位 / 双声道；按 D 切换设备",
+                : L"44.1 kHz / 16 位 / 双声道；设备选择将在下一播放会话生效",
             caption_format_.Get(),
             D2D1::RectF(
                 audio_card.rect.left + 24.0F,
@@ -3588,7 +3959,8 @@ private:
                            platform::windows::ListenBrainzState::error
                     ? error_brush_.Get()
                     : muted_brush_.Get()),
-            DWRITE_TEXT_ALIGNMENT_TRAILING);
+            DWRITE_TEXT_ALIGNMENT_TRAILING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         draw_toggle(
             layout_.settings_listenbrainz_toggle,
             user_settings_.listenbrainz_reporting_enabled);
@@ -3603,7 +3975,8 @@ private:
             small_format_.Get(),
             layout_.settings_queue_clear,
             text_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         draw_text(
             L"USER TOKEN",
             caption_format_.Get(),
@@ -3660,7 +4033,8 @@ private:
             button_format_.Get(),
             layout_.settings_clear,
             text_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         const auto save = D2D1::RoundedRect(layout_.settings_save, 10.0F, 10.0F);
         render_target_->FillRoundedRectangle(save, accent_brush_.Get());
@@ -3669,7 +4043,10 @@ private:
             button_format_.Get(),
             layout_.settings_save,
             accent_text_brush_.Get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        draw_settings_dropdown_popup();
 
     }
 
@@ -3769,6 +4146,10 @@ private:
     bool settings_saved_{};
     bool settings_input_required_{};
     HWND settings_token_edit_{};
+    SettingsDropdown settings_dropdown_{SettingsDropdown::none};
+    std::size_t settings_dropdown_scroll_{};
+    std::size_t settings_dropdown_highlight_{};
+    std::vector<SettingsDropdownHit> settings_dropdown_hits_;
     WNDPROC settings_edit_original_proc_{};
     HFONT settings_font_{};
     HBRUSH settings_edit_brush_{};

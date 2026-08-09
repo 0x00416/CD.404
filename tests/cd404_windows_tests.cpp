@@ -107,6 +107,23 @@ void test_settings_model()
         ui::select_next_audio_endpoint(endpoints, selected, settings) &&
             selected == 1 && settings.audio_endpoint_id == L"endpoint-b",
         "settings model advances and persists endpoint selection");
+    expect(
+        ui::select_audio_endpoint(endpoints, 0, selected, settings) &&
+            selected == 0 && settings.audio_endpoint_id == L"endpoint-a",
+        "settings model applies an explicit dropdown endpoint selection");
+    expect(
+        !ui::select_audio_endpoint(endpoints, 9, selected, settings) &&
+            selected == 0 && settings.audio_endpoint_id == L"endpoint-a",
+        "settings model rejects an out-of-range dropdown selection");
+    expect(
+        ui::audio_output_engine_label(
+            platform::windows::AudioOutputEngine::wasapi) ==
+            L"WASAPI（Windows 音频）" &&
+            ui::audio_output_engine_count() == 1U &&
+            ui::audio_output_engine_at(0) ==
+                platform::windows::AudioOutputEngine::wasapi &&
+            !ui::audio_output_engine_at(1),
+        "settings model exposes a future-ready audio engine selector");
 
     ui::toggle_exclusive_output(settings);
     expect(
@@ -933,6 +950,7 @@ void test_user_settings_round_trip()
     source.volume = 0.37F;
     source.listenbrainz_reporting_enabled = false;
     source.audio_endpoint_id = L"endpoint-{stable-id}";
+    source.audio_output_engine = AudioOutputEngine::wasapi;
     source.audio_exclusive_mode = true;
     source.audio_allow_shared_fallback = true;
     source.playback_positions[disc_key] = {2, 123'456};
@@ -943,6 +961,7 @@ void test_user_settings_round_trip()
         decoded.volume > 0.369F && decoded.volume < 0.371F &&
             !decoded.listenbrainz_reporting_enabled &&
             decoded.audio_endpoint_id == source.audio_endpoint_id &&
+            decoded.audio_output_engine == AudioOutputEngine::wasapi &&
             decoded.audio_exclusive_mode &&
             decoded.audio_allow_shared_fallback,
         "user settings JSON round-trips persistent options");
@@ -953,13 +972,16 @@ void test_user_settings_round_trip()
         "user settings JSON round-trips per-disc playback position");
     expect(
         json.find(L"Token") == std::wstring::npos &&
-            json.find(L"token") == std::wstring::npos,
+            json.find(L"token") == std::wstring::npos &&
+            json.find(L"\"audio_output_engine\":\"wasapi\"") !=
+                std::wstring::npos,
         "settings JSON never contains a ListenBrainz token");
 
     const UserSettings defaults = decode_user_settings(L"not json");
     expect(
         defaults.volume == 1.0F && defaults.listenbrainz_reporting_enabled &&
             defaults.audio_endpoint_id.empty() &&
+            defaults.audio_output_engine == AudioOutputEngine::wasapi &&
             !defaults.audio_exclusive_mode &&
             !defaults.audio_allow_shared_fallback,
         "malformed settings keep shared default output and safe volume");

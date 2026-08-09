@@ -19,6 +19,7 @@ struct Layout final {
     D2D1_RECT_F volume_hit{};
     D2D1_RECT_F settings_page{};
     D2D1_RECT_F settings_audio_card{};
+    D2D1_RECT_F settings_audio_engine{};
     D2D1_RECT_F settings_audio_endpoint{};
     D2D1_RECT_F settings_audio_exclusive_toggle{};
     D2D1_RECT_F settings_audio_fallback_toggle{};
