@@ -23,9 +23,12 @@
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/ui/main_window.hpp>
+#include <cd404/ui/playback_presenter.hpp>
+#include <cd404/ui/settings_model.hpp>
 #include <cd404/ui/theme.hpp>
 
 #include "disc_snapshot.hpp"
+#include "ui_drawing.hpp"
 #include "ui_layout.hpp"
 
 #include <algorithm>
@@ -533,16 +536,7 @@ private:
         track_artist,
     };
 
-    enum class ControlIcon {
-        refresh,
-        eject,
-        previous,
-        play,
-        pause,
-        stop,
-        next,
-        settings,
-    };
+    using ControlIcon = detail::ControlIcon;
 
     [[nodiscard]] HRESULT create_independent_resources()
     {
@@ -1485,173 +1479,13 @@ private:
             enabled ? secondary_brush_.Get() : muted_brush_.Get());
     }
 
-    void fill_triangle(
-        const D2D1_POINT_2F first,
-        const D2D1_POINT_2F second,
-        const D2D1_POINT_2F third,
-        ID2D1Brush* brush)
-    {
-        ComPtr<ID2D1PathGeometry> geometry;
-        if (FAILED(factory_->CreatePathGeometry(geometry.ReleaseAndGetAddressOf()))) {
-            return;
-        }
-        ComPtr<ID2D1GeometrySink> sink;
-        if (FAILED(geometry->Open(sink.ReleaseAndGetAddressOf()))) {
-            return;
-        }
-        sink->BeginFigure(first, D2D1_FIGURE_BEGIN_FILLED);
-        sink->AddLine(second);
-        sink->AddLine(third);
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        if (SUCCEEDED(sink->Close())) {
-            render_target_->FillGeometry(geometry.Get(), brush);
-        }
-    }
-
     void draw_control_icon(
         const ControlIcon icon,
         const D2D1_POINT_2F center,
         ID2D1Brush* brush)
     {
-        constexpr float half = 7.0F;
-        switch (icon) {
-        case ControlIcon::play:
-            fill_triangle(
-                D2D1::Point2F(center.x - 4.5F, center.y - half),
-                D2D1::Point2F(center.x + 7.0F, center.y),
-                D2D1::Point2F(center.x - 4.5F, center.y + half),
-                brush);
-            break;
-        case ControlIcon::stop:
-            render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(
-                    D2D1::RectF(
-                        center.x - 6.0F,
-                        center.y - 6.0F,
-                        center.x + 6.0F,
-                        center.y + 6.0F),
-                    1.5F,
-                    1.5F),
-                brush);
-            break;
-        case ControlIcon::pause:
-            render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(
-                    D2D1::RectF(
-                        center.x - 6.5F,
-                        center.y - 7.0F,
-                        center.x - 2.0F,
-                        center.y + 7.0F),
-                    1.0F,
-                    1.0F),
-                brush);
-            render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(
-                    D2D1::RectF(
-                        center.x + 2.0F,
-                        center.y - 7.0F,
-                        center.x + 6.5F,
-                        center.y + 7.0F),
-                    1.0F,
-                    1.0F),
-                brush);
-            break;
-        case ControlIcon::previous:
-            render_target_->DrawLine(
-                D2D1::Point2F(center.x - 6.5F, center.y - half),
-                D2D1::Point2F(center.x - 6.5F, center.y + half),
-                brush,
-                2.0F);
-            fill_triangle(
-                D2D1::Point2F(center.x + 6.0F, center.y - half),
-                D2D1::Point2F(center.x - 4.0F, center.y),
-                D2D1::Point2F(center.x + 6.0F, center.y + half),
-                brush);
-            break;
-        case ControlIcon::next:
-            render_target_->DrawLine(
-                D2D1::Point2F(center.x + 6.5F, center.y - half),
-                D2D1::Point2F(center.x + 6.5F, center.y + half),
-                brush,
-                2.0F);
-            fill_triangle(
-                D2D1::Point2F(center.x - 6.0F, center.y - half),
-                D2D1::Point2F(center.x + 4.0F, center.y),
-                D2D1::Point2F(center.x - 6.0F, center.y + half),
-                brush);
-            break;
-        case ControlIcon::eject:
-            fill_triangle(
-                D2D1::Point2F(center.x, center.y - 7.0F),
-                D2D1::Point2F(center.x + 8.0F, center.y + 4.0F),
-                D2D1::Point2F(center.x - 8.0F, center.y + 4.0F),
-                brush);
-            render_target_->DrawLine(
-                D2D1::Point2F(center.x - 8.0F, center.y + 8.0F),
-                D2D1::Point2F(center.x + 8.0F, center.y + 8.0F),
-                brush,
-                2.0F);
-            break;
-        case ControlIcon::refresh: {
-            ComPtr<ID2D1PathGeometry> geometry;
-            if (FAILED(factory_->CreatePathGeometry(geometry.ReleaseAndGetAddressOf()))) {
-                break;
-            }
-            ComPtr<ID2D1GeometrySink> sink;
-            if (FAILED(geometry->Open(sink.ReleaseAndGetAddressOf()))) {
-                break;
-            }
-            sink->BeginFigure(
-                D2D1::Point2F(center.x + 6.5F, center.y - 3.5F),
-                D2D1_FIGURE_BEGIN_HOLLOW);
-            sink->AddBezier(D2D1::BezierSegment(
-                D2D1::Point2F(center.x + 3.5F, center.y - 8.5F),
-                D2D1::Point2F(center.x - 3.5F, center.y - 8.5F),
-                D2D1::Point2F(center.x - 7.0F, center.y - 3.0F)));
-            sink->AddBezier(D2D1::BezierSegment(
-                D2D1::Point2F(center.x - 10.0F, center.y + 2.0F),
-                D2D1::Point2F(center.x - 6.0F, center.y + 8.0F),
-                D2D1::Point2F(center.x, center.y + 8.0F)));
-            sink->AddBezier(D2D1::BezierSegment(
-                D2D1::Point2F(center.x + 3.5F, center.y + 8.0F),
-                D2D1::Point2F(center.x + 6.5F, center.y + 6.0F),
-                D2D1::Point2F(center.x + 7.5F, center.y + 3.0F)));
-            sink->EndFigure(D2D1_FIGURE_END_OPEN);
-            if (SUCCEEDED(sink->Close())) {
-                render_target_->DrawGeometry(geometry.Get(), brush, 2.0F);
-            }
-            fill_triangle(
-                D2D1::Point2F(center.x + 7.0F, center.y - 7.5F),
-                D2D1::Point2F(center.x + 9.0F, center.y - 1.0F),
-                D2D1::Point2F(center.x + 2.5F, center.y - 2.5F),
-                brush);
-            break;
-        }
-        case ControlIcon::settings:
-            render_target_->DrawEllipse(
-                D2D1::Ellipse(center, 6.0F, 6.0F),
-                brush,
-                2.0F);
-            render_target_->DrawEllipse(
-                D2D1::Ellipse(center, 2.0F, 2.0F),
-                brush,
-                1.5F);
-            for (int tooth = 0; tooth < 8; ++tooth) {
-                const float angle = static_cast<float>(tooth) * 3.14159265F / 4.0F;
-                const float cosine = std::cos(angle);
-                const float sine = std::sin(angle);
-                render_target_->DrawLine(
-                    D2D1::Point2F(
-                        center.x + cosine * 7.5F,
-                        center.y + sine * 7.5F),
-                    D2D1::Point2F(
-                        center.x + cosine * 10.0F,
-                        center.y + sine * 10.0F),
-                    brush,
-                    2.0F);
-            }
-            break;
-        }
+        detail::draw_control_icon(
+            factory_.Get(), render_target_.Get(), icon, center, brush);
     }
 
     void draw_metadata_source_pill(
@@ -1691,16 +1525,8 @@ private:
         ID2D1Brush* brush,
         const DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING)
     {
-        const DWRITE_TEXT_ALIGNMENT previous = format->GetTextAlignment();
-        format->SetTextAlignment(alignment);
-        render_target_->DrawTextW(
-            text.c_str(),
-            static_cast<UINT32>(text.size()),
-            format,
-            rectangle,
-            brush,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        format->SetTextAlignment(previous);
+        detail::draw_text(
+            render_target_.Get(), text, format, rectangle, brush, alignment);
     }
 
     void refresh_disc()
@@ -2669,36 +2495,7 @@ private:
     void set_playback_error(
         const platform::windows::CddaPlaybackResult& result)
     {
-        using platform::windows::CddaPlaybackError;
-
-        switch (result.error) {
-        case CddaPlaybackError::no_ready_audio_cd:
-            ui_message_ = L"当前光盘已不可用";
-            break;
-        case CddaPlaybackError::source_open_failed:
-        case CddaPlaybackError::read_failed:
-            ui_message_ = L"读取光盘失败：" +
-                platform::windows::format_system_error(result.system_error);
-            break;
-        case CddaPlaybackError::endpoint_underrun:
-            ui_message_ = L"光驱供给不足，播放已停止";
-            break;
-        case CddaPlaybackError::output_open_failed:
-        case CddaPlaybackError::output_failed:
-            if (platform::windows::is_recoverable_default_endpoint_failure(result)) {
-                ui_message_ = std::format(
-                    L"默认音频设备恢复失败：0x{:08X}，请检查输出设备",
-                    static_cast<std::uint32_t>(result.audio_status));
-            } else {
-                ui_message_ = L"音频设备错误：" +
-                    platform::windows::describe_wasapi_status(
-                        result.audio_status);
-            }
-            break;
-        default:
-            ui_message_ = L"播放未能完成";
-            break;
-        }
+        ui_message_ = playback_error_message(result);
         ui_message_is_error_ = true;
     }
 
@@ -3359,13 +3156,8 @@ private:
         audio_endpoints_.insert(
             audio_endpoints_.begin(),
             platform::windows::WasapiEndpoint{L"", L"系统默认设备", true});
-        selected_audio_endpoint_ = 0;
-        for (std::size_t index = 1; index < audio_endpoints_.size(); ++index) {
-            if (audio_endpoints_[index].id == user_settings_.audio_endpoint_id) {
-                selected_audio_endpoint_ = index;
-                break;
-            }
-        }
+        selected_audio_endpoint_ = find_audio_endpoint_index(
+            audio_endpoints_, user_settings_.audio_endpoint_id);
         if (settings_font_ == nullptr) {
             settings_font_ = CreateFontW(
                 -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
@@ -3573,35 +3365,26 @@ private:
 
     void select_next_audio_endpoint()
     {
-        if (audio_endpoints_.empty()) {
+        if (!ui::select_next_audio_endpoint(
+                audio_endpoints_, selected_audio_endpoint_, user_settings_)) {
             return;
         }
-        selected_audio_endpoint_ =
-            (selected_audio_endpoint_ + 1U) % audio_endpoints_.size();
-        user_settings_.audio_endpoint_id =
-            audio_endpoints_[selected_audio_endpoint_].id;
         persist_user_settings();
         InvalidateRect(window_, nullptr, FALSE);
     }
 
     void toggle_exclusive_output()
     {
-        user_settings_.audio_exclusive_mode =
-            !user_settings_.audio_exclusive_mode;
-        if (!user_settings_.audio_exclusive_mode) {
-            user_settings_.audio_allow_shared_fallback = false;
-        }
+        ui::toggle_exclusive_output(user_settings_);
         persist_user_settings();
         InvalidateRect(window_, nullptr, FALSE);
     }
 
     void toggle_shared_fallback()
     {
-        if (!user_settings_.audio_exclusive_mode) {
+        if (!ui::toggle_shared_fallback(user_settings_)) {
             return;
         }
-        user_settings_.audio_allow_shared_fallback =
-            !user_settings_.audio_allow_shared_fallback;
         persist_user_settings();
         InvalidateRect(window_, nullptr, FALSE);
     }
@@ -3627,23 +3410,10 @@ private:
 
     void draw_toggle(const D2D1_RECT_F rectangle, const bool enabled)
     {
-        const auto pill = D2D1::RoundedRect(rectangle, 14.0F, 14.0F);
-        render_target_->FillRoundedRectangle(
-            pill,
-            enabled ? accent_brush_.Get() : elevated_brush_.Get());
-        render_target_->DrawRoundedRectangle(pill, border_brush_.Get(), 1.0F);
-        const float radius = 10.0F;
-        const float center_x = enabled
-            ? rectangle.right - radius - 4.0F
-            : rectangle.left + radius + 4.0F;
-        render_target_->FillEllipse(
-            D2D1::Ellipse(
-                D2D1::Point2F(
-                    center_x,
-                    (rectangle.top + rectangle.bottom) * 0.5F),
-                radius,
-                radius),
-            enabled ? accent_text_brush_.Get() : secondary_brush_.Get());
+        detail::draw_toggle(
+            render_target_.Get(), rectangle, enabled,
+            accent_brush_.Get(), elevated_brush_.Get(), border_brush_.Get(),
+            accent_text_brush_.Get(), secondary_brush_.Get());
     }
 
     void draw_settings_page()

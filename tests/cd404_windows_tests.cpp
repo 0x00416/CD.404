@@ -19,6 +19,8 @@
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
 #include <cd404/ui/theme.hpp>
+#include <cd404/ui/playback_presenter.hpp>
+#include <cd404/ui/settings_model.hpp>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -83,6 +85,73 @@ void test_theme_palettes()
             high.border == high.text && high.accent != high.background &&
             high.accent_text != high.accent,
         "high-contrast palette has explicit system-independent foreground separation");
+}
+
+void test_settings_model()
+{
+    using namespace cd404;
+
+    std::vector<platform::windows::WasapiEndpoint> endpoints{
+        {L"endpoint-a", L"A", true},
+        {L"endpoint-b", L"B", false},
+    };
+    platform::windows::UserSettings settings;
+    std::size_t selected = 0;
+
+    expect(
+        ui::find_audio_endpoint_index(endpoints, L"endpoint-b") == 1 &&
+            ui::find_audio_endpoint_index(endpoints, L"missing") == 0,
+        "settings model restores a selected endpoint or uses the default entry");
+    expect(
+        ui::select_next_audio_endpoint(endpoints, selected, settings) &&
+            selected == 1 && settings.audio_endpoint_id == L"endpoint-b",
+        "settings model advances and persists endpoint selection");
+
+    ui::toggle_exclusive_output(settings);
+    expect(
+        settings.audio_exclusive_mode &&
+            !settings.audio_allow_shared_fallback,
+        "exclusive output is explicit and does not silently enable fallback");
+    expect(
+        ui::toggle_shared_fallback(settings) &&
+            settings.audio_allow_shared_fallback,
+        "shared fallback can be enabled only while exclusive mode is active");
+    ui::toggle_exclusive_output(settings);
+    expect(
+        !settings.audio_exclusive_mode &&
+            !settings.audio_allow_shared_fallback &&
+            !ui::toggle_shared_fallback(settings),
+        "leaving exclusive mode clears fallback and shared mode cannot toggle it");
+}
+
+void test_playback_error_presentation()
+{
+    using namespace cd404;
+
+    platform::windows::CddaPlaybackResult result;
+    result.error = platform::windows::CddaPlaybackError::no_ready_audio_cd;
+    expect(
+        ui::playback_error_message(result) == L"当前光盘已不可用",
+        "playback presenter explains unavailable media");
+
+    result.error = platform::windows::CddaPlaybackError::endpoint_underrun;
+    expect(
+        ui::playback_error_message(result) == L"光驱供给不足，播放已停止",
+        "playback presenter explains strict underrun termination");
+
+    result.error = platform::windows::CddaPlaybackError::output_open_failed;
+    result.audio_status = AUDCLNT_E_DEVICE_INVALIDATED;
+    result.used_default_output_endpoint = true;
+    expect(
+        ui::playback_error_message(result).find(L"默认音频设备恢复失败") !=
+            std::wstring::npos,
+        "playback presenter distinguishes recoverable default endpoint failure");
+
+    result.used_default_output_endpoint = false;
+    expect(
+        ui::playback_error_message(result).find(L"音频设备错误") !=
+            std::wstring::npos,
+        "playback presenter keeps selected endpoint failure explicit");
 }
 
 void test_diagnostic_redaction_and_export()
@@ -1174,6 +1243,8 @@ int main(const int argument_count, char** arguments)
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
     test_theme_palettes();
+    test_settings_model();
+    test_playback_error_presentation();
     test_diagnostic_redaction_and_export();
     test_device_failure_classification();
     test_wasapi_negotiation_and_fallback();

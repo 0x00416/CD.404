@@ -5,13 +5,18 @@ target_sources(
     PRIVATE
         src/disc_snapshot.cpp
         src/main_window.cpp
+        src/playback_presenter.cpp
+        src/settings_model.cpp
         src/theme.cpp
+        src/ui_drawing.cpp
         src/ui_layout.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
             include/cd404/ui/main_window.hpp
+            include/cd404/ui/playback_presenter.hpp
+            include/cd404/ui/settings_model.hpp
             include/cd404/ui/theme.hpp
 )
 
