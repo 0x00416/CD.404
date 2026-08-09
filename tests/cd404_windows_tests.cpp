@@ -7,6 +7,7 @@
 #include <winsqlite/winsqlite3.h>
 
 #include <cd404/audio/playback_state_machine.hpp>
+#include <cd404/core/version.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
@@ -561,8 +562,10 @@ void test_listenbrainz_payload_contract()
             now_additional.GetNamedString(L"release_group_mbid") ==
                 L"release-group-id" &&
             now_additional.GetNamedString(L"track_mbid") == L"track-id" &&
-            now_additional.GetNamedArray(L"artist_mbids").Size() == 2,
-        "ListenBrainz payload carries exact MusicBrainz identities when available");
+            now_additional.GetNamedArray(L"artist_mbids").Size() == 2 &&
+            now_additional.GetNamedString(L"submission_client_version") ==
+                cd404::core::kVersionWide,
+        "ListenBrainz payload carries exact identities and the central release version");
 
     auto single = playing_now;
     single.type = listenbrainz::SubmissionType::single;

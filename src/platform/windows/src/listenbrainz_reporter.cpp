@@ -6,6 +6,7 @@
 
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/listenbrainz_queue.hpp>
+#include <cd404/core/version.hpp>
 
 #include "http_client.hpp"
 #include "listenbrainz_credentials.hpp"
@@ -93,7 +94,11 @@ std::wstring build_listenbrainz_payload(
     JsonObject additional;
     additional.Insert(L"media_player", string_value(L"CD.404"));
     additional.Insert(L"submission_client", string_value(L"CD.404"));
-    additional.Insert(L"submission_client_version", string_value(L"0.1.0"));
+    additional.Insert(
+        L"submission_client_version",
+        string_value(std::wstring(
+            core::kVersion.begin(),
+            core::kVersion.end())));
     if (submission.track_number != 0) {
         additional.Insert(
             L"tracknumber",

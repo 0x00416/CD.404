@@ -19,7 +19,7 @@ RELEASE_BUILD_PRESET := ninja-msvc-release
 DEBUG_APP := out/build/$(DEBUG_CONFIGURE_PRESET)/apps/cd404/CD.404.exe
 RELEASE_APP := out/build/$(RELEASE_CONFIGURE_PRESET)/apps/cd404/CD.404.exe
 
-.PHONY: all check configure debug test release test-release run run-release clean help
+.PHONY: all check verify configure debug test release test-release run run-release clean help
 
 all: debug test
 
@@ -27,6 +27,9 @@ check:
 	@if not exist "$(VSDEVCMD)" (echo [CD.404] ERROR: Visual Studio C++ Build Tools not found. Install MSVC and the Windows SDK, or pass VSDEVCMD=path/to/VsDevCmd.bat. & exit /b 1)
 	@"$(CMAKE)" --version >NUL 2>&1 || (echo [CD.404] ERROR: cmake is not available. Add it to PATH or pass CMAKE=path/to/cmake.exe. & exit /b 1)
 	@"$(CTEST)" --version >NUL 2>&1 || (echo [CD.404] ERROR: ctest is not available. Add it to PATH or pass CTEST=path/to/ctest.exe. & exit /b 1)
+
+verify:
+	@powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/release-check.ps1
 
 configure: check
 	@echo [CD.404] Configuring Debug with Ninja and MSVC...
@@ -40,7 +43,7 @@ test: debug
 	@echo [CD.404] Running Debug tests...
 	@"$(CTEST)" --preset $(DEBUG_BUILD_PRESET) --output-on-failure
 
-release: check
+release: check verify
 	@echo [CD.404] Configuring Release with Ninja and MSVC...
 	@call "$(VSDEVCMD)" -no_logo -arch=x64 -host_arch=x64 >NUL && chcp $(MSVC_CODE_PAGE) >NUL && set "VSLANG=1033" && "$(CMAKE)" --preset $(RELEASE_CONFIGURE_PRESET)
 	@echo [CD.404] Building the complete Release application...
@@ -71,6 +74,7 @@ help:
 	@echo   make debug        Configure and build Debug
 	@echo   make test         Configure, build, and test Debug
 	@echo   make release      Configure, build, and test Release
+	@echo   make verify       Check version, required release files, privacy, and tracked artifacts
 	@echo   make run          Build and start Debug
 	@echo   make run-release  Build, test, and start Release
 	@echo   make clean        Remove out/, legacy build/, and probe artifacts

@@ -2,8 +2,8 @@
 
 CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提供可靠的元数据获取、ListenBrainz 播放记录上报，以及可验证的采样级无缝播放。
 
-项目目前处于底层技术验证阶段，已经能够从实体音频 CD 读取原始 CDDA，
-并通过 Windows 默认音频设备完成最小播放。
+当前版本为 `0.2.0-public-beta.1` 公开测试候选开发分支：核心功能、离线/故障自动测试、
+诊断、隐私和每用户分发方案均已落地；发布前仍需完成检查表中的多硬件矩阵与签名步骤。
 
 ## 文档
 
@@ -11,6 +11,9 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - [公开测试版执行计划](docs/PUBLIC_BETA_PLAN.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 - [真实硬件验证手册](docs/HARDWARE_VALIDATION.md)
+- [隐私说明](docs/PRIVACY.md)
+- [第三方说明](THIRD_PARTY_NOTICES.md)
+- [公开测试发布检查表](docs/RELEASE_CHECKLIST.md)
 
 ## 预定技术栈
 
@@ -65,6 +68,22 @@ make release
 其他常用入口包括 `make run`、`make run-release`、`make clean` 和 `make help`。
 Makefile 会通过 Visual Studio Installer 自带的 `vswhere` 自动定位 MSVC；本机路径不会写入仓库。
 `make`、`cmake` 和 `ctest` 需位于 `PATH`，也可以通过同名 Make 变量显式指定其路径。
+`make release` 会先执行 `tools/release-check.ps1`，检查版本同步、发布文件、工作树空白错误、
+本机路径以及误提交的数据库/日志/二进制产物。
+
+## 每用户安装包
+
+Release 使用静态 MSVC 运行库，安装包无需先以管理员权限安装 VC Redistributable。
+安装 Inno Setup 6 后执行：
+
+```powershell
+powershell -File tools/build-installer.ps1
+```
+
+脚本会先重新运行完整 `make release`，再生成安装到
+`%LOCALAPPDATA%\Programs\CD.404` 的 x64 安装包和 SHA-256 文件。签名构建需在受控构建机
+设置 `CD404_SIGNING_THUMBPRINT` 并显式加 `-Sign`；证书、私钥和 Token 均不得进入仓库。
+未安装 Inno Setup 或没有签名证书时，只能验证方案，不能声称安装包已生成或已签名。
 
 推荐在 **Developer PowerShell for VS 2026** 中使用 Ninja：
 
