@@ -19,7 +19,7 @@ RELEASE_BUILD_PRESET := ninja-msvc-release
 DEBUG_APP := out/build/$(DEBUG_CONFIGURE_PRESET)/apps/cd404/CD.404.exe
 RELEASE_APP := out/build/$(RELEASE_CONFIGURE_PRESET)/apps/cd404/CD.404.exe
 
-.PHONY: all check verify configure debug test release test-release run run-release clean help
+.PHONY: all check verify configure debug test release test-release package run run-release clean help
 
 all: debug test
 
@@ -53,6 +53,9 @@ release: check verify
 
 test-release: release
 
+package:
+	@powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/build-installer.ps1
+
 run: debug
 	@echo [CD.404] Starting $(DEBUG_APP)...
 	@start "CD.404" "$(DEBUG_APP)"
@@ -74,6 +77,7 @@ help:
 	@echo   make debug        Configure and build Debug
 	@echo   make test         Configure, build, and test Debug
 	@echo   make release      Configure, build, and test Release
+	@echo   make package      Build the native setup EXE and SHA-256
 	@echo   make verify       Check version, required release files, privacy, and tracked artifacts
 	@echo   make run          Build and start Debug
 	@echo   make run-release  Build, test, and start Release

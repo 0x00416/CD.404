@@ -10,8 +10,12 @@
 - [ ] `make release` 全量配置、静态 MSVC Release 构建和 CTest 全绿。
 - [ ] EXE 的 `ProductVersion` 为 `0.2.0-public-beta.1`，manifest 为 `asInvoker`、x64、
   PerMonitorV2；普通用户启动不出现 UAC。
-- [ ] 若已安装 Inno Setup，运行 `powershell -File tools/build-installer.ps1`；在干净普通
-  用户账户完成安装、覆盖安装、启动和卸载，确认安装目录为 LocalAppData。
+- [ ] 运行 `make package`，确认原生安装器 `/verify` 自检通过；在干净普通用户账户完成
+  默认/自定义路径安装、路径迁移、覆盖安装、启动和卸载，分别确认保留数据与彻底清理。
+- [ ] 在没有既有 CD.404 安装的测试账户运行 `tools/test-installer.ps1`，核对内嵌应用哈希、
+  文档、开始菜单、HKCU 卸载登记和静默卸载清理。
+- [ ] 在 Windows 应用浅色和深色主题下逐页检查安装/卸载向导，确认标题栏、输入框、
+  按钮、复选框、进度条和错误提示均可读。
 
 ## 功能与真实硬件
 
@@ -30,7 +34,7 @@
   账户名、Token、绝对路径或稳定端点 ID。
 - [ ] 确认 MusicBrainz/Cover Art Archive、GnuDB、Apple 与 ListenBrainz 的当前服务条款
   仍允许本次公开测试用途；新增依赖/资源的许可文本已补齐。
-- [ ] 在隔离构建机记录 MSVC、Windows SDK、CMake、Ninja 和 Inno Setup 版本；仅从可信
+- [ ] 在隔离构建机记录 MSVC、Windows SDK、CMake 和 Ninja 版本；仅从可信
   来源安装工具，不把编译器许可证或签名私钥提交到仓库。
 
 ## 签名、哈希与发布

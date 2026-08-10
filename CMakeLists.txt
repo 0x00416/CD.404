@@ -29,6 +29,7 @@ if(WIN32)
     add_subdirectory(src/platform/windows)
     add_subdirectory(src/ui)
     add_subdirectory(apps/cd404)
+    add_subdirectory(installer/native)
     add_subdirectory(apps/playback)
 
     if(CD404_BUILD_TOOLS)

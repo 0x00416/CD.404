@@ -13,26 +13,14 @@ try {
     }
     & (Join-Path $PSScriptRoot 'release-check.ps1')
 
-    $compiler = Get-Command iscc.exe -ErrorAction SilentlyContinue
-    $candidatePaths = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-    )
-    $compilerPath = if ($compiler) {
-        $compiler.Source
-    } else {
-        $candidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    $sourcePackage = Join-Path $repoRoot 'out\build\ninja-msvc-x64-release\installer\native\CD.404-0.2.0-public-beta.1-x64-setup.exe'
+    if (-not (Test-Path -LiteralPath $sourcePackage -PathType Leaf)) {
+        throw 'The native CD.404 installer target did not produce an executable.'
     }
-    if (-not $compilerPath) {
-        throw 'Inno Setup compiler (ISCC.exe) is required to build the installer.'
-    }
-
-    & $compilerPath (Join-Path $repoRoot 'installer\CD.404.iss')
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Inno Setup compilation failed.'
-    }
+    $packageDirectory = Join-Path $repoRoot 'out\package'
+    New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
     $package = Join-Path $repoRoot 'out\package\CD.404-0.2.0-public-beta.1-x64-setup.exe'
+    Copy-Item -LiteralPath $sourcePackage -Destination $package -Force
     if ($Sign) {
         $thumbprint = $env:CD404_SIGNING_THUMBPRINT
         $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue

@@ -75,16 +75,19 @@ Makefile 会通过 Visual Studio Installer 自带的 `vswhere` 自动定位 MSVC
 ## 每用户安装包
 
 Release 使用静态 MSVC 运行库，安装包无需先以管理员权限安装 VC Redistributable。
-安装 Inno Setup 6 后执行：
+项目自带原生 Win32 每用户安装器，不依赖 Inno Setup、WiX 等第三方打包程序。执行：
 
 ```powershell
-powershell -File tools/build-installer.ps1
+make package
 ```
 
-脚本会先重新运行完整 `make release`，再生成安装到
-`%LOCALAPPDATA%\Programs\CD.404` 的 x64 安装包和 SHA-256 文件。签名构建需在受控构建机
+脚本会先重新运行完整 `make release`，再生成自包含 x64 安装包和 SHA-256 文件。安装向导
+默认使用 `%LOCALAPPDATA%\Programs\CD.404`，也允许用户输入或选择其他安装目录，并会创建当前
+用户开始菜单快捷方式、登记 Windows 卸载入口，并在卸载时保留 `%LOCALAPPDATA%\CD.404`
+中的设置、缓存和播放记录。用户也可以在卸载向导中选择彻底删除上述数据及 Windows
+凭据。安装与卸载向导会跟随 Windows 应用浅色/深色主题。签名构建需在受控构建机
 设置 `CD404_SIGNING_THUMBPRINT` 并显式加 `-Sign`；证书、私钥和 Token 均不得进入仓库。
-未安装 Inno Setup 或没有签名证书时，只能验证方案，不能声称安装包已生成或已签名。
+没有签名证书仍可生成安装包，但不得声称 Authenticode 已通过。
 
 推荐在 **Developer PowerShell for VS 2026** 中使用 Ninja：
 

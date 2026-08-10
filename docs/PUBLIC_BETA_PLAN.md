@@ -121,10 +121,12 @@
 键盘/屏幕阅读器帮助也已落地；真实 Narrator/NVDA 顺序观察保留到发布检查表。
 
 分发资产现已补齐：统一版本为 `0.2.0-public-beta.1`，EXE 包含 VERSIONINFO 和 asInvoker /
-PerMonitorV2 manifest，Release 静态链接 MSVC 运行库；Inno Setup 脚本以 LocalAppData 为
-默认目录并支持普通用户安装/卸载。静态审计、安装包构建、可选 Authenticode、SHA-256、
-隐私说明、第三方说明和回滚检查表均有可执行入口。本机未安装 Inno Setup 且没有代码
-签名证书，因此没有生成或伪称已签名安装包；这属于发布执行条件，不是缺失实现。
+PerMonitorV2 manifest，Release 静态链接 MSVC 运行库；项目自带原生 Win32 安装器，以
+LocalAppData 为默认目录，允许用户输入或选择安装路径，并支持普通用户安装、路径迁移、
+覆盖更新和卸载；卸载可选择保留用户数据或彻底删除数据与凭据，不依赖第三方打包程序。
+静态审计、安装包构建、安装器载荷自检、可选 Authenticode、SHA-256、隐私说明、第三方
+说明和回滚检查表均有可执行入口。当前没有代码签名证书，因此不得伪称安装包已签名；
+这属于发布执行条件，不是缺失实现。
 
 ## 计划调整记录
 

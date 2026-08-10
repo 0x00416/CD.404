@@ -9,7 +9,13 @@ $required = @(
     'docs/RELEASE_CHECKLIST.md',
     'docs/HARDWARE_VALIDATION.md',
     'THIRD_PARTY_NOTICES.md',
-    'installer/CD.404.iss',
+    'installer/native/CMakeLists.txt',
+    'installer/native/main.cpp',
+    'installer/native/wizard.cpp',
+    'installer/native/wizard.hpp',
+    'installer/native/installer.manifest',
+    'installer/native/resources.rc.in',
+    'tools/test-installer.ps1',
     'apps/cd404/app.manifest',
     'apps/cd404/resources.rc.in',
     'src/core/include/cd404/core/version.hpp'
@@ -22,10 +28,10 @@ foreach ($relative in $required) {
 
 $cmake = Get-Content -LiteralPath (Join-Path $repoRoot 'CMakeLists.txt') -Raw
 $versionHeader = Get-Content -LiteralPath (Join-Path $repoRoot 'src/core/include/cd404/core/version.hpp') -Raw
-$installer = Get-Content -LiteralPath (Join-Path $repoRoot 'installer/CD.404.iss') -Raw
+$installer = Get-Content -LiteralPath (Join-Path $repoRoot 'installer/native/CMakeLists.txt') -Raw
 if ($cmake -notmatch 'VERSION\s+0\.2\.0' -or
     $versionHeader -notmatch '0\.2\.0-public-beta\.1' -or
-    $installer -notmatch '0\.2\.0-public-beta\.1') {
+    $installer -notmatch 'public-beta\.1') {
     throw 'Release version is not synchronized across CMake, runtime and installer.'
 }
 

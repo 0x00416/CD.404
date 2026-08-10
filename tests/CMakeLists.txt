@@ -13,4 +13,5 @@ if(WIN32)
     cd404_set_project_warnings(cd404_windows_tests)
 
     add_test(NAME cd404_windows_tests COMMAND cd404_windows_tests)
+    add_test(NAME cd404_installer_verify COMMAND cd404_installer /verify)
 endif()

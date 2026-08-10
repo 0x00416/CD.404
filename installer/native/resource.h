@@ -1,0 +1,6 @@
+#pragma once
+
+#define IDR_CD404_APPLICATION 101
+#define IDR_CD404_PRIVACY 102
+#define IDR_CD404_NOTICES 103
+
