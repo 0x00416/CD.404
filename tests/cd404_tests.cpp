@@ -7,6 +7,7 @@
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/audio/reliable_cdda_sector_source.hpp>
 #include <cd404/core/cd_time.hpp>
+#include <cd404/core/lyrics.hpp>
 #include <cd404/disc/cd_text.hpp>
 #include <cd404/disc/gnudb.hpp>
 #include <cd404/disc/musicbrainz_disc_id.hpp>
@@ -1314,6 +1315,75 @@ void test_listenbrainz_playback_tracker()
         "ListenBrainz seeking forward does not count skipped frames as playback");
 }
 
+void test_lyrics_parsers_and_matching()
+{
+    using namespace cd404::core;
+
+    const auto enhanced = parse_lrc(
+        L"[00:03.661]\u30a4[00:03.821]\u30f3[00:03.922]\u30bf[00:04.013]\u30fc[00:04.074]\u30cd[00:04.169]\u30c3[00:04.258]\u30c8[00:04.403]\n"
+        L"[00:03.661]\u7f51\u7edc\u5929\u4f7f\n"
+        L"[00:04.725]\u3068[00:04.839]\u3044[00:04.959]\u3046[00:05.078]\u73fe[00:05.285]\u8c61[00:05.476]\u306f[00:05.809]\n"
+        L"[00:04.725]\u8fd9\u79cd\u73b0\u8c61\u662f");
+    expect(
+        enhanced.lines.size() == 2U && enhanced.has_word_timing &&
+            enhanced.lines[0].text == L"\u30a4\u30f3\u30bf\u30fc\u30cd\u30c3\u30c8" &&
+            enhanced.lines[0].translation == L"\u7f51\u7edc\u5929\u4f7f" &&
+            enhanced.lines[0].tokens.size() == 7U,
+        "enhanced bracket LRC keeps iOS-style word cues and bilingual pairing");
+
+    const auto boundary = parse_lrc(
+        L"[00:00.984]\u3053[00:01.392]\u306e[00:01.729]\u4e16[00:01.880]\u3067[00:02.065]\n"
+        L"[00:02.064]\u8fd9\u4e16\u4e0a[00:02.064]");
+    expect(
+        boundary.lines.size() == 1U &&
+            boundary.lines[0].translation == L"\u8fd9\u4e16\u4e0a",
+        "boundary timestamp translation attaches to the preceding timed line");
+
+    const auto yrc = parse_yrc(
+        L"[1000,900](1000,300,0)\u7f51(1300,600,0)\u6613");
+    expect(
+        yrc.lines.size() == 1U && yrc.has_word_timing &&
+            yrc.lines[0].text == L"\u7f51\u6613" &&
+            yrc.lines[0].tokens[1].start_milliseconds == 1300 &&
+            yrc.lines[0].tokens[1].end_milliseconds == 1900,
+        "NetEase YRC absolute word timing is parsed without losing durations");
+
+    const auto qrc = parse_qrc(
+        L"<Lyric_1 LyricType=\"1\" LyricContent=\"[1000,900]\u817e(1000,300)\u8baf(1300,600)\"/>");
+    expect(
+        qrc.lines.size() == 1U && qrc.has_word_timing &&
+            qrc.lines[0].text == L"\u817e\u8baf" &&
+            qrc.lines[0].tokens[0].start_milliseconds == 1000,
+        "QQ QRC word markers following each token are converted correctly");
+
+    const auto krc = parse_krc(
+        L"[2000,900]<0,300,0>\u9177<300,600,0>\u72d7");
+    expect(
+        krc.lines.size() == 1U && krc.has_word_timing &&
+            krc.lines[0].text == L"\u9177\u72d7" &&
+            krc.lines[0].tokens[0].start_milliseconds == 2000 &&
+            krc.lines[0].tokens[1].start_milliseconds == 2300,
+        "Kugou KRC line-relative word timing is converted to absolute timing");
+
+    const LyricsMatchQuery query{
+        L"INTERNET YAMERO", L"Aiobahn", L"INTERNET YAMERO", 248'000};
+    const LyricsMatchCandidate exact{
+        L"INTERNET YAMERO", L"Aiobahn +81", L"INTERNET YAMERO", 248'900, true, true};
+    const LyricsMatchCandidate wrong{
+        L"INTERNET OVERDOSE", L"Aiobahn", L"INTERNET OVERDOSE", 260'000, true, true};
+    expect(
+        lyrics_match_score(query, exact) >= 70.0 &&
+            lyrics_match_score(query, wrong) == 0.0,
+        "lyrics matching rewards metadata agreement and rejects duration drift over four seconds");
+
+    expect(
+        active_lyric_line(enhanced, 3'800) == std::optional<std::size_t>(0U) &&
+            active_lyric_line(enhanced, 4'600) ==
+                std::optional<std::size_t>(0U) &&
+            lyric_token_progress(enhanced.lines[0].tokens[0], 3'741) > 0.45,
+        "the current bilingual line persists through the gap until the next cue");
+}
+
 } // namespace
 
 int main()
@@ -1333,6 +1403,7 @@ int main()
     test_pcm16_spsc_ring_buffer();
     test_pcm16_volume();
     test_listenbrainz_playback_tracker();
+    test_lyrics_parsers_and_matching();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed.\n";

@@ -19,9 +19,13 @@ Windows 与 Visual Studio Build Tools 的许可条款约束。
 - GnuDB 查询结果和服务使用受其条款约束。详情：<https://gnudb.org/>
 - Apple iTunes Search API 返回的元数据仅用于应用内查询和呈现；不得将宣传图作为应用
   资源重新分发。详情：<https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/>
+- LRCLIB、网易云音乐、QQ 音乐和酷狗音乐仅用于按曲目元数据查询歌词。歌词文本及翻译的
+  著作权归原始权利人，服务可用性与使用条件由各服务提供方决定。LRCLIB API 说明：
+  <https://lrclib.net/docs>
+- 当歌词来源未提供简体中文译文时，CD.404 使用 Microsoft Edge 翻译服务补全缺失行；
+  机器翻译可能不准确，结果仅作为同步字幕显示并写入本地歌词缓存。
 
-安装包脚本面向 Inno Setup 构建工具。Inno Setup 不被打包进 CD.404 安装程序；构建者需
-自行遵守其许可与商业使用要求：<https://jrsoftware.org/isinfo.php>。
+安装包由项目内的原生 Win32 安装器生成，不依赖或分发 Inno Setup、WiX 等第三方打包程序。
 
 若正式发行加入新的代码库、字体、图标、音频或其他资源，发布者必须在签名之前更新
 本文件并附上其完整许可文本（如许可要求）。

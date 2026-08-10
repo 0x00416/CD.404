@@ -14,7 +14,9 @@
 #include <cd404/platform/windows/gnudb_client.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/listenbrainz_queue.hpp>
+#include <cd404/platform/windows/lyrics_codecs.hpp>
 #include <cd404/platform/windows/musicbrainz_client.hpp>
+#include <cd404/platform/windows/online_lyrics.hpp>
 #include <cd404/platform/windows/metadata_store.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
@@ -340,6 +342,219 @@ public:
         return submission;
     }
 };
+
+class LyricsHttpClient final
+    : public cd404::platform::windows::HttpClient {
+public:
+    std::vector<std::wstring> hosts;
+    std::vector<std::wstring> paths;
+    std::vector<std::wstring> headers;
+
+    cd404::platform::windows::HttpResponse get(
+        const std::wstring_view host,
+        const std::wstring_view path,
+        const std::wstring_view request_headers,
+        std::size_t) override
+    {
+        hosts.emplace_back(host);
+        paths.emplace_back(path);
+        headers.emplace_back(request_headers);
+        cd404::platform::windows::HttpResponse response;
+        if (host == L"lrclib.net") {
+            constexpr std::string_view body =
+                R"json([{"id":1,"trackName":"Synthetic Karaoke","artistName":"Test Artist","albumName":"Test Album","duration":120,"instrumental":false,"plainLyrics":"AB","syncedLyrics":"[00:01.000]A[00:01.500]B[00:02.000]\n[00:01.000]\u8bd1\u6587"}])json";
+            response.status = 200;
+            response.body.assign(body.begin(), body.end());
+        } else {
+            response.status = 503;
+        }
+        return response;
+    }
+
+    cd404::platform::windows::HttpResponse post(
+        std::wstring_view,
+        std::wstring_view,
+        std::wstring_view,
+        std::span<const std::uint8_t>,
+        std::size_t) override
+    {
+        return {};
+    }
+};
+
+class WordPreferenceLyricsHttpClient final
+    : public cd404::platform::windows::HttpClient {
+public:
+    cd404::platform::windows::HttpResponse get(
+        const std::wstring_view host,
+        const std::wstring_view path,
+        std::wstring_view,
+        std::size_t) override
+    {
+        cd404::platform::windows::HttpResponse response;
+        if (host == L"lrclib.net") {
+            constexpr std::string_view body =
+                R"json([{"trackName":"Preference Song","artistName":"Alpha Beta","albumName":"Preference Album","duration":120,"syncedLyrics":"[00:01.000]Line one\n[00:02.000]Line two"}])json";
+            response.status = 200;
+            response.body.assign(body.begin(), body.end());
+        } else if (host == L"music.163.com" &&
+                   path.starts_with(L"/api/search/get")) {
+            constexpr std::string_view body =
+                R"json({"result":{"songs":[{"id":42,"name":"Preference Song Live","duration":120000,"artists":[{"name":"Alpha Beta"}],"album":{"name":"Preference Album"}}]}})json";
+            response.status = 200;
+            response.body.assign(body.begin(), body.end());
+        } else if (host == L"music.163.com" &&
+                   path.starts_with(L"/api/song/lyric")) {
+            constexpr std::string_view body =
+                R"json({"yrc":{"lyric":"[1000,900](1000,300,0)One (1300,600,0)Two"}})json";
+            response.status = 200;
+            response.body.assign(body.begin(), body.end());
+        } else {
+            response.status = 503;
+        }
+        return response;
+    }
+
+    cd404::platform::windows::HttpResponse post(
+        const std::wstring_view host,
+        std::wstring_view,
+        std::wstring_view,
+        std::span<const std::uint8_t>,
+        std::size_t) override
+    {
+        cd404::platform::windows::HttpResponse response;
+        if (host == L"edge.microsoft.com") {
+            constexpr std::string_view body =
+                R"json([{"translations":[{"text":"\u4e00\u4e8c","to":"zh-Hans"}]}])json";
+            response.status = 200;
+            response.body.assign(body.begin(), body.end());
+        }
+        return response;
+    }
+};
+
+void test_online_lyrics_matching_and_parsing()
+{
+    using namespace cd404;
+    auto client = std::make_shared<LyricsHttpClient>();
+    std::optional<platform::windows::OnlineLyricsLookupResult> result;
+    std::jthread worker([&] {
+        result = platform::windows::lookup_online_lyrics(
+            core::LyricsMatchQuery{
+                L"Synthetic Karaoke",
+                L"Test Artist",
+                L"Test Album",
+                120'000,
+            },
+            client,
+            false);
+    });
+    worker.join();
+    expect(
+        result && result->lyrics && result->lyrics->has_word_timing &&
+            result->lyrics->source == L"LRCLIB" &&
+            result->lyrics->lines.size() == 1U &&
+            result->lyrics->lines[0].text == L"AB" &&
+            result->lyrics->lines[0].translation == L"\u8bd1\u6587",
+        "online lyrics lookup scores metadata and preserves enhanced bilingual tokens");
+    expect(
+        client->hosts.size() == 4U &&
+            client->hosts[0] == L"lrclib.net" &&
+            client->hosts[1] == L"music.163.com" &&
+            client->hosts[2] == L"c.y.qq.com" &&
+            client->hosts[3] == L"songsearch.kugou.com" &&
+            client->paths[0].find(L"track_name=Synthetic%20Karaoke") !=
+                std::wstring::npos &&
+            client->headers[0].find(L"admin@416.best") != std::wstring::npos,
+        "lyrics providers receive encoded metadata and an identifying user agent");
+
+    std::optional<platform::windows::OnlineLyricsLookupResult> preference;
+    std::jthread preference_worker([&] {
+        preference = platform::windows::lookup_online_lyrics(
+            core::LyricsMatchQuery{
+                L"Preference Song",
+                L"Alpha Beta",
+                L"Preference Album",
+                120'000,
+            },
+            std::make_shared<WordPreferenceLyricsHttpClient>(),
+            false);
+    });
+    preference_worker.join();
+    expect(
+        preference && preference->lyrics &&
+            preference->lyrics->source == L"NetEase" &&
+            preference->lyrics->has_word_timing &&
+            preference->lyrics->lines[0].tokens.size() == 2U &&
+            preference->lyrics->lines[0].translation == L"\u4e00\u4e8c",
+        "a close word-timed YRC candidate wins and receives a missing Chinese translation");
+}
+
+void test_cloud_lyrics_codecs()
+{
+    using namespace cd404;
+    constexpr std::array<std::uint8_t, 41> krc{
+        0x6b, 0x72, 0x63, 0x31, 0x38, 0xdb, 0xea, 0x41, 0x6a,
+        0x02, 0x44, 0x97, 0xe0, 0x02, 0x01, 0xa5, 0x7b, 0xe3,
+        0xbe, 0x58, 0x46, 0x75, 0x6c, 0x9b, 0x00, 0x84, 0x1a,
+        0xf0, 0x50, 0x87, 0xfd, 0xed, 0x72, 0x35, 0xb3, 0xba,
+        0x41, 0xef, 0x6f, 0x7d, 0x03,
+    };
+    const auto krc_plain = platform::windows::detail::decode_krc(krc);
+    const auto krc_lyrics = krc_plain ? core::parse_krc(*krc_plain) : core::LyricsDocument{};
+    expect(
+        krc_lyrics.has_word_timing && krc_lyrics.lines.size() == 1U &&
+            krc_lyrics.lines[0].text == L"\u9177\u72d7" &&
+            krc_lyrics.lines[0].tokens[1].start_milliseconds == 1'300,
+        "KRC XOR and zlib decoding feeds absolute word cues into the parser");
+
+    constexpr std::string_view qrc =
+        "C90DB2E3F6940A43538B45865EB6753863C981F936A71A093B450246D48B65F0"
+        "33262599ECFCF75E9EBBED19160162D3B56E50BC145B0D892B98EA6E463D5B7E"
+        "DCABAE69AE1C1634DCA580EC427C9778";
+    const auto qrc_plain = platform::windows::detail::decode_qrc(qrc);
+    const auto qrc_lyrics = qrc_plain ? core::parse_qrc(*qrc_plain) : core::LyricsDocument{};
+    expect(
+        qrc_lyrics.has_word_timing && qrc_lyrics.lines.size() == 1U &&
+            qrc_lyrics.lines[0].text.starts_with(L"\u817e\u8baf"),
+        "QRC Triple-DES and zlib decoding preserves word-level QRC timing");
+
+    expect(
+        !platform::windows::detail::decode_krc(
+            std::array<std::uint8_t, 5>{'k','r','c','1',0}).has_value() &&
+            !platform::windows::detail::decode_qrc("not-hex").has_value(),
+        "lyrics codecs reject truncated or malformed encrypted payloads");
+}
+
+void test_online_lyrics_live()
+{
+    using namespace cd404;
+    std::optional<platform::windows::OnlineLyricsLookupResult> result;
+    std::jthread worker([&] {
+        result = platform::windows::lookup_online_lyrics(
+            core::LyricsMatchQuery{
+                L"INTERNET YAMERO",
+                L"Aiobahn +81",
+                L"INTERNET YAMERO",
+                241'000,
+            },
+            {},
+            false);
+    });
+    worker.join();
+    const std::size_t translated_lines = result && result->lyrics
+        ? static_cast<std::size_t>(std::ranges::count_if(
+            result->lyrics->lines,
+            [](const core::LyricLine& line) { return !line.translation.empty(); }))
+        : 0U;
+    expect(
+        result && result->lyrics && result->lyrics->has_word_timing &&
+            result->lyrics->lines.size() > 10U &&
+            translated_lines > 10U &&
+            (result->lyrics->source == L"QQ Music" ||
+             result->lyrics->source == L"Kugou"),
+        "live lyrics providers return a verified word-timed document");
+}
 
 void test_wasapi_negotiation_and_fallback()
 {
@@ -1544,6 +1759,8 @@ int main(const int argument_count, char** arguments)
     test_listenbrainz_payload_contract();
     test_listenbrainz_queue_restart_and_account_isolation();
     test_listenbrainz_fake_http_failures();
+    test_online_lyrics_matching_and_parsing();
+    test_cloud_lyrics_codecs();
     test_cddb_configuration_contract();
     test_system_media_controls_safe_fallback();
     test_system_media_controls_with_window();
@@ -1560,6 +1777,9 @@ int main(const int argument_count, char** arguments)
     } else if (argument_count == 2 &&
                std::string_view(arguments[1]) == "--hardware-pause") {
         test_hardware_pause_resume();
+    } else if (argument_count == 2 &&
+               std::string_view(arguments[1]) == "--online-lyrics") {
+        test_online_lyrics_live();
     }
 
     if (failures != 0) {

@@ -14,6 +14,7 @@
 
 #include <cd404/audio/playback_recovery.hpp>
 #include <cd404/core/cd_time.hpp>
+#include <cd404/core/lyrics.hpp>
 #include <cd404/listenbrainz/playback_tracker.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
@@ -21,6 +22,7 @@
 #include <cd404/platform/windows/gnudb_client.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/online_metadata.hpp>
+#include <cd404/platform/windows/online_lyrics.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
@@ -67,6 +69,7 @@ constexpr UINT kSettingsCloseMessage = WM_APP + 6;
 constexpr UINT kMetadataEditSaveMessage = WM_APP + 7;
 constexpr UINT kMetadataEditCloseMessage = WM_APP + 8;
 constexpr UINT kCddbSubmissionReadyMessage = WM_APP + 9;
+constexpr UINT kLyricsReadyMessage = WM_APP + 10;
 constexpr int kSettingsTokenEditId = 1'001;
 constexpr int kSettingsCddbServerEditId = 1'002;
 constexpr int kSettingsCddbEmailEditId = 1'003;
@@ -137,6 +140,12 @@ using detail::DiscSnapshot;
 using detail::OnlineMetadataSnapshot;
 using detail::UiTrack;
 using detail::load_disc_snapshot;
+
+struct LyricsSnapshot final {
+    std::optional<core::LyricsDocument> lyrics;
+    std::uint64_t generation{};
+    std::size_t track_index{};
+};
 #if 0 // 合并期间保留的旧内联快照实现；待 CDDB 编辑器拆分时删除。
 [[nodiscard]] std::wstring to_wstring(const std::u16string_view text)
 {
@@ -744,6 +753,7 @@ private:
             }
             if (wparam == kAnimationTimer) {
                 update_playback_clock();
+                ensure_lyrics_for_selected_track();
                 maybe_persist_playback_position();
                 if (active_page_ == AppPage::settings && settings_saved_ &&
                     listenbrainz_reporter_.status().state !=
@@ -787,6 +797,10 @@ private:
         case kCddbSubmissionReadyMessage:
             receive_cddb_submission(std::unique_ptr<CddbSubmissionSnapshot>(
                 reinterpret_cast<CddbSubmissionSnapshot*>(lparam)));
+            return 0;
+        case kLyricsReadyMessage:
+            receive_lyrics(std::unique_ptr<LyricsSnapshot>(
+                reinterpret_cast<LyricsSnapshot*>(lparam)));
             return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
@@ -933,6 +947,18 @@ private:
                 DWRITE_FONT_WEIGHT_SEMI_BOLD,
                 icon_format_);
         }
+        if (SUCCEEDED(result)) {
+            result = create_text_format(
+                18.0F,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                lyric_format_);
+        }
+        if (SUCCEEDED(result)) {
+            result = create_text_format(
+                13.0F,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                lyric_translation_format_);
+        }
         if (FAILED(result)) {
             return result;
         }
@@ -946,6 +972,13 @@ private:
         track_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         track_duration_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         small_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        lyric_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        lyric_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        lyric_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        lyric_translation_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        lyric_translation_format_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        lyric_translation_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
         return S_OK;
     }
 
@@ -1616,6 +1649,7 @@ private:
         const float album_info_height =
             60.0F + static_cast<float>(source_rows) * 28.0F;
         const float text_top = layout_.track_list.bottom - album_info_height;
+        draw_lyrics(text_top);
         draw_text(
             disc_.album_title.empty() ? L"未知专辑" : disc_.album_title,
             album_format_.Get(),
@@ -1682,25 +1716,375 @@ private:
         draw_track_list();
     }
 
+    [[nodiscard]] D2D1_RECT_F cover_image_rectangle() const
+    {
+        if (!cover_bitmap_) {
+            return layout_.cover;
+        }
+        const D2D1_SIZE_U bitmap_size = cover_bitmap_->GetPixelSize();
+        if (bitmap_size.width == 0U || bitmap_size.height == 0U) {
+            return layout_.cover;
+        }
+        const float cover_width = layout_.cover.right - layout_.cover.left;
+        const float cover_height = layout_.cover.bottom - layout_.cover.top;
+        const float scale = std::min(
+            cover_width / static_cast<float>(bitmap_size.width),
+            cover_height / static_cast<float>(bitmap_size.height));
+        const float image_width = static_cast<float>(bitmap_size.width) * scale;
+        const float image_height = static_cast<float>(bitmap_size.height) * scale;
+        const float image_left =
+            layout_.cover.left + (cover_width - image_width) * 0.5F;
+        return D2D1::RectF(
+            image_left,
+            layout_.track_list.top,
+            image_left + image_width,
+            layout_.track_list.top + image_height);
+    }
+
+    [[nodiscard]] float measure_lyric_text(
+        const std::wstring_view text,
+        IDWriteTextFormat* format,
+        const float width,
+        const float font_size,
+        const float line_spacing,
+        const float baseline)
+    {
+        if (text.empty() || width <= 0.0F) {
+            return 0.0F;
+        }
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(write_factory_->CreateTextLayout(
+                text.data(),
+                static_cast<UINT32>(text.size()),
+                format,
+                width,
+                4'096.0F,
+                layout.ReleaseAndGetAddressOf()))) {
+            return line_spacing;
+        }
+        const DWRITE_TEXT_RANGE range{
+            0U, static_cast<UINT32>(text.size())};
+        static_cast<void>(layout->SetFontSize(font_size, range));
+        static_cast<void>(layout->SetLineSpacing(
+            DWRITE_LINE_SPACING_METHOD_UNIFORM,
+            line_spacing,
+            baseline));
+        DWRITE_TEXT_METRICS metrics{};
+        return SUCCEEDED(layout->GetMetrics(&metrics))
+            ? std::ceil(metrics.height)
+            : line_spacing;
+    }
+
+    void draw_wrapped_lyric_text(
+        const std::wstring_view text,
+        IDWriteTextFormat* format,
+        const D2D1_RECT_F rectangle,
+        ID2D1Brush* brush,
+        const float font_size,
+        const float line_spacing,
+        const float baseline)
+    {
+        if (text.empty() || rectangle.right <= rectangle.left ||
+            rectangle.bottom <= rectangle.top) {
+            return;
+        }
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(write_factory_->CreateTextLayout(
+                text.data(),
+                static_cast<UINT32>(text.size()),
+                format,
+                rectangle.right - rectangle.left,
+                rectangle.bottom - rectangle.top,
+                layout.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        const DWRITE_TEXT_RANGE range{
+            0U, static_cast<UINT32>(text.size())};
+        static_cast<void>(layout->SetFontSize(font_size, range));
+        static_cast<void>(layout->SetLineSpacing(
+            DWRITE_LINE_SPACING_METHOD_UNIFORM,
+            line_spacing,
+            baseline));
+        render_target_->DrawTextLayout(
+            D2D1::Point2F(rectangle.left, rectangle.top),
+            layout.Get(),
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    void draw_karaoke_line(
+        const core::LyricLine& line,
+        const core::LyricTime position_milliseconds,
+        const D2D1_RECT_F rectangle,
+        const float font_size,
+        const float line_spacing,
+        const float baseline)
+    {
+        if (line.text.empty() || rectangle.right <= rectangle.left ||
+            rectangle.bottom <= rectangle.top) {
+            return;
+        }
+        ComPtr<IDWriteTextLayout> text_layout;
+        if (FAILED(write_factory_->CreateTextLayout(
+                line.text.data(),
+                static_cast<UINT32>(line.text.size()),
+                lyric_format_.Get(),
+                rectangle.right - rectangle.left,
+                rectangle.bottom - rectangle.top,
+                text_layout.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        const DWRITE_TEXT_RANGE range{
+            0U, static_cast<UINT32>(line.text.size())};
+        static_cast<void>(text_layout->SetFontSize(font_size, range));
+        static_cast<void>(text_layout->SetLineSpacing(
+            DWRITE_LINE_SPACING_METHOD_UNIFORM,
+            line_spacing,
+            baseline));
+        const D2D1_POINT_2F origin = D2D1::Point2F(rectangle.left, rectangle.top);
+        render_target_->DrawTextLayout(
+            origin,
+            text_layout.Get(),
+            !line.tokens.empty() ? secondary_brush_.Get() : text_brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        if (line.tokens.empty()) {
+            return;
+        }
+
+        UINT32 text_position{};
+        for (const auto& token : line.tokens) {
+            const UINT32 token_length = static_cast<UINT32>(token.text.size());
+            if (token_length == 0U) {
+                continue;
+            }
+            const double progress = core::lyric_token_progress(
+                token,
+                position_milliseconds,
+                line.end_milliseconds);
+            if (progress <= 0.0) {
+                text_position += token_length;
+                continue;
+            }
+            UINT32 metric_count{};
+            static_cast<void>(text_layout->HitTestTextRange(
+                text_position,
+                token_length,
+                0.0F,
+                0.0F,
+                nullptr,
+                0,
+                &metric_count));
+            if (metric_count == 0U) {
+                text_position += token_length;
+                continue;
+            }
+            std::vector<DWRITE_HIT_TEST_METRICS> metrics(metric_count);
+            if (FAILED(text_layout->HitTestTextRange(
+                    text_position,
+                    token_length,
+                    0.0F,
+                    0.0F,
+                    metrics.data(),
+                    metric_count,
+                    &metric_count))) {
+                text_position += token_length;
+                continue;
+            }
+            for (const auto& metric : metrics) {
+                const float revealed_width = metric.width *
+                    static_cast<float>(progress);
+                if (revealed_width <= 0.0F) {
+                    continue;
+                }
+                render_target_->PushAxisAlignedClip(
+                    D2D1::RectF(
+                        rectangle.left + metric.left,
+                        rectangle.top + metric.top,
+                        rectangle.left + metric.left + revealed_width + 0.75F,
+                        rectangle.top + metric.top + metric.height),
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                render_target_->DrawTextLayout(
+                    origin,
+                    text_layout.Get(),
+                    accent_brush_.Get(),
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                render_target_->PopAxisAlignedClip();
+            }
+            text_position += token_length;
+        }
+    }
+
+    void draw_lyrics(const float album_text_top)
+    {
+        if (!lyrics_ || lyrics_->lines.empty() ||
+            lyrics_track_index_ != selected_track_) {
+            return;
+        }
+        const D2D1_RECT_F cover = cover_image_rectangle();
+        const D2D1_RECT_F area = D2D1::RectF(
+            layout_.cover.left,
+            cover.bottom + 4.0F,
+            layout_.cover.right,
+            album_text_top - 4.0F);
+        const float height = area.bottom - area.top;
+        if (height < 28.0F) {
+            return;
+        }
+        const core::LyricTime position_milliseconds =
+            std::max<core::SampleFrame>(0, playback_track_frame_) * 1'000 /
+            core::kCdSampleFramesPerSecond;
+        const auto active = core::active_lyric_line(
+            *lyrics_, position_milliseconds);
+        std::size_t focus_index{};
+        if (active) {
+            focus_index = *active;
+        } else {
+            const auto upcoming = std::ranges::lower_bound(
+                lyrics_->lines,
+                position_milliseconds,
+                {},
+                &core::LyricLine::start_milliseconds);
+            if (upcoming == lyrics_->lines.end()) {
+                return;
+            }
+            focus_index = static_cast<std::size_t>(
+                std::distance(lyrics_->lines.begin(), upcoming));
+        }
+
+        struct ContextLineLayout final {
+            std::size_t index{};
+            float primary_height{};
+            float translation_height{};
+            float height{};
+        };
+        const float width = area.right - area.left;
+        const auto measure_line = [&](const std::size_t index, const float scale) {
+            const auto& line = lyrics_->lines[index];
+            const bool current = index == focus_index;
+            ContextLineLayout item{index};
+            item.primary_height = measure_lyric_text(
+                line.text,
+                current ? lyric_format_.Get() : lyric_translation_format_.Get(),
+                width,
+                (current ? 18.0F : 14.0F) * scale,
+                (current ? 20.0F : 16.0F) * scale,
+                (current ? 15.5F : 12.5F) * scale);
+            item.translation_height = line.translation.empty()
+                ? 0.0F
+                : measure_lyric_text(
+                    line.translation,
+                    lyric_translation_format_.Get(),
+                    width,
+                    (current ? 13.0F : 11.0F) * scale,
+                    (current ? 15.0F : 13.0F) * scale,
+                    (current ? 11.5F : 10.0F) * scale);
+            item.height = item.primary_height + item.translation_height +
+                (item.translation_height > 0.0F ? 2.0F : 0.0F);
+            return item;
+        };
+
+        float scale = 1.0F;
+        ContextLineLayout focus = measure_line(focus_index, scale);
+        while (focus.height > height && scale > 0.60F) {
+            scale = std::max(0.60F, scale - 0.06F);
+            focus = measure_line(focus_index, scale);
+        }
+        if (focus.height > height) {
+            return;
+        }
+
+        constexpr float sentence_gap = 24.0F;
+        std::vector<ContextLineLayout> previous_lines;
+        std::vector<ContextLineLayout> next_lines;
+        const float focus_top = area.top + (height - focus.height) * 0.5F;
+        const float previous_capacity = focus_top - area.top;
+        const float next_capacity = area.bottom - (focus_top + focus.height);
+        float previous_height{};
+        float next_height{};
+        std::size_t previous_index = focus_index;
+        std::size_t next_index = focus_index + 1U;
+
+        // Keep the active cue fixed at the vertical center. Context grows away
+        // from it independently so changing the visible line count never moves
+        // the line the listener is following.
+        while (previous_index > 0U) {
+            const auto candidate = measure_line(previous_index - 1U, scale);
+            const float required = sentence_gap * scale + candidate.height;
+            if (previous_height + required > previous_capacity) {
+                break;
+            }
+            previous_lines.push_back(candidate);
+            --previous_index;
+            previous_height += required;
+        }
+        while (next_index < lyrics_->lines.size()) {
+            const auto candidate = measure_line(next_index, scale);
+            const float required = sentence_gap * scale + candidate.height;
+            if (next_height + required > next_capacity) {
+                break;
+            }
+            next_lines.push_back(candidate);
+            ++next_index;
+            next_height += required;
+        }
+
+        std::vector<ContextLineLayout> context;
+        context.reserve(previous_lines.size() + 1U + next_lines.size());
+        context.insert(
+            context.end(), previous_lines.rbegin(), previous_lines.rend());
+        context.push_back(focus);
+        context.insert(context.end(), next_lines.begin(), next_lines.end());
+
+        float top = focus_top - previous_height;
+        for (std::size_t visual_index{};
+             visual_index < context.size(); ++visual_index) {
+            const auto& item = context[visual_index];
+            const auto& line = lyrics_->lines[item.index];
+            const bool current = item.index == focus_index;
+            const float primary_bottom = top + item.primary_height;
+            if (current) {
+                draw_karaoke_line(
+                    line,
+                    position_milliseconds,
+                    D2D1::RectF(area.left, top, area.right, primary_bottom),
+                    18.0F * scale,
+                    20.0F * scale,
+                    15.5F * scale);
+            } else {
+                draw_wrapped_lyric_text(
+                    line.text,
+                    lyric_translation_format_.Get(),
+                    D2D1::RectF(area.left, top, area.right, primary_bottom),
+                    secondary_brush_.Get(),
+                    14.0F * scale,
+                    16.0F * scale,
+                    12.5F * scale);
+            }
+            if (item.translation_height > 0.0F) {
+                draw_wrapped_lyric_text(
+                    line.translation,
+                    lyric_translation_format_.Get(),
+                    D2D1::RectF(
+                        area.left,
+                        primary_bottom + 2.0F,
+                        area.right,
+                        top + item.height),
+                    muted_brush_.Get(),
+                    (current ? 13.0F : 11.0F) * scale,
+                    (current ? 15.0F : 13.0F) * scale,
+                    (current ? 11.5F : 10.0F) * scale);
+            }
+            top += item.height;
+            if (visual_index + 1U < context.size()) {
+                top += sentence_gap * scale;
+            }
+        }
+    }
+
     void draw_cover()
     {
         if (cover_bitmap_) {
-            const D2D1_SIZE_U bitmap_size = cover_bitmap_->GetPixelSize();
-            const float cover_width = layout_.cover.right - layout_.cover.left;
-            const float cover_height = layout_.cover.bottom - layout_.cover.top;
-            const float scale = std::min(
-                cover_width / static_cast<float>(bitmap_size.width),
-                cover_height / static_cast<float>(bitmap_size.height));
-            const float image_width = static_cast<float>(bitmap_size.width) * scale;
-            const float image_height = static_cast<float>(bitmap_size.height) * scale;
-            const float image_left =
-                layout_.cover.left + (cover_width - image_width) * 0.5F;
-            const float image_top = layout_.track_list.top;
-            const D2D1_RECT_F image_rect = D2D1::RectF(
-                image_left,
-                image_top,
-                image_left + image_width,
-                image_top + image_height);
+            const D2D1_RECT_F image_rect = cover_image_rectangle();
             const auto rounded = D2D1::RoundedRect(image_rect, 14.0F, 14.0F);
 
             ComPtr<ID2D1RoundedRectangleGeometry> clip_geometry;
@@ -2290,6 +2674,7 @@ private:
         selected_track_ = first_audio_track();
         restore_playback_position();
         apply_saved_metadata_override();
+        invalidate_lyrics();
         scroll_row_ = 0;
         InvalidateRect(window_, nullptr, FALSE);
         sync_system_media(true);
@@ -2500,7 +2885,176 @@ private:
                 playback_track_frame_,
                 unix_time_now());
         }
+        invalidate_lyrics();
         sync_system_media(true);
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    [[nodiscard]] core::LyricsMatchQuery lyrics_query(
+        const std::size_t track_index) const
+    {
+        if (track_index >= disc_.tracks.size()) {
+            return {};
+        }
+        const auto& track = disc_.tracks[track_index];
+        return {
+            track.title,
+            track.artist.empty() ? disc_.album_artist : track.artist,
+            disc_.album_title,
+            track.frame_count * 1'000 / core::kCdSampleFramesPerSecond,
+        };
+    }
+
+    void start_lyrics_lookup()
+    {
+        if (lyrics_worker_.joinable() ||
+            lyrics_pending_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        const std::size_t track_index = lyrics_pending_track_;
+        const core::LyricsMatchQuery query = lyrics_query(track_index);
+        if (query.title.empty() || query.duration_milliseconds <= 0 ||
+            query.title.starts_with(L"音轨 ")) {
+            if (track_index < lyrics_resolved_.size()) {
+                lyrics_resolved_[track_index] = true;
+                lyrics_documents_[track_index].reset();
+            }
+            if (track_index == selected_track_) {
+                lyrics_.reset();
+                lyrics_track_index_ = track_index;
+            }
+            lyrics_pending_track_ = std::numeric_limits<std::size_t>::max();
+            return;
+        }
+        const std::uint64_t generation = lyrics_generation_;
+        const HWND target_window = window_;
+        lyrics_worker_ = std::jthread([
+            target_window,
+            query,
+            generation,
+            track_index] {
+            auto snapshot = std::make_unique<LyricsSnapshot>();
+            snapshot->generation = generation;
+            snapshot->track_index = track_index;
+            snapshot->lyrics = platform::windows::lookup_online_lyrics(query).lyrics;
+            auto* const raw_snapshot = snapshot.release();
+            if (PostMessageW(
+                    target_window,
+                    kLyricsReadyMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(raw_snapshot)) == FALSE) {
+                delete raw_snapshot;
+            }
+        });
+    }
+
+    [[nodiscard]] std::optional<std::size_t> next_audio_lyrics_track(
+        const std::size_t track_index) const
+    {
+        for (std::size_t next = track_index + 1U; next < disc_.tracks.size(); ++next) {
+            if (disc_.tracks[next].is_audio) {
+                return next;
+            }
+        }
+        return std::nullopt;
+    }
+
+    void prefetch_next_lyrics(const std::size_t track_index)
+    {
+        if (lyrics_worker_.joinable()) {
+            return;
+        }
+        const auto next = next_audio_lyrics_track(track_index);
+        if (!next || *next >= lyrics_resolved_.size() || lyrics_resolved_[*next]) {
+            return;
+        }
+        lyrics_pending_track_ = *next;
+        start_lyrics_lookup();
+    }
+
+    void ensure_lyrics_for_selected_track()
+    {
+        if (selected_track_ >= disc_.tracks.size() ||
+            !disc_.tracks[selected_track_].is_audio) {
+            lyrics_.reset();
+            lyrics_track_index_ = std::numeric_limits<std::size_t>::max();
+            return;
+        }
+        if (lyrics_documents_.size() != disc_.tracks.size() ||
+            lyrics_resolved_.size() != disc_.tracks.size()) {
+            lyrics_documents_.assign(disc_.tracks.size(), std::nullopt);
+            lyrics_resolved_.assign(disc_.tracks.size(), false);
+        }
+        if (lyrics_resolved_[selected_track_]) {
+            if (lyrics_track_index_ != selected_track_) {
+                lyrics_ = lyrics_documents_[selected_track_];
+                lyrics_track_index_ = selected_track_;
+            }
+            prefetch_next_lyrics(selected_track_);
+            return;
+        }
+        lyrics_.reset();
+        lyrics_track_index_ = std::numeric_limits<std::size_t>::max();
+        lyrics_pending_track_ = selected_track_;
+        start_lyrics_lookup();
+    }
+
+    void invalidate_lyrics()
+    {
+        ++lyrics_generation_;
+        lyrics_.reset();
+        lyrics_track_index_ = std::numeric_limits<std::size_t>::max();
+        lyrics_documents_.assign(disc_.tracks.size(), std::nullopt);
+        lyrics_resolved_.assign(disc_.tracks.size(), false);
+        lyrics_pending_track_ = selected_track_ < disc_.tracks.size() &&
+                disc_.tracks[selected_track_].is_audio
+            ? selected_track_
+            : std::numeric_limits<std::size_t>::max();
+        start_lyrics_lookup();
+    }
+
+    void receive_lyrics(std::unique_ptr<LyricsSnapshot> snapshot)
+    {
+        if (lyrics_worker_.joinable()) {
+            lyrics_worker_.join();
+        }
+        const bool current_generation = snapshot->generation == lyrics_generation_;
+        const bool selected_result = snapshot->track_index == selected_track_;
+        if (current_generation && snapshot->track_index < lyrics_resolved_.size()) {
+            lyrics_resolved_[snapshot->track_index] = true;
+            lyrics_documents_[snapshot->track_index] = std::move(snapshot->lyrics);
+            if (selected_result) {
+                lyrics_ = lyrics_documents_[snapshot->track_index];
+                lyrics_track_index_ = snapshot->track_index;
+            }
+            if (lyrics_documents_[snapshot->track_index]) {
+                const auto& document = *lyrics_documents_[snapshot->track_index];
+                diagnostics_.record(
+                    L"lyrics",
+                    std::format(
+                        L"loaded track={} source={} lines={} word-timed={}",
+                        static_cast<unsigned int>(
+                            disc_.tracks[snapshot->track_index].number),
+                        document.source,
+                        document.lines.size(),
+                        document.has_word_timing ? 1 : 0));
+            }
+            if (lyrics_pending_track_ == snapshot->track_index) {
+                lyrics_pending_track_ = std::numeric_limits<std::size_t>::max();
+            }
+        }
+        if (lyrics_pending_track_ < disc_.tracks.size() &&
+            lyrics_pending_track_ < lyrics_resolved_.size() &&
+            !lyrics_resolved_[lyrics_pending_track_]) {
+            start_lyrics_lookup();
+        } else if (!current_generation ||
+                   (selected_track_ < lyrics_resolved_.size() &&
+                    !lyrics_resolved_[selected_track_])) {
+            lyrics_pending_track_ = selected_track_;
+            start_lyrics_lookup();
+        } else if (selected_result) {
+            prefetch_next_lyrics(selected_track_);
+        }
         InvalidateRect(window_, nullptr, FALSE);
     }
 
@@ -5861,9 +6415,18 @@ private:
     ComPtr<IDWriteTextFormat> small_format_;
     ComPtr<IDWriteTextFormat> caption_format_;
     ComPtr<IDWriteTextFormat> icon_format_;
+    ComPtr<IDWriteTextFormat> lyric_format_;
+    ComPtr<IDWriteTextFormat> lyric_translation_format_;
     DiscSnapshot disc_;
     std::jthread disc_worker_;
     std::jthread metadata_worker_;
+    std::jthread lyrics_worker_;
+    std::optional<core::LyricsDocument> lyrics_;
+    std::vector<std::optional<core::LyricsDocument>> lyrics_documents_;
+    std::vector<bool> lyrics_resolved_;
+    std::uint64_t lyrics_generation_{};
+    std::size_t lyrics_track_index_{std::numeric_limits<std::size_t>::max()};
+    std::size_t lyrics_pending_track_{std::numeric_limits<std::size_t>::max()};
     std::uint64_t disc_generation_{};
     bool disc_loading_{};
     Layout layout_{};

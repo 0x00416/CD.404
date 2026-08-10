@@ -4,11 +4,13 @@ target_sources(
     cd404_core
     PRIVATE
         src/cd_time.cpp
+        src/lyrics.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
         FILES
             include/cd404/core/cd_time.hpp
+            include/cd404/core/lyrics.hpp
             include/cd404/core/version.hpp
 )
 

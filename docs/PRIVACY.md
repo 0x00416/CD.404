@@ -11,6 +11,8 @@ Windows 音频设备，不会上传音频样本。
   以不可读 TOC 哈希为键的播放位置。
 - `%LOCALAPPDATA%\CD.404\metadata\`：按 TOC 键保存的专辑/曲目元数据、字段来源、
   用户修订和发行版选择。封面缓存来自 Cover Art Archive。
+- `%LOCALAPPDATA%\CD.404\Cache\lyrics\`：按查询摘要保存已匹配并解析的歌词、翻译和
+  时间戳，避免重复请求。文件不包含账户 Token 或音频样本。
 - `%LOCALAPPDATA%\CD.404\listenbrainz.db`：待同步正式播放记录、重试状态和不可逆账户
   指纹；数据库不保存 Token。
 - Windows 凭据管理器的 `CD.404/ListenBrainz`：仅在用户主动配置时保存 User Token。
@@ -21,9 +23,13 @@ Windows 音频设备，不会上传音频样本。
 ## 网络请求
 
 启用相应功能时，应用会直接连接 MusicBrainz/Cover Art Archive、GnuDB、Apple iTunes
-Search API 和 ListenBrainz。元数据请求发送由光盘 TOC/Disc ID 推导的标识、轨数/时长
+Search API、LRCLIB、网易云音乐、QQ 音乐、酷狗音乐和 ListenBrainz。元数据请求发送由光盘 TOC/Disc ID 推导的标识、轨数/时长
 及已有专辑、艺术家和曲目查询词；封面请求发送 MusicBrainz 发行版或发行组 ID。内容关联
-只在精确发行匹配失败且已有可信文本元数据时执行。ListenBrainz 请求只在
+只在精确发行匹配失败且已有可信文本元数据时执行。歌词匹配会向上述歌词服务发送当前
+曲名、艺术家、专辑和时长；当歌词来源没有简体中文译文时，原文歌词行会批量发送到
+Microsoft Edge 翻译服务生成双语字幕。上述请求不发送音频、Disc ID、ListenBrainz Token
+或用户账户信息，生成的译文随歌词保存在本地缓存中。
+ListenBrainz 请求只在
 用户配置 Token 且开启上报后发送曲名、艺术家、专辑、时长、起播时间和可用 MBID。
 各服务会按其隐私政策处理 IP 地址和请求内容。关闭 ListenBrainz 上报不会影响播放。
 

@@ -13,9 +13,11 @@ target_sources(
         src/listenbrainz_credentials.cpp
         src/listenbrainz_reporter.cpp
         src/listenbrainz_queue.cpp
+        src/lyrics_codecs.cpp
         src/metadata_store.cpp
         src/musicbrainz_client.cpp
         src/online_metadata.cpp
+        src/online_lyrics.cpp
         src/raw_cdda_sector_source.cpp
         src/system_media_controls.cpp
         src/user_settings.cpp
@@ -33,9 +35,11 @@ target_sources(
             include/cd404/platform/windows/itunes_client.hpp
             include/cd404/platform/windows/listenbrainz_reporter.hpp
             include/cd404/platform/windows/listenbrainz_queue.hpp
+            include/cd404/platform/windows/lyrics_codecs.hpp
             include/cd404/platform/windows/metadata_store.hpp
             include/cd404/platform/windows/musicbrainz_client.hpp
             include/cd404/platform/windows/online_metadata.hpp
+            include/cd404/platform/windows/online_lyrics.hpp
             include/cd404/platform/windows/raw_cdda_sector_source.hpp
             include/cd404/platform/windows/system_media_controls.hpp
             include/cd404/platform/windows/user_settings.hpp
@@ -53,6 +57,7 @@ target_link_libraries(
     PRIVATE
         kernel32
         advapi32
+        crypt32
         ole32
         propsys
         shell32
