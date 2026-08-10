@@ -42,12 +42,19 @@ struct DiscSnapshot final {
         platform::windows::MetadataSource::unknown};
     std::wstring release_mbid;
     std::wstring release_group_mbid;
+    std::wstring reference_release_mbid;
+    std::wstring reference_release_group_mbid;
     std::vector<std::wstring> metadata_sources;
+    std::wstring cddb_category{L"misc"};
+    std::wstring cddb_year;
+    unsigned int cddb_revision{};
     std::vector<platform::windows::MetadataReleaseCandidate> release_candidates;
     std::wstring selected_release_id;
     std::filesystem::path cover_art_path;
+    std::wstring cover_art_source;
     std::wstring status;
     bool has_cd_text{};
+    bool has_user_metadata{};
     bool has_optical_drive{};
 };
 

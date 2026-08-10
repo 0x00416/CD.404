@@ -42,6 +42,21 @@ namespace detail {
 
 using ::cd404::platform::windows::HttpResponse;
 
+[[nodiscard]] HttpResponse http_get(
+    std::wstring_view host,
+    unsigned short port,
+    bool secure,
+    std::wstring_view path,
+    std::wstring_view headers = {},
+    std::size_t maximum_response_bytes = 2U * 1'024U * 1'024U);
+[[nodiscard]] HttpResponse http_post(
+    std::wstring_view host,
+    unsigned short port,
+    bool secure,
+    std::wstring_view path,
+    std::wstring_view headers,
+    std::span<const std::uint8_t> body,
+    std::size_t maximum_response_bytes = 2U * 1'024U * 1'024U);
 [[nodiscard]] HttpResponse https_get(
     std::wstring_view host,
     std::wstring_view path,

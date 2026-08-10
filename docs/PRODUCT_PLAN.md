@@ -260,20 +260,23 @@ Track
 3. CD-TEXT。
 4. MusicBrainz 精确 Disc ID 或高置信 TOC 结果。
 5. GnuDB/CDDB 精确结果。
-6. 通过音轨结构和时长校验的 iTunes 结果。
-7. TOC 生成的占位数据，如 `Track 01`。
+6. 由 GnuDB/CD-TEXT 文本与逐轨时长校验得到的 MusicBrainz 内容关联。
+7. 通过音轨结构和时长校验的 iTunes 结果。
+8. TOC 生成的占位数据，如 `Track 01`。
 
-封面以 MusicBrainz Release MBID 查询 Cover Art Archive，缓存 1200 像素缩略图并由界面按显示尺寸高质量缩小。
+封面以 MusicBrainz Release/Release Group MBID 或 GnuDB `Artid` 查询 Cover Art Archive，缓存 1200 像素缩略图并由界面按显示尺寸高质量缩小。图片保持原始宽高比，不放入固定方形容器。
 
 ### 8.2 查询过程
 
 1. 从 TOC 生成 MusicBrainz 查询参数、GnuDB/CDDB Disc ID 和标准 TOC 指纹。
 2. 并行查询 MusicBrainz 与 GnuDB；GnuDB 按协议先执行 `query`，再对精确命中执行 `read`。
 3. MusicBrainz 获取发行版、介质、曲目、录音、艺术家和所需 MBID，并对候选结果评分。
-4. 合并 CD-TEXT 与高置信在线结果，获得可信的专辑/艺术家查询种子。
-5. 查询 iTunes 专辑及曲目；只有专辑、艺术家、音轨数、编号和 TOC 时长差均通过校验才采用。
-6. 不同来源仅补全当前仍为空的字段，唯一高置信候选自动采用，否则由用户选择。
-7. 保存选择与 TOC 指纹的绑定。
+4. 精确/TOC 匹配失败但 GnuDB 命中时，按专辑名搜索 MusicBrainz，再用曲名与时长做不依赖曲序的全局映射；歧义结果不自动采用。
+5. 内容关联只使用 recording 与 artist 身份，参考发行不冒充当前实体发行，不提供 ListenBrainz release MBID。
+6. 合并 CD-TEXT 与高置信在线结果，获得可信的专辑/艺术家查询种子。
+7. 查询 iTunes 专辑及曲目；只有专辑、艺术家、音轨数、编号和 TOC 时长差均通过校验才采用。
+8. 不同来源仅补全当前仍为空的字段，唯一高置信候选自动采用，否则由用户选择。
+9. 保存选择与 TOC 指纹的绑定。
 
 MusicBrainz 请求必须使用包含应用名和版本的有效 User-Agent，并由全局限速器确保不超过官方服务要求。GnuDB 使用 HTTPS CGI、包含客户端 `hello` 标识并请求协议 6 UTF-8。iTunes 请求按官方建议限速和缓存；不使用其宣传图作为播放器封面。所有来源的 HTTP 缓存、退避和取消必须集中实现。
 
@@ -287,9 +290,10 @@ MusicBrainz 请求必须使用包含应用名和版本的有效 User-Agent，并
 - 用户地区和语言偏好。
 - 发行国家、日期、标签和条码。
 - 具体介质是否具有对应 Disc ID。
+- 不同曲序下逐轨曲名与时长的最优一对一映射，以及次优候选的歧义间距。
 - 是否有正面封面。
 
-不得仅凭专辑名称自动选择发行版。
+不得仅凭专辑名称自动选择发行版。内容关联得到的 release/release-group 只能作为页面和封面的参考身份；只有物理 Disc ID/TOC 发行匹配可以作为当前光盘的发行身份。
 
 ### 8.4 字段级来源与合并
 
@@ -313,6 +317,14 @@ MetadataValue
 - API 错误保存简短状态，不阻塞 UI。
 - 手动刷新才忽略正常缓存有效期。
 - 数据库结构使用显式版本和迁移脚本。
+
+### 8.6 CDDB/freedb 编辑与提交
+
+- 默认使用 `gnudb.gnudb.org` 的 protocol 6 HTTP(S) CGI，用户可自定义兼容服务器或关闭数据源。
+- 用户修订按 TOC 指纹保存，并在后续在线结果到达时保持优先级。
+- 上传不得自动发生；先提供 `Submit-Mode: test` 校验，正式 `submit` 前再次向用户确认数据和邮箱的外发。
+- 仅生成 UTF-8 xmcd，保留 Disc ID、轨道偏移、盘长和修订号，遵守每行 256 字节上限。
+- 拒绝完全未编辑的数据、空专辑/艺术家/曲名、无效分类和播放器自动生成的占位曲名。
 
 ## 9. ListenBrainz 集成
 

@@ -148,6 +148,16 @@ std::wstring encode_user_settings(const UserSettings& settings)
     root.Insert(
         L"audio_allow_shared_fallback",
         JsonValue::CreateBooleanValue(settings.audio_allow_shared_fallback));
+    root.Insert(
+        L"cddb_enabled",
+        JsonValue::CreateBooleanValue(settings.cddb_enabled));
+    root.Insert(
+        L"cddb_server",
+        JsonValue::CreateStringValue(
+            settings.cddb_server.empty() ? kDefaultCddbServer : settings.cddb_server));
+    root.Insert(
+        L"cddb_email",
+        JsonValue::CreateStringValue(settings.cddb_email));
 
     JsonObject positions;
     for (const auto& [disc_key, position] : settings.playback_positions) {
@@ -166,6 +176,39 @@ std::wstring encode_user_settings(const UserSettings& settings)
         positions.Insert(disc_key, entry);
     }
     root.Insert(L"playback_positions", positions);
+
+    JsonObject metadata_overrides;
+    for (const auto& [disc_key, metadata] : settings.metadata_overrides) {
+        if (disc_key.empty() || metadata.album_title.empty() ||
+            metadata.album_artist.empty() || metadata.track_titles.empty() ||
+            metadata.track_titles.size() > 99U ||
+            (!metadata.track_artists.empty() &&
+             metadata.track_artists.size() != metadata.track_titles.size())) {
+            continue;
+        }
+        JsonObject entry;
+        entry.Insert(L"album_title", JsonValue::CreateStringValue(metadata.album_title));
+        entry.Insert(L"album_artist", JsonValue::CreateStringValue(metadata.album_artist));
+        entry.Insert(
+            L"category",
+            JsonValue::CreateStringValue(
+                metadata.category.empty() ? L"misc" : metadata.category));
+        entry.Insert(L"year", JsonValue::CreateStringValue(metadata.year));
+        entry.Insert(
+            L"revision",
+            JsonValue::CreateNumberValue(metadata.revision));
+        JsonArray titles;
+        JsonArray artists;
+        for (std::size_t index = 0; index < metadata.track_titles.size(); ++index) {
+            titles.Append(JsonValue::CreateStringValue(metadata.track_titles[index]));
+            artists.Append(JsonValue::CreateStringValue(
+                metadata.track_artists.empty() ? L"" : metadata.track_artists[index]));
+        }
+        entry.Insert(L"track_titles", titles);
+        entry.Insert(L"track_artists", artists);
+        metadata_overrides.Insert(disc_key, entry);
+    }
+    root.Insert(L"metadata_overrides", metadata_overrides);
     return root.Stringify().c_str();
 }
 
@@ -202,6 +245,21 @@ UserSettings decode_user_settings(const std::wstring& json) noexcept
         settings.audio_allow_shared_fallback = root.GetNamedBoolean(
             L"audio_allow_shared_fallback",
             false);
+        settings.cddb_enabled = root.GetNamedBoolean(
+            L"cddb_enabled",
+            settings.cddb_enabled);
+        settings.cddb_server = root.GetNamedString(
+            L"cddb_server",
+            kDefaultCddbServer).c_str();
+        if (settings.cddb_server.empty() || settings.cddb_server.size() > 512U ||
+            settings.cddb_server.find_first_of(L"\r\n\t") != std::wstring::npos) {
+            settings.cddb_server = kDefaultCddbServer;
+        }
+        settings.cddb_email = root.GetNamedString(L"cddb_email", L"").c_str();
+        if (settings.cddb_email.size() > 320U ||
+            settings.cddb_email.find_first_of(L"\r\n\t") != std::wstring::npos) {
+            settings.cddb_email.clear();
+        }
 
         const JsonObject positions = root.GetNamedObject(
             L"playback_positions",
@@ -226,6 +284,48 @@ UserSettings decode_user_settings(const std::wstring& json) noexcept
                     static_cast<unsigned int>(track),
                     static_cast<core::SampleFrame>(offset),
                 });
+        }
+
+        const JsonObject metadata_overrides = root.GetNamedObject(
+            L"metadata_overrides",
+            JsonObject{});
+        for (const auto& pair : metadata_overrides) {
+            const std::wstring key = pair.Key().c_str();
+            if (key.empty() || pair.Value().ValueType() != JsonValueType::Object) {
+                continue;
+            }
+            const JsonObject entry = pair.Value().GetObject();
+            SavedDiscMetadata metadata;
+            metadata.album_title = entry.GetNamedString(L"album_title", L"").c_str();
+            metadata.album_artist = entry.GetNamedString(L"album_artist", L"").c_str();
+            metadata.category = entry.GetNamedString(L"category", L"misc").c_str();
+            metadata.year = entry.GetNamedString(L"year", L"").c_str();
+            const double revision = entry.GetNamedNumber(L"revision", 0);
+            if (std::isfinite(revision) && revision >= 0 &&
+                revision <= static_cast<double>(std::numeric_limits<unsigned int>::max())) {
+                metadata.revision = static_cast<unsigned int>(revision);
+            }
+            const JsonArray titles = entry.GetNamedArray(L"track_titles", JsonArray{});
+            const JsonArray artists = entry.GetNamedArray(L"track_artists", JsonArray{});
+            if (titles.Size() == 0U || titles.Size() > 99U ||
+                (artists.Size() != 0U && artists.Size() != titles.Size())) {
+                continue;
+            }
+            bool valid = !metadata.album_title.empty() && !metadata.album_artist.empty();
+            for (std::uint32_t index = 0; valid && index < titles.Size(); ++index) {
+                if (titles.GetAt(index).ValueType() != JsonValueType::String ||
+                    (artists.Size() != 0U &&
+                     artists.GetAt(index).ValueType() != JsonValueType::String)) {
+                    valid = false;
+                    break;
+                }
+                metadata.track_titles.emplace_back(titles.GetStringAt(index).c_str());
+                metadata.track_artists.emplace_back(
+                    artists.Size() == 0U ? L"" : artists.GetStringAt(index).c_str());
+            }
+            if (valid) {
+                settings.metadata_overrides.emplace(key, std::move(metadata));
+            }
         }
     } catch (const winrt::hresult_error&) {
         return UserSettings{};

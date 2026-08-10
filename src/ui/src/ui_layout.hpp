@@ -31,8 +31,29 @@ struct Layout final {
     D2D1_RECT_F settings_clear{};
     D2D1_RECT_F settings_listenbrainz_toggle{};
     D2D1_RECT_F settings_queue_clear{};
+    D2D1_RECT_F settings_cddb_card{};
+    D2D1_RECT_F settings_cddb_server_edit{};
+    D2D1_RECT_F settings_cddb_email_edit{};
+    D2D1_RECT_F settings_cddb_save{};
+    D2D1_RECT_F settings_cddb_toggle{};
+    D2D1_RECT_F metadata_button{};
+    D2D1_RECT_F metadata_page{};
+    D2D1_RECT_F metadata_back{};
+    D2D1_RECT_F metadata_album_title_edit{};
+    D2D1_RECT_F metadata_album_artist_edit{};
+    D2D1_RECT_F metadata_category_edit{};
+    D2D1_RECT_F metadata_year_edit{};
+    D2D1_RECT_F metadata_track_list{};
+    D2D1_RECT_F metadata_track_title_edit{};
+    D2D1_RECT_F metadata_track_artist_edit{};
+    D2D1_RECT_F metadata_save{};
+    D2D1_RECT_F metadata_test_submit{};
+    D2D1_RECT_F metadata_submit{};
 };
 
-[[nodiscard]] Layout calculate_layout(float width, float height) noexcept;
+[[nodiscard]] Layout calculate_layout(
+    float width,
+    float height,
+    float settings_scroll_offset = 0.0F) noexcept;
 
 } // namespace cd404::ui::detail

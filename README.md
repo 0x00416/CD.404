@@ -48,7 +48,8 @@ CD.404 是一款面向 Windows 10/11 的轻量原生 CD 播放器，目标是提
 - 按光盘 TOC 记忆当前曲目和精确采样帧位置，并持久化音量。
 - ListenBrainz `playing_now` 和符合“半曲或 4 分钟取较短者”规则的 `single` 上报。
 - ListenBrainz Token 在线验证、账户状态、SQLite 离线队列及速率限制感知重试。
-- CD-TEXT、MusicBrainz、GnuDB 与 iTunes 多源元数据补全，并显示本次实际命中的来源。
+- CD-TEXT、MusicBrainz、CDDB/freedb 与 iTunes 多源元数据补全，并显示本次实际命中的来源。
+- CDDB/freedb 默认使用 `gnudb.gnudb.org`，可自定义服务器或关闭；支持本地元数据编辑、服务器测试校验和用户确认后的正式上传。
 - 基础自动测试。
 
 ## 构建
@@ -103,9 +104,11 @@ ctest --preset ninja-msvc-debug
 界面跟随 Windows 应用浅色/深色主题和系统高对比度颜色，并在主题变化时即时重建资源。
 窗口通过 MSAA 暴露随所选曲目更新的可访问名称；所有主要播放和设置操作都有键盘入口，
 按 `F1` 可打开由屏幕阅读器直接读取的原生快捷键帮助。
-元数据优先使用光盘内嵌 CD-TEXT；后台先按标准 MusicBrainz Disc ID 精确查询，未关联时才使用 TOC 模糊后备，同时并行查询 GnuDB，再以可信的专辑/艺术家结果查询 iTunes。多个 MusicBrainz 发行版可按 `M` 切换并按光盘记忆。专辑下方每个来源胶囊只显示一个本次实际命中的获取来源，例如 `CD-TEXT`、`MusicBrainz`、`GnuDB` 或 `iTunes`；空间不足时自动换行。`F2`/`Shift+F2` 可修订当前曲目，`Ctrl+F2`/`Ctrl+Shift+F2` 可修订专辑，编辑提示会显示当前字段来源；用户值不会被刷新覆盖。文本元数据使用当前用户目录下的版本化持久缓存支持离线启动；正面封面仅使用 Cover Art Archive 的 1200px 缩略图，不会写入仓库，也不会下载或复用 iTunes 宣传图。
+元数据优先使用光盘内嵌 CD-TEXT；后台先按标准 MusicBrainz Disc ID 精确查询，未关联时才使用 TOC 模糊后备，同时按设置查询 CDDB/freedb，再以可信的专辑/艺术家结果查询 iTunes，并通过音轨数、编号和 TOC 时长差严格校验后补全空字段。多个 MusicBrainz 发行版可按 `M` 切换并按光盘记忆。CDDB/freedb 默认以 HTTPS 连接 `gnudb.gnudb.org`，设置页可更换兼容服务器，也可完全关闭；出于旧服务兼容性允许 `http://`，但会明文传输 CDDB 邮箱和元数据。专辑下方每个来源胶囊只显示一个本次实际命中的服务。用户修订不会被刷新覆盖，文本元数据使用当前用户目录下的版本化持久缓存支持离线启动；正面封面仅使用 Cover Art Archive 的 1200px 缩略图，不会写入仓库，也不会下载或复用 iTunes 宣传图。
 
-首次启动的音量为 100%。应用会在 `%LOCALAPPDATA%\CD.404\settings.json` 保存音量、ListenBrainz 上报选项，以及按 TOC 区分的光盘播放位置；进度使用 44.1 kHz 采样帧而非整秒记录。播放位置记忆和 Windows 媒体控制始终启用，不在设置页显示。该文件是当前用户的本机配置，不属于仓库内容，也不包含 ListenBrainz Token。
+播放页的“编辑元数据”会打开独立编辑页，可修改专辑名、专辑艺术家、CDDB 分类、年份及每轨曲名/艺术家。“保存到本机”以 TOC 指纹记住结果，换盘后再次插入仍优先使用；不会自动上传。“测试上传”仅请服务器检查 UTF-8 xmcd 内容，“正式上传”会再次弹出确认后才写入配置的公共数据库。上传必须在设置页填写有效邮箱，并且会拒绝未编辑、缺失曲名或仍包含 `Track 01` / `音轨 01` 占位名的提交。
+
+首次启动的音量为 100%。应用会在 `%LOCALAPPDATA%\CD.404\settings.json` 保存音量、ListenBrainz 上报选项、CDDB 服务器/开关/提交邮箱、用户编辑的元数据，以及按 TOC 区分的光盘播放位置；进度使用 44.1 kHz 采样帧而非整秒记录。CDDB 提交邮箱只在用户启用该数据源并发起请求时发送到所配置的服务器。播放位置记忆和 Windows 媒体控制始终启用，不在设置页显示。该文件是当前用户的本机配置，不属于仓库内容，也不包含 ListenBrainz Token。
 
 ## ListenBrainz 配置
 

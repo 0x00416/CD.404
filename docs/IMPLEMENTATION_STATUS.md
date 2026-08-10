@@ -1,6 +1,6 @@
 # 实施状态
 
-> 更新时间：2026-08-09
+> 更新时间：2026-08-10
 
 ## 当前里程碑
 
@@ -38,10 +38,16 @@
 - 实现 Windows CD-TEXT 读取、pack 排序与跨 pack 文本拼接，并将专辑、艺术家和曲名接入界面。
 - 实现 MusicBrainz TOC 模糊匹配、候选版本时长评分和后台元数据补全。
 - MusicBrainz 自动采用要求平均每轨误差不超过 2 秒且任一轨不超过 5 秒；换盘后丢弃上一张盘的迟到结果。
+- 对没有官方实体发行、曲序与官方数字发行不同的自刻盘，支持由 GnuDB 专辑名、逐轨曲名和 TOC 时长驱动的 MusicBrainz 内容关联。匹配采用全局最小代价曲序映射，容忍 `Remix` 修饰和小幅拼写误差，并在候选近似同分但 recording 身份不同时拒绝自动采用。
+- 内容关联仅写入按当前光盘曲序重排后的 recording/artist MBID；参考 release/release-group MBID 单独保存，不作为当前实体介质身份，也不随 ListenBrainz 上报。只有 Disc ID/TOC 发行匹配才提供 release 与 release-specific track MBID。
 - 实现 GnuDB/CDDB Disc ID 计算、HTTPS `query`/`read` 两阶段查询和协议 6 UTF-8 xmcd 解析；仅采用精确匹配结果。
+- 将 CDDB/freedb 查询扩展为可配置服务：默认 `gnudb.gnudb.org`，支持 HTTP/HTTPS、自定义端口和 CGI 路径，设置页可关闭整个数据源。
+- 新增独立元数据编辑页；修改按 TOC 指纹保存并优先于后台补全，可编辑专辑、艺术家、分类、年份和每轨字段。
+- 实现 CDDB/freedb HTTP POST 提交：支持服务器 `test` 校验与二次确认后的 `submit`，生成符合 256 字节行限制的 UTF-8 xmcd，拒绝未编辑、缺少必需字段和占位曲名。
 - 实现 iTunes 专辑及曲目查询，并以专辑/艺术家、音轨数、编号和 TOC 时长差做保守校验。
 - 实现 MusicBrainz 与 GnuDB 并行查询、iTunes 条件补全的在线元数据聚合器；界面显示实际命中的来源。
 - 接入 Cover Art Archive 1200px 正面封面，并通过 WIC 圆角渲染和本地应用数据缓存复用。
+- 封面依次尝试匹配发行、参考发行组以及 GnuDB 条目中的 `Artid`；`Artid` 仅按合法 MusicBrainz UUID 访问 Cover Art Archive，来源在模型中保留。无新封面时清空旧盘位图，不沿用上一张盘。
 - 原始 CDDA 读取改用 Windows 重叠 I/O，取消时通过 `CancelIoEx` 中断待处理读取。
 - WASAPI 输出改为预填后显式启动，正常 EOS 才排空，取消和错误直接停止。
 - 消费端检查 WASAPI padding；非 EOS 状态耗尽端点缓冲会记录为欠载失败。
@@ -123,10 +129,10 @@
 - MSVC Debug 构建成功。
 - `make release` 可完成 Release 配置、全量/增量构建和测试；已验证中文 MSVC
   环境下修改公共头文件会正确触发所有依赖目标重编译。
-- CTest：2/2 测试程序通过。平台无关测试覆盖时间转换、边界、溢出、TOC、GnuDB、
+- CTest：2/2 测试程序通过。平台无关测试覆盖时间转换、边界、溢出、TOC、GnuDB Disc ID/xmcd 解析与提交生成、
   xmcd、CDDA 重试/短读/取消/重叠策略、播放状态机、PCM16 音量和 ListenBrainz 阈值；
   Windows 测试覆盖播放结果语义、无设备访问的请求边界、音量边界、用户设置往返与
-  损坏文件回退、SMTC 安全降级、ListenBrainz 两类 JSON 载荷契约及全部诊断枚举名称。
+  损坏文件回退、CDDB 服务器/邮箱校验、`test`/`submit` 请求契约、SMTC 安全降级、ListenBrainz 两类 JSON 载荷契约及全部诊断枚举名称。
 - 2026-08-09 阶段 1 回归：先加入失败测试，确认恢复协调器和错误分类接口缺失；实现后 `make release` 构建成功，CTest 2/2 通过。新增测试覆盖刷新事件合并、同盘唤醒续播、换盘/暂停态禁止自动续播、默认端点单次重试与防循环、WASAPI/介质错误分类、光学卷与电源消息分类。
 - 2026-08-09 阶段 2 回归：先加入失败测试，确认会话定位 API 和连续区间规划器缺失；实现后相关测试与 `make release` 通过。新增测试覆盖向前/向后切轨规划、数据轨拒绝、跨数据轨显式回退、曲尾越界，以及 128 次跨边界抖动定位；每次均验证旧环形缓冲归零和目标起连续三帧无丢失、重复或插入。
 - 2026-08-09 阶段 3 回归：先加入失败测试，确认输出策略、格式协商和持久设置接口缺失；实现后 `make release` 构建成功，CTest 2/2 通过。假后端覆盖共享默认、精确独占、格式不支持、独占占用、显式共享回退和所选端点失效；设置测试覆盖端点 ID、独占开关、回退开关和安全默认值。
@@ -170,6 +176,7 @@
   同一个 CDDA 连续流和 WASAPI 会话。
 - 使用实体 9 音轨 CD 验证在线链路：MusicBrainz 与 iTunes 均成功匹配同一专辑；GnuDB 服务请求成功，但该光盘没有条目，未产生错误补全。
 - 使用无 CD-TEXT 的 9 音轨 Märchen EP 刻录盘复测误匹配：MusicBrainz 返回候选平均每轨误差 22.2 秒、最大 47.1 秒，现已按阈值拒绝，不再显示错误专辑。
+- 使用无 CD-TEXT、GnuDB Disc ID `6506c88d` 的 8 音轨自刻盘验证内容关联：GnuDB 返回 `Re:BPM15Q by TeddyLoid`，MusicBrainz 官方数字发行 `dfe4a55b-d323-41c8-9d31-4e3347efd21c` 的曲序被映射为当前盘的 `1, 8, 2, 3, 4, 5, 6, 7`；下载得到正确的 1200px 封面。官方 API 字段、重排、错误时长拒绝和歧义拒绝均有确定性测试覆盖；完整 `make release` 与 CTest 2/2 通过。
 
 受限自动化环境可能阻止 MSBuild FileTracker 访问部分系统资源；遇到这种情况可使用 Ninja/MSVC 预设。该限制不影响普通开发终端使用 Visual Studio 生成器预设。
 

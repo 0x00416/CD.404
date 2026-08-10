@@ -5,6 +5,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 namespace cd404::platform::windows {
 
@@ -17,6 +18,18 @@ struct SavedPlaybackPosition final {
     core::SampleFrame offset_frames{};
 };
 
+inline constexpr wchar_t kDefaultCddbServer[] = L"gnudb.gnudb.org";
+
+struct SavedDiscMetadata final {
+    std::wstring album_title;
+    std::wstring album_artist;
+    std::wstring category{L"misc"};
+    std::wstring year;
+    std::vector<std::wstring> track_titles;
+    std::vector<std::wstring> track_artists;
+    unsigned int revision{};
+};
+
 struct UserSettings final {
     float volume{1.0F};
     bool listenbrainz_reporting_enabled{true};
@@ -24,7 +37,11 @@ struct UserSettings final {
     std::wstring audio_endpoint_id;
     bool audio_exclusive_mode{};
     bool audio_allow_shared_fallback{};
+    bool cddb_enabled{true};
+    std::wstring cddb_server{kDefaultCddbServer};
+    std::wstring cddb_email;
     std::map<std::wstring, SavedPlaybackPosition> playback_positions;
+    std::map<std::wstring, SavedDiscMetadata> metadata_overrides;
 };
 
 // Stable TOC-derived key used only for local resume state. It does not contain

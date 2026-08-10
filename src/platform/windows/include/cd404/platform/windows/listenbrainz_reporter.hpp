@@ -25,6 +25,10 @@ namespace cd404::platform::windows {
 // removes the saved credential. No token is written to an application file.
 [[nodiscard]] bool save_listenbrainz_token(std::wstring_view token) noexcept;
 
+// Returns only the number of characters in the effective credential. The
+// token itself remains in Windows Credential Manager or the process environment.
+[[nodiscard]] std::size_t listenbrainz_token_character_count() noexcept;
+
 enum class ListenBrainzState {
     disabled,
     token_missing,

@@ -399,6 +399,8 @@ void test_gnudb_identity_and_entry()
     constexpr std::string_view response =
         "210 data 12345603 entry follows\r\n"
         "# xmcd database file\r\n"
+        "# Cover: https://coverartarchive.org/release/first/cover.jpg\r\n"
+        "# Artid: 8763f781-57b1-4c84-90da-5cb7180873da\r\n"
         "DTITLE=Various Artists / Example Album\r\n"
         "TTITLE0=Artist One / First Track\r\n"
         "TTITLE1=Artist Two / Second\r\n"
@@ -412,8 +414,77 @@ void test_gnudb_identity_and_entry()
             metadata->track_titles ==
                 std::vector<std::string>{"First Track", "Second Track", "Third Track"} &&
             metadata->track_artists ==
-                std::vector<std::string>{"Artist One", "Artist Two", "Artist Three"},
-        "GnuDB UTF-8 entry joins repeated fields and separates compilation artists");
+                std::vector<std::string>{"Artist One", "Artist Two", "Artist Three"} &&
+            metadata->cover_art_ids == std::vector<std::string>{
+                "8763f781-57b1-4c84-90da-5cb7180873da"} &&
+            metadata->cover_urls == std::vector<std::string>{
+                "https://coverartarchive.org/release/first/cover.jpg"},
+        "GnuDB UTF-8 entry joins fields, separates artists, and keeps cover references");
+
+    if (!toc) {
+        return;
+    }
+    GnudbSubmissionMetadataUtf8 submission;
+    submission.album_title = "M\xC3\xA4rchen";
+    submission.album_artist = "Various Artists";
+    submission.category = "misc";
+    submission.year = "2024";
+    submission.track_titles.resize(toc->tracks().size());
+    submission.track_artists.resize(toc->tracks().size());
+    for (std::size_t index = 0; index < submission.track_titles.size(); ++index) {
+        submission.track_titles[index] = "Song " + std::to_string(index + 1U);
+        submission.track_artists[index] = "Artist " + std::to_string(index + 1U);
+    }
+    submission.track_titles[0] = std::string(400, 'A') + "\\n finale";
+    submission.revision = 3;
+    submission.user_edited = true;
+    GnudbSubmissionError submission_error{};
+    const auto entry = make_gnudb_submission_entry(*toc, submission, submission_error);
+    expect(
+        entry && submission_error == GnudbSubmissionError::none &&
+            entry->disc_id == 0x9a09340dU &&
+            entry->body.find("DISCID=9a09340d\n") != std::string::npos &&
+            entry->body.find("DTITLE=Various Artists / M\xC3\xA4rchen\n") !=
+                std::string::npos &&
+            entry->body.find("# Revision: 3\n") != std::string::npos &&
+            entry->body.find("TTITLE0=Artist 1 / ") != std::string::npos &&
+            entry->body.ends_with("PLAYORDER=\n"),
+        "GnuDB submission builder emits a UTF-8 protocol-level-6 xmcd entry");
+    if (entry) {
+        std::size_t line_start{};
+        bool lines_valid = true;
+        while (line_start < entry->body.size()) {
+            const std::size_t newline = entry->body.find('\n', line_start);
+            if (newline == std::string::npos || newline - line_start + 1U > 256U) {
+                lines_valid = false;
+                break;
+            }
+            line_start = newline + 1U;
+        }
+        expect(lines_valid, "GnuDB submission lines stay within the 256-byte limit");
+    }
+
+    submission.user_edited = false;
+    expect(
+        !make_gnudb_submission_entry(*toc, submission, submission_error) &&
+            submission_error == GnudbSubmissionError::not_edited,
+        "GnuDB submission rejects metadata that the user did not edit");
+    submission.user_edited = true;
+    submission.track_titles[2].clear();
+    expect(
+        !make_gnudb_submission_entry(*toc, submission, submission_error) &&
+            submission_error == GnudbSubmissionError::track_title_missing,
+        "GnuDB submission rejects incomplete track titles");
+    submission.track_titles[2] = "Track 03";
+    expect(
+        !make_gnudb_submission_entry(*toc, submission, submission_error) &&
+            submission_error == GnudbSubmissionError::track_title_missing,
+        "GnuDB submission rejects generated placeholder track titles");
+    expect(
+        is_valid_gnudb_category("classical") &&
+            is_valid_gnudb_category("soundtrack") &&
+            !is_valid_gnudb_category("electronic"),
+        "GnuDB submission accepts only protocol categories");
 }
 
 void test_musicbrainz_disc_id()

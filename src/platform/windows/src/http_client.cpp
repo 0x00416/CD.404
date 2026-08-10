@@ -72,11 +72,34 @@ HttpResponse https_get(
     const std::wstring_view path,
     const std::size_t maximum_response_bytes)
 {
-    return https_get(host, path, {}, maximum_response_bytes);
+    return http_get(
+        host,
+        INTERNET_DEFAULT_HTTPS_PORT,
+        true,
+        path,
+        {},
+        maximum_response_bytes);
 }
 
 HttpResponse https_get(
     const std::wstring_view host,
+    const std::wstring_view path,
+    const std::wstring_view headers,
+    const std::size_t maximum_response_bytes)
+{
+    return http_get(
+        host,
+        INTERNET_DEFAULT_HTTPS_PORT,
+        true,
+        path,
+        headers,
+        maximum_response_bytes);
+}
+
+HttpResponse http_get(
+    const std::wstring_view host,
+    const unsigned short port,
+    const bool secure,
     const std::wstring_view path,
     const std::wstring_view headers,
     const std::size_t maximum_response_bytes)
@@ -86,7 +109,7 @@ HttpResponse https_get(
     }
 
     InternetHandle session(WinHttpOpen(
-        L"CD.404/0.1 (https://github.com/0x00416/CD.404)",
+        L"CD.404/0.2.0 (https://github.com/0x00416/CD.404)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -94,11 +117,11 @@ HttpResponse https_get(
     if (session.get() == nullptr) {
         return {{}, GetLastError(), 0};
     }
-    static_cast<void>(WinHttpSetTimeouts(session.get(), 3'000, 5'000, 5'000, 8'000));
+    static_cast<void>(WinHttpSetTimeouts(session.get(), 3'000, 5'000, 5'000, 15'000));
 
     const std::wstring host_string(host);
     InternetHandle connection(WinHttpConnect(
-        session.get(), host_string.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+        session.get(), host_string.c_str(), port, 0));
     if (connection.get() == nullptr) {
         return {{}, GetLastError(), 0};
     }
@@ -111,7 +134,7 @@ HttpResponse https_get(
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE));
+        secure ? WINHTTP_FLAG_SECURE : 0));
     const std::wstring header_string(headers);
     if (request.get() == nullptr ||
         WinHttpSendRequest(
@@ -179,13 +202,32 @@ HttpResponse https_post(
     const std::span<const std::uint8_t> body,
     const std::size_t maximum_response_bytes)
 {
+    return http_post(
+        host,
+        INTERNET_DEFAULT_HTTPS_PORT,
+        true,
+        path,
+        headers,
+        body,
+        maximum_response_bytes);
+}
+
+HttpResponse http_post(
+    const std::wstring_view host,
+    const unsigned short port,
+    const bool secure,
+    const std::wstring_view path,
+    const std::wstring_view headers,
+    const std::span<const std::uint8_t> body,
+    const std::size_t maximum_response_bytes)
+{
     if (host.empty() || path.empty() || maximum_response_bytes == 0U ||
         body.size() > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
         return {{}, ERROR_INVALID_PARAMETER, 0};
     }
 
     InternetHandle session(WinHttpOpen(
-        L"CD.404/0.1 (https://github.com/0x00416/CD.404)",
+        L"CD.404/0.2.0 (https://github.com/0x00416/CD.404)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -197,7 +239,7 @@ HttpResponse https_post(
 
     const std::wstring host_string(host);
     InternetHandle connection(WinHttpConnect(
-        session.get(), host_string.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+        session.get(), host_string.c_str(), port, 0));
     if (connection.get() == nullptr) {
         return {{}, GetLastError(), 0};
     }
@@ -210,7 +252,7 @@ HttpResponse https_post(
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE));
+        secure ? WINHTTP_FLAG_SECURE : 0));
     const std::wstring header_string(headers);
     if (request.get() == nullptr ||
         WinHttpSendRequest(

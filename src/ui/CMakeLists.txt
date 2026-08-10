@@ -30,11 +30,13 @@ target_link_libraries(
         cd404::windows
     PRIVATE
         d2d1
+        comctl32
         comdlg32
         dwrite
         dwmapi
         user32
         oleacc
+        uxtheme
         windowscodecs
 )
 cd404_set_project_warnings(cd404_ui)

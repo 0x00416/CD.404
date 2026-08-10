@@ -99,4 +99,13 @@ std::wstring load_listenbrainz_token()
 }
 
 } // namespace detail
+
+std::size_t listenbrainz_token_character_count() noexcept
+{
+    try {
+        return detail::load_listenbrainz_token().size();
+    } catch (...) {
+        return 0U;
+    }
+}
 } // namespace cd404::platform::windows

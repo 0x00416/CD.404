@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <uxtheme.h>
 
 #include <d2d1.h>
 #include <d2d1helper.h>
@@ -17,6 +18,7 @@
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
+#include <cd404/platform/windows/gnudb_client.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/online_metadata.hpp>
 #include <cd404/platform/windows/optical_drive.hpp>
@@ -64,9 +66,20 @@ constexpr UINT kSettingsSaveMessage = WM_APP + 5;
 constexpr UINT kSettingsCloseMessage = WM_APP + 6;
 constexpr UINT kMetadataEditSaveMessage = WM_APP + 7;
 constexpr UINT kMetadataEditCloseMessage = WM_APP + 8;
+constexpr UINT kCddbSubmissionReadyMessage = WM_APP + 9;
 constexpr int kSettingsTokenEditId = 1'001;
+constexpr int kSettingsCddbServerEditId = 1'002;
+constexpr int kSettingsCddbEmailEditId = 1'003;
+constexpr int kMetadataAlbumTitleEditId = 1'101;
+constexpr int kMetadataAlbumArtistEditId = 1'102;
+constexpr int kMetadataCategoryEditId = 1'103;
+constexpr int kMetadataYearEditId = 1'104;
+constexpr int kMetadataTrackTitleEditId = 1'105;
+constexpr int kMetadataTrackArtistEditId = 1'106;
 constexpr UINT_PTR kAnimationTimer = 1;
 constexpr UINT kAnimationIntervalMs = 50;
+constexpr UINT_PTR kSettingsScrollSettleTimer = 2;
+constexpr UINT kSettingsScrollSettleDelayMs = 150;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmWindowCornerPreference = 33;
 constexpr DWORD kDwmSystemBackdropType = 38;
@@ -75,6 +88,8 @@ constexpr float kDesignWidth = 1'100.0F;
 constexpr float kDesignHeight = 760.0F;
 constexpr float kMinimumWidth = 840.0F;
 constexpr float kMinimumHeight = 600.0F;
+constexpr float kSettingsContentTop = 140.0F;
+constexpr float kSettingsContentBottom = 736.0F;
 
 [[nodiscard]] D2D1_COLOR_F color(
     const std::uint32_t rgb,
@@ -122,6 +137,173 @@ using detail::DiscSnapshot;
 using detail::OnlineMetadataSnapshot;
 using detail::UiTrack;
 using detail::load_disc_snapshot;
+#if 0 // 合并期间保留的旧内联快照实现；待 CDDB 编辑器拆分时删除。
+[[nodiscard]] std::wstring to_wstring(const std::u16string_view text)
+{
+    std::wstring result;
+    result.reserve(text.size());
+    std::ranges::transform(text, std::back_inserter(result), [](const char16_t character) {
+        return static_cast<wchar_t>(character);
+    });
+    return result;
+}
+
+[[nodiscard]] std::string to_utf8(const std::wstring_view text)
+{
+    if (text.empty() ||
+        text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        text.data(),
+        static_cast<int>(text.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (required <= 0) {
+        return {};
+    }
+    std::string result(static_cast<std::size_t>(required), '\0');
+    return WideCharToMultiByte(
+               CP_UTF8,
+               WC_ERR_INVALID_CHARS,
+               text.data(),
+               static_cast<int>(text.size()),
+               result.data(),
+               required,
+               nullptr,
+               nullptr) == required
+        ? result
+        : std::string{};
+}
+
+struct UiTrack final {
+    std::uint8_t number{};
+    core::SampleFrame frame_count{};
+    bool is_audio{};
+    bool has_metadata_title{};
+    std::wstring title;
+    std::wstring artist;
+    std::wstring track_mbid;
+    std::wstring recording_mbid;
+    std::vector<std::wstring> artist_mbids;
+};
+
+struct DiscSnapshot final {
+    std::optional<platform::windows::OpticalDrive> drive;
+    std::optional<disc::Toc> toc;
+    std::vector<UiTrack> tracks;
+    core::SampleFrame total_audio_frames{};
+    std::wstring album_title;
+    std::wstring album_artist;
+    std::wstring release_mbid;
+    std::wstring release_group_mbid;
+    std::wstring metadata_source;
+    std::wstring cddb_category{L"misc"};
+    std::wstring cddb_year;
+    unsigned int cddb_revision{};
+    std::filesystem::path cover_art_path;
+    std::wstring status;
+    bool has_cd_text{};
+    bool has_user_metadata{};
+    bool has_optical_drive{};
+};
+
+struct OnlineMetadataSnapshot final {
+    std::optional<platform::windows::OnlineMetadata> metadata;
+    std::uint64_t disc_generation{};
+};
+
+[[nodiscard]] DiscSnapshot load_disc_snapshot()
+{
+    DiscSnapshot snapshot;
+    const auto drives = platform::windows::enumerate_optical_drives();
+    snapshot.has_optical_drive = !drives.empty();
+    if (drives.empty()) {
+        snapshot.status = L"未检测到光驱";
+        return snapshot;
+    }
+
+    unsigned long last_error{};
+    for (const auto& drive : drives) {
+        auto toc_result = platform::windows::read_toc(drive);
+        if (!toc_result.toc) {
+            last_error = toc_result.system_error;
+            continue;
+        }
+
+        snapshot.drive = drive;
+        snapshot.toc = *toc_result.toc;
+        for (const auto& track : toc_result.toc->tracks()) {
+            UiTrack view;
+            view.number = track.number;
+            view.frame_count = track.frame_count;
+            view.is_audio = track.is_audio;
+            view.title = track.is_audio
+                ? std::format(L"音轨 {:02}", track.number)
+                : std::format(L"数据轨 {:02}", track.number);
+            if (track.is_audio) {
+                snapshot.total_audio_frames += track.frame_count;
+            }
+            snapshot.tracks.push_back(std::move(view));
+        }
+
+        const auto cd_text_result = platform::windows::read_cd_text(drive);
+        if (cd_text_result.metadata) {
+            snapshot.has_cd_text = true;
+            snapshot.metadata_source = L"CD-TEXT";
+            snapshot.album_title = to_wstring(cd_text_result.metadata->album_title);
+            snapshot.album_artist = to_wstring(cd_text_result.metadata->album_performer);
+            for (auto& track : snapshot.tracks) {
+                const auto& metadata = cd_text_result.metadata->tracks[track.number];
+                if (!metadata.title.empty()) {
+                    track.title = to_wstring(metadata.title);
+                    track.has_metadata_title = true;
+                }
+                if (!metadata.performer.empty()) {
+                    track.artist = to_wstring(metadata.performer);
+                }
+            }
+        }
+        snapshot.status = std::format(
+            L"已就绪 · {} 首音频轨",
+            std::count_if(
+                snapshot.tracks.begin(),
+                snapshot.tracks.end(),
+                [](const UiTrack& track) { return track.is_audio; }));
+        return snapshot;
+    }
+
+    snapshot.drive = drives.front();
+    snapshot.status = last_error == 0
+        ? L"请插入一张音频 CD"
+        : L"光驱已连接 · 等待音频 CD";
+    return snapshot;
+}
+#endif
+
+[[nodiscard]] std::string to_utf8(const std::wstring_view text)
+{
+    if (text.empty() ||
+        text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (required <= 0) {
+        return {};
+    }
+    std::string result(static_cast<std::size_t>(required), '\0');
+    return WideCharToMultiByte(
+               CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+               result.data(), required, nullptr, nullptr) == required
+        ? result
+        : std::string{};
+}
 
 struct TrackHit final {
     D2D1_RECT_F rectangle{};
@@ -137,6 +319,53 @@ struct ScrollbarGeometry final {
 };
 
 using detail::Layout;
+#if 0 // 合并期间保留的旧内联布局定义；有效布局位于 ui_layout.*。
+struct Layout final {
+    float width{};
+    float height{};
+    D2D1_RECT_F refresh_button{};
+    D2D1_RECT_F eject_button{};
+    D2D1_RECT_F settings_button{};
+    D2D1_RECT_F cover{};
+    D2D1_RECT_F track_list{};
+    D2D1_RECT_F progress_hit{};
+    D2D1_RECT_F previous_button{};
+    D2D1_RECT_F play_button{};
+    D2D1_RECT_F next_button{};
+    D2D1_RECT_F volume_hit{};
+    D2D1_RECT_F settings_page{};
+    D2D1_RECT_F settings_listenbrainz_card{};
+    D2D1_RECT_F settings_back{};
+    D2D1_RECT_F settings_edit{};
+    D2D1_RECT_F settings_save{};
+    D2D1_RECT_F settings_clear{};
+    D2D1_RECT_F settings_listenbrainz_toggle{};
+    D2D1_RECT_F settings_cddb_card{};
+    D2D1_RECT_F settings_cddb_server_edit{};
+    D2D1_RECT_F settings_cddb_email_edit{};
+    D2D1_RECT_F settings_cddb_save{};
+    D2D1_RECT_F settings_cddb_toggle{};
+    D2D1_RECT_F metadata_button{};
+    D2D1_RECT_F metadata_page{};
+    D2D1_RECT_F metadata_back{};
+    D2D1_RECT_F metadata_album_title_edit{};
+    D2D1_RECT_F metadata_album_artist_edit{};
+    D2D1_RECT_F metadata_category_edit{};
+    D2D1_RECT_F metadata_year_edit{};
+    D2D1_RECT_F metadata_track_list{};
+    D2D1_RECT_F metadata_track_title_edit{};
+    D2D1_RECT_F metadata_track_artist_edit{};
+    D2D1_RECT_F metadata_save{};
+    D2D1_RECT_F metadata_test_submit{};
+    D2D1_RECT_F metadata_submit{};
+};
+
+#endif
+
+struct CddbSubmissionSnapshot final {
+    platform::windows::CddbSubmissionResult result;
+    platform::windows::CddbSubmissionMode mode{};
+};
 
 class MainWindow final {
 public:
@@ -160,6 +389,7 @@ public:
     ~MainWindow()
     {
         close_metadata_edit();
+        close_metadata_editor(false);
         close_settings();
         stop_playback();
         user_settings_.volume = volume_;
@@ -175,6 +405,12 @@ public:
     [[nodiscard]] bool create(const int show_command)
     {
         if (FAILED(create_independent_resources())) {
+            return false;
+        }
+        INITCOMMONCONTROLSEX common_controls{};
+        common_controls.dwSize = sizeof(common_controls);
+        common_controls.dwICC = ICC_STANDARD_CLASSES;
+        if (InitCommonControlsEx(&common_controls) == FALSE) {
             return false;
         }
 
@@ -201,7 +437,7 @@ public:
         };
         static_cast<void>(AdjustWindowRectExForDpi(
             &window_rectangle,
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             FALSE,
             0,
             dpi));
@@ -210,7 +446,7 @@ public:
             0,
             kWindowClassName,
             kWindowTitle,
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             window_rectangle.right - window_rectangle.left,
@@ -321,15 +557,34 @@ private:
             return 0;
         case WM_ERASEBKGND:
             return 1;
+        case WM_ENTERSIZEMOVE:
+            cancel_settings_scroll_session();
+            window_resizing_ = true;
+            hide_active_input_controls();
+            return 0;
+        case WM_EXITSIZEMOVE:
+            window_resizing_ = false;
+            finish_input_control_relayout();
+            return 0;
         case WM_SIZE:
+            if (wparam == SIZE_MINIMIZED) {
+                cancel_settings_scroll_session();
+                hide_active_input_controls();
+                return 0;
+            }
+            if (!window_resizing_) {
+                cancel_settings_scroll_session();
+                hide_active_input_controls();
+            }
             if (render_target_) {
                 const auto width = static_cast<UINT32>(LOWORD(lparam));
                 const auto height = static_cast<UINT32>(HIWORD(lparam));
                 static_cast<void>(render_target_->Resize(D2D1::SizeU(width, height)));
             }
-            update_metadata_edit_bounds();
-            update_settings_control_bounds();
             InvalidateRect(window_, nullptr, FALSE);
+            if (!window_resizing_) {
+                finish_input_control_relayout();
+            }
             return 0;
         case WM_DPICHANGED: {
             const auto* suggested = reinterpret_cast<const RECT*>(lparam);
@@ -345,8 +600,10 @@ private:
                 const float dpi = static_cast<float>(HIWORD(wparam));
                 render_target_->SetDpi(dpi, dpi);
             }
-            update_metadata_edit_bounds();
-            update_settings_control_bounds();
+            if (!window_resizing_) {
+                hide_active_input_controls();
+                finish_input_control_relayout();
+            }
             return 0;
         }
         case WM_GETMINMAXINFO: {
@@ -379,8 +636,11 @@ private:
             return 0;
         case WM_MOUSEWHEEL:
             if (active_page_ == AppPage::settings) {
-                handle_settings_dropdown_wheel(
-                    GET_WHEEL_DELTA_WPARAM(wparam));
+                handle_settings_mouse_wheel(GET_WHEEL_DELTA_WPARAM(wparam));
+                return 0;
+            }
+            if (active_page_ == AppPage::metadata_editor) {
+                handle_metadata_mouse_wheel(GET_WHEEL_DELTA_WPARAM(wparam));
                 return 0;
             }
             handle_mouse_wheel(
@@ -392,6 +652,12 @@ private:
             SetFocus(window_);
             if (active_page_ == AppPage::settings) {
                 handle_settings_click(D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))));
+                return 0;
+            }
+            if (active_page_ == AppPage::metadata_editor) {
+                handle_metadata_click(D2D1::Point2F(
                     pixel_to_dip(GET_X_LPARAM(lparam)),
                     pixel_to_dip(GET_Y_LPARAM(lparam))));
                 return 0;
@@ -445,10 +711,14 @@ private:
             break;
         case WM_CTLCOLOREDIT:
             if (reinterpret_cast<HWND>(lparam) == settings_token_edit_ ||
-                reinterpret_cast<HWND>(lparam) == metadata_edit_) {
+                reinterpret_cast<HWND>(lparam) == metadata_edit_ ||
+                reinterpret_cast<HWND>(lparam) == settings_cddb_server_edit_ ||
+                reinterpret_cast<HWND>(lparam) == settings_cddb_email_edit_ ||
+                is_metadata_edit(reinterpret_cast<HWND>(lparam))) {
                 const auto device_context = reinterpret_cast<HDC>(wparam);
                 SetTextColor(device_context, colorref(theme_.text));
                 SetBkColor(device_context, colorref(theme_.elevated));
+                SetBkMode(device_context, OPAQUE);
                 return reinterpret_cast<LRESULT>(settings_edit_brush_);
             }
             break;
@@ -468,6 +738,10 @@ private:
                     reinterpret_cast<const void*>(lparam)));
             return message == WM_POWERBROADCAST ? TRUE : 0;
         case WM_TIMER:
+            if (wparam == kSettingsScrollSettleTimer) {
+                settle_settings_scroll_session();
+                return 0;
+            }
             if (wparam == kAnimationTimer) {
                 update_playback_clock();
                 maybe_persist_playback_position();
@@ -510,8 +784,13 @@ private:
         case kMetadataEditCloseMessage:
             close_metadata_edit();
             return 0;
+        case kCddbSubmissionReadyMessage:
+            receive_cddb_submission(std::unique_ptr<CddbSubmissionSnapshot>(
+                reinterpret_cast<CddbSubmissionSnapshot*>(lparam)));
+            return 0;
         case WM_DESTROY:
             KillTimer(window_, kAnimationTimer);
+            KillTimer(window_, kSettingsScrollSettleTimer);
             persist_playback_position();
             persist_user_settings();
             stop_playback();
@@ -533,11 +812,13 @@ private:
         next,
         progress,
         volume,
+        metadata,
     };
 
     enum class AppPage {
         player,
         settings,
+        metadata_editor,
     };
 
     enum class SettingsDropdown {
@@ -860,6 +1141,208 @@ private:
                 theme_.dark ? 1 : 0,
                 theme_.high_contrast ? 1 : 0));
         InvalidateRect(window_, nullptr, FALSE);
+#if 0 // 旧内联 calculate_layout；布局已合并进 detail::calculate_layout。
+        const auto size = render_target_->GetSize();
+        Layout result;
+        result.width = size.width;
+        result.height = size.height;
+
+        const float margin = size.width < 960.0F ? 20.0F : 24.0F;
+        const float top = 84.0F;
+        const float transport_height = size.height < 680.0F ? 104.0F : 124.0F;
+        const float transport_top = size.height - transport_height;
+        const float left_width = std::clamp(size.width * 0.27F, 240.0F, 300.0F);
+        const float gap = size.width < 960.0F ? 28.0F : 40.0F;
+        const float cover_size = std::min(
+            left_width,
+            std::max(220.0F, transport_top - top - 185.0F));
+        const float cover_top = top + 52.0F;
+
+        result.refresh_button = D2D1::RectF(
+            size.width - 160.0F,
+            12.0F,
+            size.width - 120.0F,
+            52.0F);
+        result.eject_button = D2D1::RectF(
+            size.width - 112.0F,
+            12.0F,
+            size.width - 72.0F,
+            52.0F);
+        result.settings_button = D2D1::RectF(
+            size.width - 64.0F,
+            12.0F,
+            size.width - 24.0F,
+            52.0F);
+        result.cover = D2D1::RectF(
+            margin,
+            cover_top,
+            margin + cover_size,
+            cover_top + cover_size);
+        result.track_list = D2D1::RectF(
+            margin + left_width + gap,
+            top + 52.0F,
+            size.width - margin,
+            transport_top - 12.0F);
+        result.progress_hit = D2D1::RectF(
+            margin,
+            transport_top + 14.0F,
+            size.width - margin,
+            transport_top + 34.0F);
+
+        const float center = size.width * 0.5F;
+        const float controls_y = transport_top + transport_height * 0.57F;
+        result.previous_button = D2D1::RectF(
+            center - 96.0F,
+            controls_y - 20.0F,
+            center - 56.0F,
+            controls_y + 20.0F);
+        result.play_button = D2D1::RectF(
+            center - 28.0F,
+            controls_y - 28.0F,
+            center + 28.0F,
+            controls_y + 28.0F);
+        result.next_button = D2D1::RectF(
+            center + 56.0F,
+            controls_y - 20.0F,
+            center + 96.0F,
+            controls_y + 20.0F);
+        const float volume_right = size.width - 24.0F;
+        const float volume_left = std::max(size.width * 0.77F, volume_right - 164.0F);
+        result.volume_hit = D2D1::RectF(
+            volume_left - 4.0F,
+            controls_y - 16.0F,
+            volume_right + 4.0F,
+            controls_y + 16.0F);
+
+        result.settings_page = D2D1::RectF(
+            margin,
+            84.0F,
+            size.width - margin,
+            size.height - 24.0F);
+        result.settings_back = D2D1::RectF(
+            size.width - margin - 132.0F,
+            88.0F,
+            size.width - margin,
+            128.0F);
+        result.settings_listenbrainz_card = D2D1::RectF(
+            margin,
+            148.0F,
+            size.width - margin,
+            342.0F);
+        result.settings_edit = D2D1::RectF(
+            result.settings_listenbrainz_card.left + 24.0F,
+            result.settings_listenbrainz_card.top + 112.0F,
+            result.settings_listenbrainz_card.right - 224.0F,
+            result.settings_listenbrainz_card.top + 156.0F);
+        result.settings_clear = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 208.0F,
+            result.settings_listenbrainz_card.top + 112.0F,
+            result.settings_listenbrainz_card.right - 112.0F,
+            result.settings_listenbrainz_card.top + 156.0F);
+        result.settings_save = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 104.0F,
+            result.settings_listenbrainz_card.top + 112.0F,
+            result.settings_listenbrainz_card.right - 24.0F,
+            result.settings_listenbrainz_card.top + 156.0F);
+        result.settings_listenbrainz_toggle = D2D1::RectF(
+            result.settings_listenbrainz_card.right - 76.0F,
+            result.settings_listenbrainz_card.top + 22.0F,
+            result.settings_listenbrainz_card.right - 24.0F,
+            result.settings_listenbrainz_card.top + 50.0F);
+        result.settings_cddb_card = D2D1::RectF(
+            margin,
+            358.0F,
+            size.width - margin,
+            size.height - 24.0F);
+        result.settings_cddb_toggle = D2D1::RectF(
+            result.settings_cddb_card.right - 76.0F,
+            result.settings_cddb_card.top + 22.0F,
+            result.settings_cddb_card.right - 24.0F,
+            result.settings_cddb_card.top + 50.0F);
+        result.settings_cddb_server_edit = D2D1::RectF(
+            result.settings_cddb_card.left + 24.0F,
+            result.settings_cddb_card.top + 86.0F,
+            result.settings_cddb_card.right - 24.0F,
+            result.settings_cddb_card.top + 128.0F);
+        result.settings_cddb_email_edit = D2D1::RectF(
+            result.settings_cddb_card.left + 24.0F,
+            result.settings_cddb_card.top + 150.0F,
+            result.settings_cddb_card.right - 136.0F,
+            result.settings_cddb_card.top + 192.0F);
+        result.settings_cddb_save = D2D1::RectF(
+            result.settings_cddb_card.right - 120.0F,
+            result.settings_cddb_card.top + 150.0F,
+            result.settings_cddb_card.right - 24.0F,
+            result.settings_cddb_card.top + 192.0F);
+        result.metadata_button = D2D1::RectF(
+            result.track_list.left + 88.0F,
+            82.0F,
+            result.track_list.left + 184.0F,
+            122.0F);
+        result.metadata_page = D2D1::RectF(
+            margin,
+            84.0F,
+            size.width - margin,
+            size.height - 24.0F);
+        result.metadata_back = D2D1::RectF(
+            size.width - margin - 132.0F,
+            88.0F,
+            size.width - margin,
+            128.0F);
+        const float editor_top = 152.0F;
+        const float editor_gap = 16.0F;
+        const float editor_half = (size.width - margin * 2.0F - editor_gap) * 0.5F;
+        result.metadata_album_title_edit = D2D1::RectF(
+            margin, editor_top, margin + editor_half, editor_top + 42.0F);
+        result.metadata_album_artist_edit = D2D1::RectF(
+            margin + editor_half + editor_gap,
+            editor_top,
+            size.width - margin,
+            editor_top + 42.0F);
+        result.metadata_category_edit = D2D1::RectF(
+            margin, editor_top + 66.0F, margin + editor_half, editor_top + 108.0F);
+        result.metadata_year_edit = D2D1::RectF(
+            margin + editor_half + editor_gap,
+            editor_top + 66.0F,
+            size.width - margin,
+            editor_top + 108.0F);
+        result.metadata_track_list = D2D1::RectF(
+            margin,
+            editor_top + 132.0F,
+            size.width - margin,
+            size.height - 150.0F);
+        result.metadata_track_title_edit = D2D1::RectF(
+            margin,
+            size.height - 126.0F,
+            margin + editor_half,
+            size.height - 84.0F);
+        result.metadata_track_artist_edit = D2D1::RectF(
+            margin + editor_half + editor_gap,
+            size.height - 126.0F,
+            size.width - margin,
+            size.height - 84.0F);
+        result.metadata_save = D2D1::RectF(
+            margin,
+            size.height - 68.0F,
+            margin + 118.0F,
+            size.height - 28.0F);
+        result.metadata_test_submit = D2D1::RectF(
+            size.width - margin - 254.0F,
+            size.height - 68.0F,
+            size.width - margin - 126.0F,
+            size.height - 28.0F);
+        result.metadata_submit = D2D1::RectF(
+            size.width - margin - 112.0F,
+            size.height - 68.0F,
+            size.width - margin,
+            size.height - 28.0F);
+        return result;
+#endif
+    }
+
+    [[nodiscard]] static float settings_maximum_scroll(const float height) noexcept
+    {
+        return std::max(0.0F, kSettingsContentBottom - (height - 24.0F));
     }
 
     void paint()
@@ -871,12 +1354,24 @@ private:
             render_target_->SetTransform(D2D1::Matrix3x2F::Identity());
             render_target_->Clear(color(theme_.background));
             const auto size = render_target_->GetSize();
-            layout_ = detail::calculate_layout(size.width, size.height);
+            settings_scroll_offset_ = std::clamp(
+                settings_scroll_offset_,
+                0.0F,
+                settings_maximum_scroll(size.height));
+            layout_ = detail::calculate_layout(
+                size.width,
+                size.height,
+                settings_scroll_offset_);
             draw_header();
             if (active_page_ == AppPage::settings) {
                 update_settings_control_bounds();
                 draw_settings_page();
+            } else if (active_page_ == AppPage::metadata_editor) {
+                update_metadata_edit_bounds();
+                update_metadata_editor_bounds();
+                draw_metadata_editor_page();
             } else {
+                update_metadata_edit_bounds();
                 draw_content();
                 draw_transport();
             }
@@ -886,6 +1381,121 @@ private:
             }
         }
         EndPaint(window_, &paint_structure);
+    }
+
+    void hide_active_input_controls()
+    {
+        const HWND focused = GetFocus();
+        if (focused != nullptr && IsChild(window_, focused) != FALSE) {
+            resize_focus_ = focused;
+        }
+        const auto hide = [](const HWND edit) {
+            if (edit != nullptr) {
+                ShowWindow(edit, SW_HIDE);
+            }
+        };
+        if (active_page_ == AppPage::settings) {
+            settings_controls_ready_ = false;
+            hide(settings_token_edit_);
+            hide(settings_cddb_server_edit_);
+            hide(settings_cddb_email_edit_);
+        } else if (active_page_ == AppPage::metadata_editor) {
+            hide(metadata_album_title_edit_);
+            hide(metadata_album_artist_edit_);
+            hide(metadata_category_edit_);
+            hide(metadata_year_edit_);
+            hide(metadata_track_title_edit_);
+            hide(metadata_track_artist_edit_);
+        } else {
+            hide(metadata_edit_);
+        }
+    }
+
+    void restore_active_input_controls()
+    {
+        const auto show = [](const HWND edit) {
+            if (edit != nullptr) {
+                ShowWindow(edit, SW_SHOWNOACTIVATE);
+            }
+        };
+        if (active_page_ == AppPage::settings) {
+            settings_controls_ready_ = true;
+            update_settings_control_bounds();
+        } else if (active_page_ == AppPage::metadata_editor) {
+            update_metadata_edit_bounds();
+            update_metadata_editor_bounds();
+            show(metadata_album_title_edit_);
+            show(metadata_album_artist_edit_);
+            show(metadata_category_edit_);
+            show(metadata_year_edit_);
+            show(metadata_track_title_edit_);
+            show(metadata_track_artist_edit_);
+        } else {
+            update_metadata_edit_bounds();
+            show(metadata_edit_);
+        }
+        if (resize_focus_ != nullptr &&
+            IsWindowVisible(resize_focus_) != FALSE) {
+            SetFocus(resize_focus_);
+        }
+        resize_focus_ = nullptr;
+    }
+
+    void finish_input_control_relayout()
+    {
+        static_cast<void>(RedrawWindow(
+            window_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        restore_active_input_controls();
+    }
+
+    void cancel_settings_scroll_session()
+    {
+        KillTimer(window_, kSettingsScrollSettleTimer);
+        settings_scroll_active_ = false;
+    }
+
+    void begin_settings_scroll_session()
+    {
+        if (!settings_scroll_active_) {
+            settings_scroll_active_ = true;
+            hide_active_input_controls();
+            static_cast<void>(RedrawWindow(
+                window_, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        }
+        KillTimer(window_, kSettingsScrollSettleTimer);
+        static_cast<void>(SetTimer(
+            window_,
+            kSettingsScrollSettleTimer,
+            kSettingsScrollSettleDelayMs,
+            nullptr));
+    }
+
+    void settle_settings_scroll_session()
+    {
+        KillTimer(window_, kSettingsScrollSettleTimer);
+        if (!settings_scroll_active_) {
+            return;
+        }
+        settings_scroll_active_ = false;
+        if (!window_resizing_ && active_page_ == AppPage::settings) {
+            finish_input_control_relayout();
+        }
+    }
+
+    void scroll_settings_to(const float requested_offset)
+    {
+        const float next = std::clamp(
+            requested_offset,
+            0.0F,
+            settings_maximum_scroll(layout_.height));
+        if (std::abs(next - settings_scroll_offset_) < 0.5F) {
+            return;
+        }
+        begin_settings_scroll_session();
+        settings_scroll_offset_ = next;
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void draw_header()
@@ -1044,6 +1654,22 @@ private:
             heading_format_.Get(),
             D2D1::RectF(right_left, 84.0F, right_left + 130.0F, 122.0F),
             text_brush_.Get());
+        const auto metadata_button = D2D1::RoundedRect(
+            layout_.metadata_button,
+            10.0F,
+            10.0F);
+        render_target_->FillRoundedRectangle(
+            metadata_button,
+            hovered_control_ == HoveredControl::metadata
+                ? elevated_brush_.Get()
+                : surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(metadata_button, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"编辑元数据",
+            caption_format_.Get(),
+            layout_.metadata_button,
+            secondary_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(
             std::format(
                 L"共 {} 轨 · {}",
@@ -1647,8 +2273,12 @@ private:
             }
             return;
         }
+        if (active_page_ == AppPage::metadata_editor) {
+            close_metadata_editor(false);
+        }
         ++disc_generation_;
         disc_ = std::move(*snapshot);
+        load_cover_bitmap(disc_.cover_art_path);
         diagnostics_.record(
             L"disc",
             std::format(
@@ -1659,6 +2289,7 @@ private:
         preferred_metadata_release_id_.clear();
         selected_track_ = first_audio_track();
         restore_playback_position();
+        apply_saved_metadata_override();
         scroll_row_ = 0;
         InvalidateRect(window_, nullptr, FALSE);
         sync_system_media(true);
@@ -1726,6 +2357,11 @@ private:
         const std::wstring album_title = disc_.album_title;
         const std::wstring album_artist = disc_.album_artist;
         const std::wstring preferred_release_id = preferred_metadata_release_id_;
+        const platform::windows::OnlineMetadataOptions metadata_options{
+            user_settings_.cddb_enabled,
+            user_settings_.cddb_server,
+            user_settings_.cddb_email,
+        };
         const std::uint64_t disc_generation = disc_generation_;
         metadata_worker_ = std::jthread([
             target_window,
@@ -1733,6 +2369,7 @@ private:
             album_title,
             album_artist,
             preferred_release_id,
+            metadata_options,
             disc_generation] {
             auto snapshot = std::make_unique<OnlineMetadataSnapshot>();
             snapshot->disc_generation = disc_generation;
@@ -1740,7 +2377,8 @@ private:
                 toc,
                 album_title,
                 album_artist,
-                preferred_release_id);
+                preferred_release_id,
+                metadata_options);
             auto* const raw_snapshot = snapshot.release();
             if (PostMessageW(
                     target_window,
@@ -1797,11 +2435,20 @@ private:
         disc_.selected_release_id = metadata.selected_release_id;
         preferred_metadata_release_id_ = metadata.selected_release_id;
         disc_.cover_art_path = metadata.cover_art_path;
+        disc_.cover_art_source = metadata.cover_art_source;
         disc_.release_mbid = metadata.release_mbid;
         disc_.release_group_mbid = metadata.release_group_mbid;
-        if (!disc_.cover_art_path.empty()) {
-            load_cover_bitmap(disc_.cover_art_path);
+        disc_.reference_release_mbid = metadata.reference_release_mbid;
+        disc_.reference_release_group_mbid =
+            metadata.reference_release_group_mbid;
+        if (!disc_.has_user_metadata) {
+            if (!metadata.cddb_category.empty()) {
+                disc_.cddb_category = metadata.cddb_category;
+            }
+            disc_.cddb_year = metadata.cddb_year;
+            disc_.cddb_revision = metadata.cddb_revision;
         }
+        load_cover_bitmap(disc_.cover_art_path);
         const std::size_t title_count = std::min(
             disc_.tracks.size(),
             metadata.track_titles.size());
@@ -1889,6 +2536,16 @@ private:
             }
             return;
         }
+        if (active_page_ == AppPage::metadata_editor) {
+            const bool changed = hovered_track_.has_value() ||
+                hovered_control_ != HoveredControl::none;
+            hovered_track_.reset();
+            hovered_control_ = HoveredControl::none;
+            if (changed) {
+                InvalidateRect(window_, nullptr, FALSE);
+            }
+            return;
+        }
 
         const auto previous_track = hovered_track_;
         const auto previous_control = hovered_control_;
@@ -1915,6 +2572,7 @@ private:
         if (contains(layout_.next_button, point)) return HoveredControl::next;
         if (contains(layout_.progress_hit, point)) return HoveredControl::progress;
         if (contains(layout_.volume_hit, point)) return HoveredControl::volume;
+        if (contains(layout_.metadata_button, point)) return HoveredControl::metadata;
         return HoveredControl::none;
     }
 
@@ -1960,6 +2618,9 @@ private:
         case HoveredControl::volume:
             set_volume_from_point(point.x);
             break;
+        case HoveredControl::metadata:
+            open_metadata_editor();
+            break;
         case HoveredControl::none:
             break;
         }
@@ -1989,6 +2650,24 @@ private:
                 toggle_shared_fallback();
             } else if (key == 'G') {
                 export_diagnostics();
+            } else if (key == VK_PRIOR) {
+                scroll_settings_to(settings_scroll_offset_ - 160.0F);
+            } else if (key == VK_NEXT) {
+                scroll_settings_to(settings_scroll_offset_ + 160.0F);
+            } else if (key == VK_HOME) {
+                scroll_settings_to(0.0F);
+            } else if (key == VK_END) {
+                scroll_settings_to(settings_maximum_scroll(layout_.height));
+            }
+            return 0;
+        }
+        if (active_page_ == AppPage::metadata_editor) {
+            if (key == VK_ESCAPE) {
+                close_metadata_editor();
+            } else if (key == VK_UP) {
+                select_metadata_track(-1);
+            } else if (key == VK_DOWN) {
+                select_metadata_track(1);
             }
             return 0;
         }
@@ -2864,6 +3543,36 @@ private:
         NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, window_, OBJID_WINDOW, CHILDID_SELF);
     }
 
+    void apply_saved_metadata_override()
+    {
+        if (current_disc_key_.empty()) {
+            return;
+        }
+        const auto saved = user_settings_.metadata_overrides.find(current_disc_key_);
+        if (saved == user_settings_.metadata_overrides.end() ||
+            saved->second.track_titles.size() != disc_.tracks.size() ||
+            (!saved->second.track_artists.empty() &&
+             saved->second.track_artists.size() != disc_.tracks.size())) {
+            return;
+        }
+        const auto& metadata = saved->second;
+        disc_.album_title = metadata.album_title;
+        disc_.album_artist = metadata.album_artist;
+        disc_.cddb_category = metadata.category.empty() ? L"misc" : metadata.category;
+        disc_.cddb_year = metadata.year;
+        disc_.cddb_revision = metadata.revision;
+        disc_.has_user_metadata = true;
+        disc_.metadata_sources = make_metadata_source_labels(
+            disc_.has_cd_text, true, {});
+        for (std::size_t index = 0; index < disc_.tracks.size(); ++index) {
+            disc_.tracks[index].title = metadata.track_titles[index];
+            disc_.tracks[index].has_metadata_title = true;
+            if (!metadata.track_artists.empty()) {
+                disc_.tracks[index].artist = metadata.track_artists[index];
+            }
+        }
+    }
+
     void restore_playback_position()
     {
         current_disc_key_.clear();
@@ -3029,7 +3738,7 @@ private:
             WS_EX_CLIENTEDGE,
             L"EDIT",
             value->c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
             0, 0, 1, 1,
             window_,
             nullptr,
@@ -3039,6 +3748,7 @@ private:
             metadata_edit_field_ = MetadataEditField::none;
             return;
         }
+        static_cast<void>(SetWindowTheme(metadata_edit_, L" ", L" "));
         SendMessageW(
             metadata_edit_,
             WM_SETFONT,
@@ -3055,6 +3765,10 @@ private:
                 GWLP_WNDPROC,
                 reinterpret_cast<LONG_PTR>(metadata_edit_window_proc)));
         update_metadata_edit_bounds();
+        static_cast<void>(RedrawWindow(
+            window_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        ShowWindow(metadata_edit_, SW_SHOWNOACTIVATE);
         SendMessageW(metadata_edit_, EM_SETSEL, 0, -1);
         SetFocus(metadata_edit_);
         ui_message_ = std::format(
@@ -3178,6 +3892,18 @@ private:
                 return 0;
             }
         }
+        if (self != nullptr && edit == self->settings_token_edit_ &&
+            self->settings_token_mask_active_) {
+            const bool replaces_saved_token =
+                message == WM_PASTE || message == WM_CUT ||
+                (message == WM_KEYDOWN &&
+                 (wparam == VK_BACK || wparam == VK_DELETE)) ||
+                (message == WM_CHAR && wparam >= 0x20U);
+            if (replaces_saved_token) {
+                self->settings_token_mask_active_ = false;
+                SetWindowTextW(edit, L"");
+            }
+        }
         if (self != nullptr && message == WM_GETDLGCODE) {
             return DLGC_WANTALLKEYS;
         }
@@ -3201,6 +3927,9 @@ private:
         }
 
         active_page_ = AppPage::settings;
+        cancel_settings_scroll_session();
+        settings_scroll_offset_ = 0.0F;
+        settings_controls_ready_ = false;
         settings_save_failed_ = false;
         settings_saved_ = false;
         settings_input_required_ = false;
@@ -3211,6 +3940,7 @@ private:
             platform::windows::WasapiEndpoint{L"", L"系统默认设备", true});
         selected_audio_endpoint_ = find_audio_endpoint_index(
             audio_endpoints_, user_settings_.audio_endpoint_id);
+        cddb_settings_error_.clear();
         if (settings_font_ == nullptr) {
             settings_font_ = CreateFontW(
                 -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
@@ -3235,7 +3965,7 @@ private:
             0,
             L"EDIT",
             L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
+            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
             0,
             0,
             1,
@@ -3246,17 +3976,13 @@ private:
             instance_,
             nullptr);
         if (settings_token_edit_ != nullptr) {
+            static_cast<void>(SetWindowTheme(settings_token_edit_, L" ", L" "));
             SendMessageW(
                 settings_token_edit_,
                 WM_SETFONT,
                 reinterpret_cast<WPARAM>(settings_font_),
                 TRUE);
             SendMessageW(settings_token_edit_, EM_SETLIMITTEXT, 512, 0);
-            SendMessageW(
-                settings_token_edit_,
-                EM_SETCUEBANNER,
-                TRUE,
-                reinterpret_cast<LPARAM>(L"粘贴 ListenBrainz User Token"));
             SetWindowLongPtrW(
                 settings_token_edit_,
                 GWLP_USERDATA,
@@ -3266,25 +3992,104 @@ private:
                     settings_token_edit_,
                     GWLP_WNDPROC,
                     reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
+            refresh_settings_token_status();
+        }
+        const auto create_plain_edit = [this](
+            const int identifier,
+            const wchar_t* initial_text,
+            const WPARAM limit) {
+            HWND edit = CreateWindowExW(
+                0,
+                L"EDIT",
+                initial_text,
+                WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
+                0,
+                0,
+                1,
+                1,
+                window_,
+                reinterpret_cast<HMENU>(static_cast<std::intptr_t>(identifier)),
+                instance_,
+                nullptr);
+            if (edit != nullptr) {
+                static_cast<void>(SetWindowTheme(edit, L" ", L" "));
+                SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(settings_font_), TRUE);
+                SendMessageW(edit, EM_SETLIMITTEXT, limit, 0);
+                SetWindowLongPtrW(edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+                const auto original = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+                    edit,
+                    GWLP_WNDPROC,
+                    reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
+                if (settings_edit_original_proc_ == nullptr) {
+                    settings_edit_original_proc_ = original;
+                }
+            }
+            return edit;
+        };
+        settings_cddb_server_edit_ = create_plain_edit(
+            kSettingsCddbServerEditId,
+            user_settings_.cddb_server.c_str(),
+            512);
+        settings_cddb_email_edit_ = create_plain_edit(
+            kSettingsCddbEmailEditId,
+            user_settings_.cddb_email.c_str(),
+            320);
+        update_settings_control_bounds();
+        static_cast<void>(RedrawWindow(
+            window_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        settings_controls_ready_ = true;
+        update_settings_control_bounds();
+        if (settings_token_edit_ != nullptr) {
             SetFocus(settings_token_edit_);
         }
-        update_settings_control_bounds();
-        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void refresh_settings_token_status()
+    {
+        if (settings_token_edit_ == nullptr) {
+            return;
+        }
+        settings_token_character_count_ =
+            platform::windows::listenbrainz_token_character_count();
+        settings_token_mask_active_ = settings_token_character_count_ != 0U;
+        const std::wstring masked_value(
+            settings_token_character_count_,
+            L'x');
+        SetWindowTextW(settings_token_edit_, masked_value.c_str());
+        SendMessageW(settings_token_edit_, EM_SETSEL, 0, 0);
+        static_cast<void>(RedrawWindow(
+            settings_token_edit_,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW));
     }
 
     void close_settings()
     {
+        cancel_settings_scroll_session();
         close_settings_dropdown();
+        settings_controls_ready_ = false;
+        resize_focus_ = nullptr;
         if (settings_token_edit_ != nullptr) {
             DestroyWindow(settings_token_edit_);
             settings_token_edit_ = nullptr;
-            settings_edit_original_proc_ = nullptr;
         }
+        if (settings_cddb_server_edit_ != nullptr) {
+            DestroyWindow(settings_cddb_server_edit_);
+            settings_cddb_server_edit_ = nullptr;
+        }
+        if (settings_cddb_email_edit_ != nullptr) {
+            DestroyWindow(settings_cddb_email_edit_);
+            settings_cddb_email_edit_ = nullptr;
+        }
+        settings_edit_original_proc_ = nullptr;
         if (active_page_ == AppPage::settings) {
             active_page_ = AppPage::player;
             settings_save_failed_ = false;
             settings_saved_ = false;
             settings_input_required_ = false;
+            cddb_settings_error_.clear();
             if (window_ != nullptr) {
                 SetFocus(window_);
                 InvalidateRect(window_, nullptr, FALSE);
@@ -3294,41 +4099,67 @@ private:
 
     void save_settings()
     {
-        if (active_page_ != AppPage::settings || settings_token_edit_ == nullptr) {
+        if (active_page_ != AppPage::settings || settings_token_edit_ == nullptr ||
+            settings_cddb_server_edit_ == nullptr ||
+            settings_cddb_email_edit_ == nullptr) {
             return;
         }
-        const int length = GetWindowTextLengthW(settings_token_edit_);
-        std::wstring token(static_cast<std::size_t>(length) + 1U, L'\0');
-        const int written = GetWindowTextW(
-            settings_token_edit_,
-            token.data(),
-            length + 1);
-        token.resize(static_cast<std::size_t>(std::max(written, 0)));
-        const auto first = token.find_first_not_of(L" \t\r\n");
-        if (first == std::wstring::npos) {
-            token.clear();
-        } else {
-            const auto last = token.find_last_not_of(L" \t\r\n");
-            token = token.substr(first, last - first + 1U);
-        }
+        const auto edit_text = [](const HWND edit) {
+            const int length = GetWindowTextLengthW(edit);
+            std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
+            const int written = GetWindowTextW(edit, value.data(), length + 1);
+            value.resize(static_cast<std::size_t>(std::max(written, 0)));
+            const auto first = value.find_first_not_of(L" \t\r\n");
+            if (first == std::wstring::npos) {
+                return std::wstring{};
+            }
+            const auto last = value.find_last_not_of(L" \t\r\n");
+            return value.substr(first, last - first + 1U);
+        };
+        const std::wstring token = settings_token_mask_active_
+            ? std::wstring{}
+            : edit_text(settings_token_edit_);
+        const std::wstring server = edit_text(settings_cddb_server_edit_);
+        const std::wstring email = edit_text(settings_cddb_email_edit_);
 
-        if (!platform::windows::is_listenbrainz_token_format_valid(token)) {
+        if (!token.empty() &&
+            !platform::windows::is_listenbrainz_token_format_valid(token)) {
             settings_input_required_ = true;
             settings_save_failed_ = false;
             settings_saved_ = false;
             InvalidateRect(window_, nullptr, FALSE);
             return;
         }
+        if (!platform::windows::parse_cddb_server(server)) {
+            cddb_settings_error_ = L"CDDB 服务器地址无效";
+            settings_saved_ = false;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+        if (!email.empty() && !platform::windows::is_valid_cddb_email(email)) {
+            cddb_settings_error_ = L"请输入有效的 CDDB 身份邮箱";
+            settings_saved_ = false;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
 
-        if (!platform::windows::save_listenbrainz_token(token)) {
+        if (!token.empty() &&
+            !platform::windows::save_listenbrainz_token(token)) {
             settings_save_failed_ = true;
             settings_input_required_ = false;
             settings_saved_ = false;
             InvalidateRect(window_, nullptr, FALSE);
             return;
         }
-        listenbrainz_reporter_.reload_token();
-        SetWindowTextW(settings_token_edit_, L"");
+        if (!token.empty()) {
+            listenbrainz_reporter_.reload_token();
+            SetWindowTextW(settings_token_edit_, L"");
+            refresh_settings_token_status();
+        }
+        user_settings_.cddb_server = server;
+        user_settings_.cddb_email = email;
+        persist_user_settings();
+        cddb_settings_error_.clear();
         settings_save_failed_ = false;
         settings_input_required_ = false;
         settings_saved_ = true;
@@ -3347,6 +4178,7 @@ private:
         listenbrainz_reporter_.reload_token();
         if (settings_token_edit_ != nullptr) {
             SetWindowTextW(settings_token_edit_, L"");
+            refresh_settings_token_status();
         }
         settings_save_failed_ = false;
         settings_input_required_ = false;
@@ -3356,6 +4188,33 @@ private:
 
     void handle_settings_click(const D2D1_POINT_2F point)
     {
+        const ScrollbarGeometry scroll = settings_scrollbar_geometry();
+        if (scroll.visible && contains(scroll.track, point)) {
+            const float maximum = settings_maximum_scroll(layout_.height);
+            const float travel = std::max(
+                0.0F,
+                scroll.track.bottom - scroll.track.top -
+                    (scroll.thumb.bottom - scroll.thumb.top));
+            const float thumb_top = std::clamp(
+                point.y - scroll.track.top -
+                    (scroll.thumb.bottom - scroll.thumb.top) * 0.5F,
+                0.0F,
+                travel);
+            const float next = travel > 0.0F
+                ? maximum * thumb_top / travel
+                : 0.0F;
+            scroll_settings_to(next);
+            return;
+        }
+        if (point.y < kSettingsContentTop) {
+            if (contains(layout_.settings_diagnostics_export, point)) {
+                export_diagnostics();
+            } else if (contains(layout_.settings_back, point) ||
+                       contains(layout_.settings_button, point)) {
+                close_settings();
+            }
+            return;
+        }
         for (const auto& hit : settings_dropdown_hits_) {
             if (contains(hit.rectangle, point)) {
                 apply_settings_dropdown_option(hit.option_index);
@@ -3403,6 +4262,13 @@ private:
             toggle_exclusive_output();
         } else if (contains(layout_.settings_audio_fallback_toggle, point)) {
             toggle_shared_fallback();
+        } else if (contains(layout_.settings_cddb_save, point)) {
+            save_settings();
+        } else if (contains(layout_.settings_cddb_toggle, point)) {
+            user_settings_.cddb_enabled = !user_settings_.cddb_enabled;
+            cddb_settings_error_.clear();
+            persist_user_settings();
+            InvalidateRect(window_, nullptr, FALSE);
         } else if (contains(layout_.settings_back, point) ||
                    contains(layout_.settings_button, point)) {
             close_settings();
@@ -3620,6 +4486,19 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
+    void handle_settings_mouse_wheel(const short delta)
+    {
+        if (settings_dropdown_ != SettingsDropdown::none) {
+            handle_settings_dropdown_wheel(delta);
+            return;
+        }
+        const float next =
+            settings_scroll_offset_ -
+                static_cast<float>(delta) * 64.0F /
+                    static_cast<float>(WHEEL_DELTA);
+        scroll_settings_to(next);
+    }
+
     void update_settings_dropdown_hover(const D2D1_POINT_2F point)
     {
         for (const auto& hit : settings_dropdown_hits_) {
@@ -3765,14 +4644,50 @@ private:
         const auto to_pixel = [scale](const float value) {
             return static_cast<int>(std::lround(value * scale));
         };
-        SetWindowPos(
-            settings_token_edit_,
-            HWND_TOP,
-            to_pixel(layout_.settings_edit.left + 13.0F),
-            to_pixel(layout_.settings_edit.top + 8.0F),
-            to_pixel(layout_.settings_edit.right - layout_.settings_edit.left - 26.0F),
-            to_pixel(layout_.settings_edit.bottom - layout_.settings_edit.top - 16.0F),
-            SWP_NOACTIVATE);
+        const auto position_edit = [&](const HWND edit, const D2D1_RECT_F rectangle) {
+            if (edit == nullptr) {
+                return;
+            }
+            const bool visible = settings_controls_ready_ &&
+                rectangle.top >= kSettingsContentTop &&
+                rectangle.bottom <= layout_.height - 24.0F;
+            const int left = to_pixel(rectangle.left + 13.0F);
+            const int top = to_pixel(rectangle.top + 8.0F);
+            const int width = to_pixel(rectangle.right - rectangle.left - 26.0F);
+            const int height = to_pixel(rectangle.bottom - rectangle.top - 16.0F);
+            RECT current{};
+            GetWindowRect(edit, &current);
+            MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&current), 2);
+            const bool bounds_changed =
+                current.left != left || current.top != top ||
+                current.right - current.left != width ||
+                current.bottom - current.top != height;
+            if (bounds_changed) {
+                SetWindowPos(
+                    edit,
+                    nullptr,
+                    left,
+                    top,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOZORDER);
+            }
+            const bool visibility_changed =
+                (IsWindowVisible(edit) != FALSE) != visible;
+            if (visibility_changed) {
+                ShowWindow(edit, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+            }
+            if (visible && (bounds_changed || visibility_changed)) {
+                static_cast<void>(RedrawWindow(
+                    edit,
+                    nullptr,
+                    nullptr,
+                    RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW));
+            }
+        };
+        position_edit(settings_token_edit_, layout_.settings_edit);
+        position_edit(settings_cddb_server_edit_, layout_.settings_cddb_server_edit);
+        position_edit(settings_cddb_email_edit_, layout_.settings_cddb_email_edit);
     }
 
     void draw_toggle(const D2D1_RECT_F rectangle, const bool enabled)
@@ -3781,6 +4696,50 @@ private:
             render_target_.Get(), rectangle, enabled,
             accent_brush_.Get(), elevated_brush_.Get(), border_brush_.Get(),
             accent_text_brush_.Get(), secondary_brush_.Get());
+    }
+
+    [[nodiscard]] ScrollbarGeometry settings_scrollbar_geometry() const noexcept
+    {
+        ScrollbarGeometry geometry;
+        const float maximum = settings_maximum_scroll(layout_.height);
+        if (maximum <= 0.0F) {
+            return geometry;
+        }
+        geometry.visible = true;
+        geometry.track = D2D1::RectF(
+            layout_.settings_page.right + 8.0F,
+            148.0F,
+            layout_.settings_page.right + 12.0F,
+            std::max(149.0F, layout_.height - 24.0F));
+        const float track_height = geometry.track.bottom - geometry.track.top;
+        constexpr float content_height = kSettingsContentBottom - 148.0F;
+        const float thumb_height = std::clamp(
+            track_height * track_height / content_height,
+            48.0F,
+            track_height);
+        const float travel = std::max(0.0F, track_height - thumb_height);
+        const float thumb_top = geometry.track.top +
+            travel * settings_scroll_offset_ / maximum;
+        geometry.thumb = D2D1::RectF(
+            geometry.track.left - 2.0F,
+            thumb_top,
+            geometry.track.right + 2.0F,
+            thumb_top + thumb_height);
+        return geometry;
+    }
+
+    void draw_settings_scrollbar()
+    {
+        const ScrollbarGeometry geometry = settings_scrollbar_geometry();
+        if (!geometry.visible) {
+            return;
+        }
+        render_target_->FillRoundedRectangle(
+            D2D1::RoundedRect(geometry.track, 2.0F, 2.0F),
+            border_brush_.Get());
+        render_target_->FillRoundedRectangle(
+            D2D1::RoundedRect(geometry.thumb, 4.0F, 4.0F),
+            muted_brush_.Get());
     }
 
     void draw_settings_page()
@@ -3828,6 +4787,14 @@ private:
             DWRITE_TEXT_ALIGNMENT_CENTER,
             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
+        render_target_->PushAxisAlignedClip(
+            D2D1::RectF(
+                0.0F,
+                kSettingsContentTop,
+                layout_.width,
+                layout_.height),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
         const auto audio_card = D2D1::RoundedRect(
             layout_.settings_audio_card,
             16.0F,
@@ -3841,25 +4808,25 @@ private:
                 audio_card.rect.left + 24.0F,
                 audio_card.rect.top + 18.0F,
                 audio_card.rect.right - 24.0F,
-                audio_card.rect.top + 50.0F),
+                audio_card.rect.top + 46.0F),
             text_brush_.Get());
         draw_text(
             L"音频引擎",
             caption_format_.Get(),
             D2D1::RectF(
                 layout_.settings_audio_engine.left,
-                audio_card.rect.top + 52.0F,
+                audio_card.rect.top + 54.0F,
                 layout_.settings_audio_engine.right,
-                audio_card.rect.top + 72.0F),
+                audio_card.rect.top + 74.0F),
             muted_brush_.Get());
         draw_text(
             L"输出设备",
             caption_format_.Get(),
             D2D1::RectF(
                 layout_.settings_audio_endpoint.left,
-                audio_card.rect.top + 52.0F,
+                audio_card.rect.top + 54.0F,
                 layout_.settings_audio_endpoint.right,
-                audio_card.rect.top + 72.0F),
+                audio_card.rect.top + 74.0F),
             muted_brush_.Get());
         draw_settings_dropdown_field(
             layout_.settings_audio_engine,
@@ -3929,18 +4896,18 @@ private:
             heading_format_.Get(),
             D2D1::RectF(
                 listenbrainz_card.rect.left + 24.0F,
-                listenbrainz_card.rect.top + 20.0F,
+                listenbrainz_card.rect.top + 18.0F,
                 listenbrainz_card.rect.right - 200.0F,
-                listenbrainz_card.rect.top + 52.0F),
+                listenbrainz_card.rect.top + 46.0F),
             text_brush_.Get());
         draw_text(
             L"将正在播放状态和达到阈值的播放记录同步到个人账户",
             small_format_.Get(),
             D2D1::RectF(
                 listenbrainz_card.rect.left + 24.0F,
-                listenbrainz_card.rect.top + 54.0F,
+                listenbrainz_card.rect.top + 52.0F,
                 listenbrainz_card.rect.right - 24.0F,
-                listenbrainz_card.rect.top + 82.0F),
+                listenbrainz_card.rect.top + 76.0F),
             secondary_brush_.Get());
         const auto listenbrainz_status = listenbrainz_reporter_.status();
         draw_text(
@@ -3948,9 +4915,9 @@ private:
             small_format_.Get(),
             D2D1::RectF(
                 listenbrainz_card.rect.right - 180.0F,
-                listenbrainz_card.rect.top + 22.0F,
+                listenbrainz_card.rect.top + 18.0F,
                 listenbrainz_card.rect.right - 92.0F,
-                listenbrainz_card.rect.top + 50.0F),
+                listenbrainz_card.rect.top + 46.0F),
             listenbrainz_status.state == platform::windows::ListenBrainzState::ready
                 ? success_brush_.Get()
                 : (listenbrainz_status.state ==
@@ -4048,6 +5015,784 @@ private:
 
         draw_settings_dropdown_popup();
 
+        const auto cddb_card = D2D1::RoundedRect(
+            layout_.settings_cddb_card,
+            16.0F,
+            16.0F);
+        render_target_->FillRoundedRectangle(cddb_card, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(cddb_card, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"CDDB / freedb",
+            heading_format_.Get(),
+            D2D1::RectF(
+                cddb_card.rect.left + 24.0F,
+                cddb_card.rect.top + 18.0F,
+                cddb_card.rect.right - 120.0F,
+                cddb_card.rect.top + 46.0F),
+            text_brush_.Get());
+        draw_text(
+            cddb_settings_error_.empty()
+                ? L"默认使用 GnuDB HTTPS；邮箱留空时使用项目开发者身份"
+                : cddb_settings_error_,
+            small_format_.Get(),
+            D2D1::RectF(
+                cddb_card.rect.left + 24.0F,
+                cddb_card.rect.top + 52.0F,
+                cddb_card.rect.right - 96.0F,
+                cddb_card.rect.top + 76.0F),
+            cddb_settings_error_.empty()
+                ? secondary_brush_.Get()
+                : error_brush_.Get());
+        draw_toggle(layout_.settings_cddb_toggle, user_settings_.cddb_enabled);
+        draw_text(
+            L"服务器",
+            caption_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_cddb_server_edit.left,
+                layout_.settings_cddb_server_edit.top - 18.0F,
+                layout_.settings_cddb_server_edit.right,
+                layout_.settings_cddb_server_edit.top - 4.0F),
+            muted_brush_.Get());
+        draw_text(
+            L"身份邮箱（查询可选，提交时必填）",
+            caption_format_.Get(),
+            D2D1::RectF(
+                layout_.settings_cddb_email_edit.left,
+                layout_.settings_cddb_email_edit.top - 18.0F,
+                layout_.settings_cddb_email_edit.right,
+                layout_.settings_cddb_email_edit.top - 4.0F),
+            muted_brush_.Get());
+        for (const D2D1_RECT_F rectangle : {
+                 layout_.settings_cddb_server_edit,
+                 layout_.settings_cddb_email_edit,
+             }) {
+            const auto field = D2D1::RoundedRect(rectangle, 10.0F, 10.0F);
+            render_target_->FillRoundedRectangle(field, elevated_brush_.Get());
+            render_target_->DrawRoundedRectangle(
+                field,
+                cddb_settings_error_.empty() ? border_brush_.Get() : error_brush_.Get(),
+                cddb_settings_error_.empty() ? 1.0F : 2.0F);
+        }
+        const auto cddb_save = D2D1::RoundedRect(
+            layout_.settings_cddb_save,
+            10.0F,
+            10.0F);
+        render_target_->FillRoundedRectangle(cddb_save, accent_brush_.Get());
+        draw_text(
+            L"保存",
+            button_format_.Get(),
+            layout_.settings_cddb_save,
+            accent_text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+        render_target_->PopAxisAlignedClip();
+        draw_settings_scrollbar();
+    }
+
+    [[nodiscard]] bool is_metadata_edit(const HWND window) const noexcept
+    {
+        return window != nullptr &&
+            (window == metadata_album_title_edit_ ||
+             window == metadata_album_artist_edit_ ||
+             window == metadata_category_edit_ ||
+             window == metadata_year_edit_ ||
+             window == metadata_track_title_edit_ ||
+             window == metadata_track_artist_edit_);
+    }
+
+    [[nodiscard]] static std::wstring edit_text(const HWND edit)
+    {
+        if (edit == nullptr) {
+            return {};
+        }
+        const int length = GetWindowTextLengthW(edit);
+        std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
+        const int written = GetWindowTextW(edit, value.data(), length + 1);
+        value.resize(static_cast<std::size_t>(std::max(written, 0)));
+        const auto first = value.find_first_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) {
+            return {};
+        }
+        const auto last = value.find_last_not_of(L" \t\r\n");
+        return value.substr(first, last - first + 1U);
+    }
+
+    static LRESULT CALLBACK metadata_editor_window_proc(
+        const HWND edit,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        auto* self = reinterpret_cast<MainWindow*>(
+            GetWindowLongPtrW(edit, GWLP_USERDATA));
+        if (self != nullptr && message == WM_KEYDOWN && wparam == VK_ESCAPE) {
+            PostMessageW(self->window_, WM_KEYDOWN, VK_ESCAPE, 0);
+            return 0;
+        }
+        return self != nullptr && self->metadata_editor_edit_original_proc_ != nullptr
+            ? CallWindowProcW(
+                  self->metadata_editor_edit_original_proc_,
+                  edit,
+                  message,
+                  wparam,
+                  lparam)
+            : DefWindowProcW(edit, message, wparam, lparam);
+    }
+
+    [[nodiscard]] HWND create_metadata_edit(
+        const int identifier,
+        const std::wstring& value,
+        const WPARAM limit)
+    {
+        HWND edit = CreateWindowExW(
+            0,
+            L"EDIT",
+            value.c_str(),
+            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
+            0,
+            0,
+            1,
+            1,
+            window_,
+            reinterpret_cast<HMENU>(static_cast<std::intptr_t>(identifier)),
+            instance_,
+            nullptr);
+        if (edit == nullptr) {
+            return nullptr;
+        }
+        static_cast<void>(SetWindowTheme(edit, L" ", L" "));
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(settings_font_), TRUE);
+        SendMessageW(edit, EM_SETLIMITTEXT, limit, 0);
+        SetWindowLongPtrW(edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        const auto original = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            edit,
+            GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(metadata_editor_window_proc)));
+        if (metadata_editor_edit_original_proc_ == nullptr) {
+            metadata_editor_edit_original_proc_ = original;
+        }
+        return edit;
+    }
+
+    [[nodiscard]] bool metadata_editor_changed() const noexcept
+    {
+        const auto& left = metadata_editor_working_;
+        const auto& right = metadata_editor_original_;
+        return left.album_title != right.album_title ||
+            left.album_artist != right.album_artist ||
+            left.category != right.category || left.year != right.year ||
+            left.track_titles != right.track_titles ||
+            left.track_artists != right.track_artists;
+    }
+
+    void commit_metadata_editor_fields()
+    {
+        if (active_page_ != AppPage::metadata_editor) {
+            return;
+        }
+        metadata_editor_working_.album_title = edit_text(metadata_album_title_edit_);
+        metadata_editor_working_.album_artist = edit_text(metadata_album_artist_edit_);
+        metadata_editor_working_.category = edit_text(metadata_category_edit_);
+        metadata_editor_working_.year = edit_text(metadata_year_edit_);
+        if (metadata_editor_track_ < metadata_editor_working_.track_titles.size()) {
+            metadata_editor_working_.track_titles[metadata_editor_track_] =
+                edit_text(metadata_track_title_edit_);
+            metadata_editor_working_.track_artists[metadata_editor_track_] =
+                edit_text(metadata_track_artist_edit_);
+        }
+    }
+
+    void load_metadata_track_fields()
+    {
+        if (metadata_editor_track_ >= metadata_editor_working_.track_titles.size()) {
+            return;
+        }
+        SetWindowTextW(
+            metadata_track_title_edit_,
+            metadata_editor_working_.track_titles[metadata_editor_track_].c_str());
+        SetWindowTextW(
+            metadata_track_artist_edit_,
+            metadata_editor_working_.track_artists[metadata_editor_track_].c_str());
+    }
+
+    void open_metadata_editor()
+    {
+        if (!disc_.toc || disc_.tracks.empty()) {
+            return;
+        }
+        if (active_page_ == AppPage::metadata_editor) {
+            SetFocus(metadata_album_title_edit_);
+            return;
+        }
+        active_page_ = AppPage::metadata_editor;
+        if (settings_font_ == nullptr) {
+            settings_font_ = CreateFontW(
+                -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
+                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+        if (settings_edit_brush_ == nullptr) {
+            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
+        }
+        metadata_editor_working_ = {
+            disc_.album_title,
+            disc_.album_artist,
+            disc_.cddb_category.empty() ? L"misc" : disc_.cddb_category,
+            disc_.cddb_year,
+            {},
+            {},
+            disc_.cddb_revision,
+        };
+        if (!disc_.has_user_metadata &&
+            std::find(
+                disc_.metadata_sources.begin(),
+                disc_.metadata_sources.end(),
+                L"CDDB/freedb") != disc_.metadata_sources.end()) {
+            ++metadata_editor_working_.revision;
+        }
+        metadata_editor_working_.track_titles.reserve(disc_.tracks.size());
+        metadata_editor_working_.track_artists.reserve(disc_.tracks.size());
+        for (const auto& track : disc_.tracks) {
+            metadata_editor_working_.track_titles.push_back(track.title);
+            metadata_editor_working_.track_artists.push_back(
+                track.artist.empty() ? disc_.album_artist : track.artist);
+        }
+        metadata_editor_original_ = metadata_editor_working_;
+        metadata_editor_has_saved_edits_ = disc_.has_user_metadata;
+        metadata_editor_track_ = std::min(selected_track_, disc_.tracks.size() - 1U);
+        metadata_editor_scroll_row_ = 0;
+        metadata_editor_feedback_.clear();
+        metadata_editor_feedback_error_ = false;
+
+        metadata_album_title_edit_ = create_metadata_edit(
+            kMetadataAlbumTitleEditId,
+            metadata_editor_working_.album_title,
+            512);
+        metadata_album_artist_edit_ = create_metadata_edit(
+            kMetadataAlbumArtistEditId,
+            metadata_editor_working_.album_artist,
+            512);
+        metadata_category_edit_ = create_metadata_edit(
+            kMetadataCategoryEditId,
+            metadata_editor_working_.category,
+            32);
+        metadata_year_edit_ = create_metadata_edit(
+            kMetadataYearEditId,
+            metadata_editor_working_.year,
+            16);
+        metadata_track_title_edit_ = create_metadata_edit(
+            kMetadataTrackTitleEditId,
+            metadata_editor_working_.track_titles[metadata_editor_track_],
+            512);
+        metadata_track_artist_edit_ = create_metadata_edit(
+            kMetadataTrackArtistEditId,
+            metadata_editor_working_.track_artists[metadata_editor_track_],
+            512);
+        update_metadata_editor_bounds();
+        static_cast<void>(RedrawWindow(
+            window_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        for (const HWND edit : {
+                 metadata_album_title_edit_,
+                 metadata_album_artist_edit_,
+                 metadata_category_edit_,
+                 metadata_year_edit_,
+                 metadata_track_title_edit_,
+                 metadata_track_artist_edit_,
+             }) {
+            if (edit != nullptr) {
+                ShowWindow(edit, SW_SHOWNOACTIVATE);
+            }
+        }
+        SetFocus(metadata_album_title_edit_);
+    }
+
+    void close_metadata_editor(const bool confirm = true)
+    {
+        if (active_page_ == AppPage::metadata_editor) {
+            commit_metadata_editor_fields();
+            if (confirm && metadata_editor_changed() &&
+                MessageBoxW(
+                    window_,
+                    L"尚未保存的元数据修改将被放弃。",
+                    L"CD.404",
+                    MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+                return;
+            }
+        }
+        for (HWND* edit : {
+                 &metadata_album_title_edit_,
+                 &metadata_album_artist_edit_,
+                 &metadata_category_edit_,
+                 &metadata_year_edit_,
+                 &metadata_track_title_edit_,
+                 &metadata_track_artist_edit_,
+             }) {
+            if (*edit != nullptr) {
+                DestroyWindow(*edit);
+                *edit = nullptr;
+            }
+        }
+        metadata_editor_edit_original_proc_ = nullptr;
+        if (active_page_ == AppPage::metadata_editor) {
+            active_page_ = AppPage::player;
+            SetFocus(window_);
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+    }
+
+    void update_metadata_editor_bounds()
+    {
+        const float scale = static_cast<float>(GetDpiForWindow(window_)) / 96.0F;
+        const auto to_pixel = [scale](const float value) {
+            return static_cast<int>(std::lround(value * scale));
+        };
+        const auto position = [&](const HWND edit, const D2D1_RECT_F rectangle) {
+            if (edit == nullptr) {
+                return;
+            }
+            SetWindowPos(
+                edit,
+                HWND_TOP,
+                to_pixel(rectangle.left + 13.0F),
+                to_pixel(rectangle.top + 8.0F),
+                to_pixel(rectangle.right - rectangle.left - 26.0F),
+                to_pixel(rectangle.bottom - rectangle.top - 16.0F),
+                SWP_NOACTIVATE);
+        };
+        position(metadata_album_title_edit_, layout_.metadata_album_title_edit);
+        position(metadata_album_artist_edit_, layout_.metadata_album_artist_edit);
+        position(metadata_category_edit_, layout_.metadata_category_edit);
+        position(metadata_year_edit_, layout_.metadata_year_edit);
+        position(metadata_track_title_edit_, layout_.metadata_track_title_edit);
+        position(metadata_track_artist_edit_, layout_.metadata_track_artist_edit);
+    }
+
+    [[nodiscard]] disc::GnudbSubmissionMetadataUtf8 metadata_submission() const
+    {
+        disc::GnudbSubmissionMetadataUtf8 result;
+        result.album_title = to_utf8(metadata_editor_working_.album_title);
+        result.album_artist = to_utf8(metadata_editor_working_.album_artist);
+        result.category = to_utf8(metadata_editor_working_.category);
+        result.year = to_utf8(metadata_editor_working_.year);
+        result.revision = metadata_editor_working_.revision;
+        result.user_edited = metadata_editor_has_saved_edits_ || metadata_editor_changed();
+        result.track_titles.reserve(metadata_editor_working_.track_titles.size());
+        result.track_artists.reserve(metadata_editor_working_.track_artists.size());
+        for (const auto& title : metadata_editor_working_.track_titles) {
+            result.track_titles.push_back(to_utf8(title));
+        }
+        for (const auto& artist : metadata_editor_working_.track_artists) {
+            result.track_artists.push_back(to_utf8(artist));
+        }
+        return result;
+    }
+
+    [[nodiscard]] bool save_metadata_locally()
+    {
+        commit_metadata_editor_fields();
+        if (!disc_.toc || current_disc_key_.empty()) {
+            return false;
+        }
+        if (metadata_editor_working_.album_title.empty() ||
+            metadata_editor_working_.album_artist.empty() ||
+            metadata_editor_working_.track_titles.size() != disc_.tracks.size() ||
+            std::ranges::any_of(
+                metadata_editor_working_.track_titles,
+                [](const std::wstring& title) { return title.empty(); }) ||
+            !disc::is_valid_gnudb_category(
+                to_utf8(metadata_editor_working_.category))) {
+            metadata_editor_feedback_ =
+                L"请填写专辑名、艺术家、有效分类和所有曲名";
+            metadata_editor_feedback_error_ = true;
+            InvalidateRect(window_, nullptr, FALSE);
+            return false;
+        }
+        user_settings_.metadata_overrides[current_disc_key_] = metadata_editor_working_;
+        if (!platform::windows::save_user_settings(user_settings_)) {
+            metadata_editor_feedback_ = L"无法保存本地元数据";
+            metadata_editor_feedback_error_ = true;
+            InvalidateRect(window_, nullptr, FALSE);
+            return false;
+        }
+        metadata_editor_has_saved_edits_ = true;
+        metadata_editor_original_ = metadata_editor_working_;
+        apply_saved_metadata_override();
+        metadata_editor_feedback_ = L"已保存到本机，不会被在线元数据覆盖";
+        metadata_editor_feedback_error_ = false;
+        sync_system_media(true);
+        if (listenbrainz_tracker_.active() && selected_track_ < disc_.tracks.size()) {
+            listenbrainz_tracker_.update(
+                listen_metadata(selected_track_),
+                playback_track_frame_,
+                unix_time_now());
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+        return true;
+    }
+
+    void start_cddb_submission(const platform::windows::CddbSubmissionMode mode)
+    {
+        if (cddb_submission_worker_.joinable() || !save_metadata_locally()) {
+            return;
+        }
+        if (!user_settings_.cddb_enabled) {
+            metadata_editor_feedback_ = L"CDDB/freedb 已在设置中关闭";
+            metadata_editor_feedback_error_ = true;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+        if (!platform::windows::is_valid_cddb_email(user_settings_.cddb_email)) {
+            metadata_editor_feedback_ = L"请先在设置中填写有效的 CDDB 提交邮箱";
+            metadata_editor_feedback_error_ = true;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+        if (mode == platform::windows::CddbSubmissionMode::submit &&
+            MessageBoxW(
+                window_,
+                L"这会将当前整张光盘的编辑结果和提交邮箱发送到配置的公共 CDDB/freedb 服务器。是否继续？",
+                L"正式上传 CDDB 元数据",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            return;
+        }
+        const platform::windows::CddbClientConfiguration configuration{
+            user_settings_.cddb_server,
+            user_settings_.cddb_email,
+        };
+        const auto submission = metadata_submission();
+        disc::GnudbSubmissionError submission_error{};
+        if (!disc::make_gnudb_submission_entry(
+                *disc_.toc,
+                submission,
+                submission_error)) {
+            metadata_editor_feedback_ =
+                L"上传要求替换所有“音轨 01 / Track 01”占位曲名";
+            metadata_editor_feedback_error_ = true;
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
+        const disc::Toc toc = *disc_.toc;
+        const HWND target_window = window_;
+        metadata_editor_feedback_ = mode == platform::windows::CddbSubmissionMode::test
+            ? L"正在请服务器校验…"
+            : L"正在上传…";
+        metadata_editor_feedback_error_ = false;
+        cddb_submission_worker_ = std::jthread([
+            target_window,
+            configuration,
+            submission,
+            toc,
+            mode] {
+            auto snapshot = std::make_unique<CddbSubmissionSnapshot>();
+            snapshot->mode = mode;
+            snapshot->result = platform::windows::submit_gnudb(
+                configuration,
+                submission,
+                toc,
+                mode);
+            auto* raw = snapshot.release();
+            if (PostMessageW(
+                    target_window,
+                    kCddbSubmissionReadyMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(raw)) == FALSE) {
+                delete raw;
+            }
+        });
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void receive_cddb_submission(std::unique_ptr<CddbSubmissionSnapshot> snapshot)
+    {
+        if (cddb_submission_worker_.joinable()) {
+            cddb_submission_worker_.join();
+        }
+        std::wstring response = snapshot->result.message;
+        std::replace(response.begin(), response.end(), L'\r', L' ');
+        std::replace(response.begin(), response.end(), L'\n', L' ');
+        if (response.size() > 160U) {
+            response.resize(160U);
+        }
+        if (snapshot->result.accepted) {
+            metadata_editor_feedback_ =
+                snapshot->mode == platform::windows::CddbSubmissionMode::test
+                ? L"服务器校验通过，未写入公共数据库"
+                : L"服务器已接收正式提交";
+            if (snapshot->mode == platform::windows::CddbSubmissionMode::submit) {
+                ++metadata_editor_working_.revision;
+                metadata_editor_original_.revision = metadata_editor_working_.revision;
+                if (!current_disc_key_.empty()) {
+                    user_settings_.metadata_overrides[current_disc_key_].revision =
+                        metadata_editor_working_.revision;
+                    persist_user_settings();
+                }
+            }
+            metadata_editor_feedback_error_ = false;
+        } else {
+            metadata_editor_feedback_ = response.empty()
+                ? std::format(
+                      L"CDDB 请求失败（HTTP {}，系统 {}）",
+                      snapshot->result.http_status,
+                      snapshot->result.system_error)
+                : response;
+            metadata_editor_feedback_error_ = true;
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void select_metadata_track(const int direction)
+    {
+        commit_metadata_editor_fields();
+        if (metadata_editor_working_.track_titles.empty()) {
+            return;
+        }
+        const auto next = std::clamp<std::ptrdiff_t>(
+            static_cast<std::ptrdiff_t>(metadata_editor_track_) + direction,
+            0,
+            static_cast<std::ptrdiff_t>(metadata_editor_working_.track_titles.size() - 1U));
+        metadata_editor_track_ = static_cast<std::size_t>(next);
+        load_metadata_track_fields();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void handle_metadata_mouse_wheel(const short delta)
+    {
+        const std::size_t visible = static_cast<std::size_t>(std::max(
+            1.0F,
+            std::floor((layout_.metadata_track_list.bottom -
+                        layout_.metadata_track_list.top - 28.0F) / 36.0F)));
+        const std::size_t maximum = disc_.tracks.size() > visible
+            ? disc_.tracks.size() - visible
+            : 0U;
+        if (delta > 0) {
+            metadata_editor_scroll_row_ = metadata_editor_scroll_row_ > 2U
+                ? metadata_editor_scroll_row_ - 3U
+                : 0U;
+        } else {
+            metadata_editor_scroll_row_ = std::min(
+                maximum,
+                metadata_editor_scroll_row_ + 3U);
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void handle_metadata_click(const D2D1_POINT_2F point)
+    {
+        if (contains(layout_.metadata_back, point)) {
+            close_metadata_editor();
+            return;
+        }
+        if (contains(layout_.metadata_save, point)) {
+            static_cast<void>(save_metadata_locally());
+            return;
+        }
+        if (contains(layout_.metadata_test_submit, point)) {
+            start_cddb_submission(platform::windows::CddbSubmissionMode::test);
+            return;
+        }
+        if (contains(layout_.metadata_submit, point)) {
+            start_cddb_submission(platform::windows::CddbSubmissionMode::submit);
+            return;
+        }
+        for (const auto& hit : metadata_track_hits_) {
+            if (contains(hit.rectangle, point)) {
+                commit_metadata_editor_fields();
+                metadata_editor_track_ = hit.track_index;
+                load_metadata_track_fields();
+                InvalidateRect(window_, nullptr, FALSE);
+                return;
+            }
+        }
+    }
+
+    void draw_metadata_editor_page()
+    {
+        draw_text(
+            L"编辑元数据",
+            heading_format_.Get(),
+            D2D1::RectF(
+                layout_.metadata_page.left,
+                84.0F,
+                layout_.metadata_back.left - 20.0F,
+                116.0F),
+            text_brush_.Get());
+        draw_text(
+            L"本地修改优先级最高；上传始终需要用户明确操作",
+            small_format_.Get(),
+            D2D1::RectF(
+                layout_.metadata_page.left,
+                116.0F,
+                layout_.metadata_back.left - 20.0F,
+                140.0F),
+            secondary_brush_.Get());
+        const auto back = D2D1::RoundedRect(layout_.metadata_back, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(back, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(back, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"←  返回播放器",
+            button_format_.Get(),
+            layout_.metadata_back,
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto draw_field = [&](const D2D1_RECT_F rectangle, const wchar_t* label) {
+            draw_text(
+                label,
+                caption_format_.Get(),
+                D2D1::RectF(
+                    rectangle.left,
+                    rectangle.top - 18.0F,
+                    rectangle.right,
+                    rectangle.top),
+                muted_brush_.Get());
+            const auto field = D2D1::RoundedRect(rectangle, 10.0F, 10.0F);
+            render_target_->FillRoundedRectangle(field, elevated_brush_.Get());
+            render_target_->DrawRoundedRectangle(field, border_brush_.Get(), 1.0F);
+        };
+        draw_field(layout_.metadata_album_title_edit, L"专辑名");
+        draw_field(layout_.metadata_album_artist_edit, L"专辑艺术家");
+        draw_field(
+            layout_.metadata_category_edit,
+            L"CDDB 分类（misc / rock / classical / soundtrack 等）");
+        draw_field(layout_.metadata_year_edit, L"年份");
+        draw_field(
+            layout_.metadata_track_title_edit,
+            std::format(L"{:02} 曲名", metadata_editor_track_ + 1U).c_str());
+        draw_field(layout_.metadata_track_artist_edit, L"曲目艺术家");
+
+        const auto list = D2D1::RoundedRect(layout_.metadata_track_list, 12.0F, 12.0F);
+        render_target_->FillRoundedRectangle(list, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(list, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"#",
+            caption_format_.Get(),
+            D2D1::RectF(
+                list.rect.left + 12.0F,
+                list.rect.top + 5.0F,
+                list.rect.left + 50.0F,
+                list.rect.top + 27.0F),
+            muted_brush_.Get());
+        draw_text(
+            L"曲名 / 艺术家",
+            caption_format_.Get(),
+            D2D1::RectF(
+                list.rect.left + 54.0F,
+                list.rect.top + 5.0F,
+                list.rect.right - 16.0F,
+                list.rect.top + 27.0F),
+            muted_brush_.Get());
+        const float row_height = 36.0F;
+        const float rows_top = list.rect.top + 28.0F;
+        const std::size_t visible = static_cast<std::size_t>(std::max(
+            1.0F,
+            std::floor((list.rect.bottom - rows_top) / row_height)));
+        const std::size_t maximum = disc_.tracks.size() > visible
+            ? disc_.tracks.size() - visible
+            : 0U;
+        metadata_editor_scroll_row_ = std::min(metadata_editor_scroll_row_, maximum);
+        metadata_track_hits_.clear();
+        render_target_->PushAxisAlignedClip(
+            D2D1::RectF(list.rect.left, rows_top, list.rect.right, list.rect.bottom),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const std::size_t end = std::min(
+            disc_.tracks.size(), metadata_editor_scroll_row_ + visible);
+        for (std::size_t index = metadata_editor_scroll_row_; index < end; ++index) {
+            const float top = rows_top +
+                static_cast<float>(index - metadata_editor_scroll_row_) * row_height;
+            const D2D1_RECT_F row = D2D1::RectF(
+                list.rect.left + 4.0F,
+                top,
+                list.rect.right - 4.0F,
+                top + row_height);
+            if (index == metadata_editor_track_) {
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(row, 8.0F, 8.0F),
+                    selection_brush_.Get());
+            }
+            metadata_track_hits_.push_back({row, index});
+            draw_text(
+                std::format(L"{:02}", disc_.tracks[index].number),
+                caption_format_.Get(),
+                D2D1::RectF(row.left + 8.0F, row.top + 8.0F, row.left + 48.0F, row.bottom),
+                muted_brush_.Get());
+            std::wstring summary = metadata_editor_working_.track_titles[index];
+            const auto& artist = metadata_editor_working_.track_artists[index];
+            if (!artist.empty()) {
+                summary += L"  ·  " + artist;
+            }
+            draw_text(
+                summary,
+                small_format_.Get(),
+                D2D1::RectF(row.left + 54.0F, row.top + 6.0F, row.right - 12.0F, row.bottom),
+                index == metadata_editor_track_ ? text_brush_.Get() : secondary_brush_.Get());
+        }
+        render_target_->PopAxisAlignedClip();
+        if (maximum != 0U) {
+            const float track_top = rows_top + 4.0F;
+            const float track_bottom = list.rect.bottom - 4.0F;
+            const float thumb_height = std::max(
+                24.0F,
+                (track_bottom - track_top) * static_cast<float>(visible) /
+                    static_cast<float>(disc_.tracks.size()));
+            const float thumb_top = track_top +
+                (track_bottom - track_top - thumb_height) *
+                    static_cast<float>(metadata_editor_scroll_row_) /
+                    static_cast<float>(maximum);
+            render_target_->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(list.rect.right - 8.0F, thumb_top,
+                                list.rect.right - 4.0F, thumb_top + thumb_height),
+                    2.0F,
+                    2.0F),
+                muted_brush_.Get());
+        }
+
+        const auto button = [&](
+            const D2D1_RECT_F rectangle,
+            const wchar_t* label,
+            const bool primary,
+            const bool enabled) {
+            const auto rounded = D2D1::RoundedRect(rectangle, 10.0F, 10.0F);
+            render_target_->FillRoundedRectangle(
+                rounded,
+                primary && enabled ? accent_brush_.Get() : elevated_brush_.Get());
+            render_target_->DrawRoundedRectangle(rounded, border_brush_.Get(), 1.0F);
+            draw_text(
+                label,
+                button_format_.Get(),
+                rectangle,
+                enabled
+                    ? (primary ? accent_text_brush_.Get() : text_brush_.Get())
+                    : muted_brush_.Get(),
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+        };
+        const bool submission_idle = !cddb_submission_worker_.joinable();
+        button(layout_.metadata_save, L"保存到本机", false, true);
+        button(
+            layout_.metadata_test_submit,
+            L"测试上传",
+            false,
+            submission_idle && user_settings_.cddb_enabled);
+        button(
+            layout_.metadata_submit,
+            L"正式上传",
+            true,
+            submission_idle && user_settings_.cddb_enabled);
+        if (!metadata_editor_feedback_.empty()) {
+            draw_text(
+                metadata_editor_feedback_,
+                caption_format_.Get(),
+                D2D1::RectF(
+                    layout_.metadata_save.right + 16.0F,
+                    layout_.metadata_save.top + 4.0F,
+                    layout_.metadata_test_submit.left - 16.0F,
+                    layout_.metadata_save.bottom),
+                metadata_editor_feedback_error_
+                    ? error_brush_.Get()
+                    : success_brush_.Get(),
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
     }
 
     void eject_disc()
@@ -4081,6 +5826,8 @@ private:
 
     HINSTANCE instance_{};
     HWND window_{};
+    HWND resize_focus_{};
+    bool window_resizing_{};
     ThemePalette theme_{};
     std::wstring accessible_name_;
     ComPtr<ID2D1Factory> factory_;
@@ -4145,12 +5892,36 @@ private:
     bool settings_save_failed_{};
     bool settings_saved_{};
     bool settings_input_required_{};
+    bool settings_controls_ready_{};
+    bool settings_scroll_active_{};
+    float settings_scroll_offset_{};
+    std::size_t settings_token_character_count_{};
+    bool settings_token_mask_active_{};
     HWND settings_token_edit_{};
     SettingsDropdown settings_dropdown_{SettingsDropdown::none};
     std::size_t settings_dropdown_scroll_{};
     std::size_t settings_dropdown_highlight_{};
     std::vector<SettingsDropdownHit> settings_dropdown_hits_;
+    HWND settings_cddb_server_edit_{};
+    HWND settings_cddb_email_edit_{};
+    std::wstring cddb_settings_error_;
     WNDPROC settings_edit_original_proc_{};
+    HWND metadata_album_title_edit_{};
+    HWND metadata_album_artist_edit_{};
+    HWND metadata_category_edit_{};
+    HWND metadata_year_edit_{};
+    HWND metadata_track_title_edit_{};
+    HWND metadata_track_artist_edit_{};
+    WNDPROC metadata_editor_edit_original_proc_{};
+    platform::windows::SavedDiscMetadata metadata_editor_working_;
+    platform::windows::SavedDiscMetadata metadata_editor_original_;
+    std::size_t metadata_editor_track_{};
+    std::size_t metadata_editor_scroll_row_{};
+    std::vector<TrackHit> metadata_track_hits_;
+    bool metadata_editor_has_saved_edits_{};
+    std::wstring metadata_editor_feedback_;
+    bool metadata_editor_feedback_error_{};
+    std::jthread cddb_submission_worker_;
     HFONT settings_font_{};
     HBRUSH settings_edit_brush_{};
     HWND metadata_edit_{};

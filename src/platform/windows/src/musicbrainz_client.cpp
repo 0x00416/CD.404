@@ -6,22 +6,34 @@
 #include <xmllite.h>
 #include <wrl/client.h>
 
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Data.Json.h>
+#include <winrt/base.h>
+
 #include <cd404/platform/windows/musicbrainz_client.hpp>
 #include <cd404/disc/musicbrainz_disc_id.hpp>
 
+#include "http_client.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cwctype>
 #include <cwchar>
+#include <chrono>
 #include <format>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -32,6 +44,20 @@ using Microsoft::WRL::ComPtr;
 
 constexpr std::uint64_t kMaximumAverageTrackDifferenceMilliseconds = 2'000U;
 constexpr std::uint64_t kMaximumSingleTrackDifferenceMilliseconds = 5'000U;
+
+void wait_for_musicbrainz_request_slot()
+{
+    using namespace std::chrono_literals;
+    static std::mutex mutex;
+    static std::chrono::steady_clock::time_point previous;
+    const std::scoped_lock lock(mutex);
+    const auto earliest = previous + 1'100ms;
+    if (previous != std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now() < earliest) {
+        std::this_thread::sleep_until(earliest);
+    }
+    previous = std::chrono::steady_clock::now();
+}
 
 class InternetHandle final {
 public:
@@ -72,9 +98,11 @@ private:
            L"&inc=recordings+artist-credits+release-groups&cdstubs=no";
 }
 
-[[nodiscard]] bool read_response(HINTERNET request, std::vector<std::uint8_t>& body)
+[[nodiscard]] bool read_response(
+    HINTERNET request,
+    std::vector<std::uint8_t>& body,
+    const std::size_t maximum_response_bytes = 2U * 1'024U * 1'024U)
 {
-    constexpr std::size_t kMaximumResponseBytes = 2U * 1'024U * 1'024U;
     for (;;) {
         DWORD available{};
         if (WinHttpQueryDataAvailable(request, &available) == FALSE) {
@@ -83,7 +111,7 @@ private:
         if (available == 0) {
             return true;
         }
-        if (available > kMaximumResponseBytes - body.size()) {
+        if (available > maximum_response_bytes - body.size()) {
             SetLastError(ERROR_FILE_TOO_LARGE);
             return false;
         }
@@ -119,6 +147,23 @@ private:
            (release_id + L"-1200.jpg");
 }
 
+[[nodiscard]] bool is_musicbrainz_identifier(const std::wstring_view value)
+{
+    if (value.size() != 36U) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < value.size(); ++index) {
+        if (index == 8U || index == 13U || index == 18U || index == 23U) {
+            if (value[index] != L'-') {
+                return false;
+            }
+        } else if (std::iswxdigit(value[index]) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] bool looks_like_image(const std::span<const std::uint8_t> bytes)
 {
     constexpr std::uint8_t kPngSignature[]{
@@ -134,12 +179,31 @@ private:
     return jpeg || png;
 }
 
-[[nodiscard]] std::filesystem::path download_cover_art(const std::wstring& release_id)
+[[nodiscard]] bool cached_cover_is_image(const std::filesystem::path& path)
 {
+    std::ifstream input(path, std::ios::binary);
+    std::array<std::uint8_t, 8> signature{};
+    input.read(
+        reinterpret_cast<char*>(signature.data()),
+        static_cast<std::streamsize>(signature.size()));
+    return looks_like_image(std::span(
+        signature.data(),
+        static_cast<std::size_t>(std::max<std::streamsize>(input.gcount(), 0))));
+}
+
+[[nodiscard]] std::filesystem::path download_cover_art(
+    const std::wstring& release_id,
+    const std::wstring& release_group_id)
+{
+    if (!is_musicbrainz_identifier(release_id) ||
+        (!release_group_id.empty() &&
+         !is_musicbrainz_identifier(release_group_id))) {
+        return {};
+    }
     const std::filesystem::path cache_path = cover_cache_path(release_id);
     std::error_code filesystem_error;
     if (!cache_path.empty() && std::filesystem::file_size(cache_path, filesystem_error) > 0 &&
-        !filesystem_error) {
+        !filesystem_error && cached_cover_is_image(cache_path)) {
         return cache_path;
     }
     if (cache_path.empty()) {
@@ -147,7 +211,7 @@ private:
     }
 
     InternetHandle session(WinHttpOpen(
-        L"CD.404/0.1 (https://github.com/0x00416/CD.404)",
+        L"CD.404/0.2.0 (https://github.com/0x00416/CD.404)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -164,43 +228,65 @@ private:
     if (connection.get() == nullptr) {
         return {};
     }
-    const std::wstring path = L"/release/" + release_id + L"/front-1200";
-    InternetHandle request(WinHttpOpenRequest(
-        connection.get(),
-        L"GET",
-        path.c_str(),
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE));
-    if (request.get() == nullptr ||
-        WinHttpSendRequest(
-            request.get(),
-            WINHTTP_NO_ADDITIONAL_HEADERS,
-            0,
-            WINHTTP_NO_REQUEST_DATA,
-            0,
-            0,
-            0) == FALSE ||
-        WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
-        return {};
-    }
-
-    DWORD status{};
-    DWORD status_size = sizeof(status);
-    if (WinHttpQueryHeaders(
-            request.get(),
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &status,
-            &status_size,
-            WINHTTP_NO_HEADER_INDEX) == FALSE ||
-        status != 200) {
-        return {};
-    }
-
     std::vector<std::uint8_t> image;
-    if (!read_response(request.get(), image) || !looks_like_image(image)) {
+    const std::array paths{
+        L"/release/" + release_id + L"/front-1200",
+        release_group_id.empty()
+            ? std::wstring{}
+            : L"/release-group/" + release_group_id + L"/front-1200",
+    };
+    for (const auto& path : paths) {
+        if (path.empty()) {
+            continue;
+        }
+        InternetHandle request(WinHttpOpenRequest(
+            connection.get(),
+            L"GET",
+            path.c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE));
+        if (request.get() == nullptr ||
+            WinHttpSendRequest(
+                request.get(),
+                WINHTTP_NO_ADDITIONAL_HEADERS,
+                0,
+                WINHTTP_NO_REQUEST_DATA,
+                0,
+                0,
+                0) == FALSE ||
+            WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
+            return {};
+        }
+
+        DWORD status{};
+        DWORD status_size = sizeof(status);
+        if (WinHttpQueryHeaders(
+                request.get(),
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &status,
+                &status_size,
+                WINHTTP_NO_HEADER_INDEX) == FALSE) {
+            return {};
+        }
+        if (status == 404) {
+            continue;
+        }
+        if (status != 200) {
+            return {};
+        }
+
+        image.clear();
+        constexpr std::size_t kMaximumCoverBytes = 12U * 1'024U * 1'024U;
+        if (read_response(request.get(), image, kMaximumCoverBytes) &&
+            looks_like_image(image)) {
+            break;
+        }
+        image.clear();
+    }
+    if (image.empty()) {
         return {};
     }
 
@@ -405,6 +491,7 @@ void end_element(
                 maximum_difference <= kMaximumSingleTrackDifferenceMilliseconds &&
                 score <= kMaximumAverageTrackDifferenceMilliseconds * expected_tracks;
             if (durations_match) {
+                state.candidate.track_lengths_milliseconds = state.track_lengths;
                 state.matches.emplace_back(score, state.candidate);
             }
         }
@@ -415,6 +502,7 @@ void end_element(
         state.candidate.track_ids.clear();
         state.candidate.recording_ids.clear();
         state.candidate.track_artist_ids.clear();
+        state.candidate.track_lengths_milliseconds.clear();
         state.track_lengths.clear();
     } else if (name == L"artist-credit" && depth == state.track_artist_depth) {
         state.track_artist_depth = std::numeric_limits<std::size_t>::max();
@@ -494,6 +582,291 @@ void end_element(
     return candidates;
 }
 
+[[nodiscard]] std::wstring normalized_content_name(const std::wstring_view value)
+{
+    std::wstring_view title = value;
+    const std::size_t qualifier = title.find_last_of(L"(（[");
+    if (qualifier != std::wstring_view::npos) {
+        std::wstring suffix;
+        for (const wchar_t character : title.substr(qualifier)) {
+            if (std::iswalnum(character) != 0) {
+                suffix.push_back(static_cast<wchar_t>(std::towlower(character)));
+            }
+        }
+        if (suffix.find(L"remix") != std::wstring::npos) {
+            title = title.substr(0U, qualifier);
+        }
+    }
+    std::wstring normalized;
+    normalized.reserve(title.size());
+    for (const wchar_t character : title) {
+        if (std::iswalnum(character) != 0) {
+            normalized.push_back(static_cast<wchar_t>(std::towlower(character)));
+        }
+    }
+    constexpr std::wstring_view remix = L"remix";
+    if (normalized.size() > remix.size() && normalized.ends_with(remix)) {
+        normalized.resize(normalized.size() - remix.size());
+    }
+    return normalized;
+}
+
+[[nodiscard]] std::uint32_t name_similarity(
+    const std::wstring_view left,
+    const std::wstring_view right)
+{
+    const std::wstring a = normalized_content_name(left);
+    const std::wstring b = normalized_content_name(right);
+    if (a.empty() || b.empty()) {
+        return 0U;
+    }
+    std::vector<std::size_t> previous(b.size() + 1U);
+    std::vector<std::size_t> current(b.size() + 1U);
+    std::iota(previous.begin(), previous.end(), 0U);
+    for (std::size_t row = 1U; row <= a.size(); ++row) {
+        current[0] = row;
+        for (std::size_t column = 1U; column <= b.size(); ++column) {
+            current[column] = std::min({
+                previous[column] + 1U,
+                current[column - 1U] + 1U,
+                previous[column - 1U] +
+                    (a[row - 1U] == b[column - 1U] ? 0U : 1U),
+            });
+        }
+        std::swap(previous, current);
+    }
+    const std::size_t maximum = std::max(a.size(), b.size());
+    return static_cast<std::uint32_t>(
+        (maximum - std::min(maximum, previous.back())) * 1'000U / maximum);
+}
+
+[[nodiscard]] std::vector<std::size_t> minimum_cost_assignment(
+    const std::vector<std::vector<std::uint64_t>>& costs)
+{
+    const std::size_t count = costs.size();
+    if (count == 0U || std::ranges::any_of(costs, [count](const auto& row) {
+            return row.size() != count;
+        })) {
+        return {};
+    }
+    std::vector<std::int64_t> u(count + 1U);
+    std::vector<std::int64_t> v(count + 1U);
+    std::vector<std::size_t> p(count + 1U);
+    std::vector<std::size_t> way(count + 1U);
+    for (std::size_t row = 1U; row <= count; ++row) {
+        p[0] = row;
+        std::size_t column0{};
+        std::vector<std::int64_t> minimum(
+            count + 1U,
+            std::numeric_limits<std::int64_t>::max());
+        std::vector<bool> used(count + 1U);
+        do {
+            used[column0] = true;
+            const std::size_t row0 = p[column0];
+            std::int64_t delta = std::numeric_limits<std::int64_t>::max();
+            std::size_t column1{};
+            for (std::size_t column = 1U; column <= count; ++column) {
+                if (used[column]) {
+                    continue;
+                }
+                const auto current = static_cast<std::int64_t>(
+                    costs[row0 - 1U][column - 1U]) - u[row0] - v[column];
+                if (current < minimum[column]) {
+                    minimum[column] = current;
+                    way[column] = column0;
+                }
+                if (minimum[column] < delta) {
+                    delta = minimum[column];
+                    column1 = column;
+                }
+            }
+            for (std::size_t column = 0U; column <= count; ++column) {
+                if (used[column]) {
+                    u[p[column]] += delta;
+                    v[column] -= delta;
+                } else {
+                    minimum[column] -= delta;
+                }
+            }
+            column0 = column1;
+        } while (p[column0] != 0U);
+        do {
+            const std::size_t column1 = way[column0];
+            p[column0] = p[column1];
+            column0 = column1;
+        } while (column0 != 0U);
+    }
+    std::vector<std::size_t> assignment(count);
+    for (std::size_t column = 1U; column <= count; ++column) {
+        assignment[p[column] - 1U] = column - 1U;
+    }
+    return assignment;
+}
+
+using winrt::Windows::Data::Json::JsonArray;
+using winrt::Windows::Data::Json::JsonObject;
+
+[[nodiscard]] std::wstring json_string(
+    const JsonObject& object,
+    const wchar_t* key)
+{
+    return object.HasKey(key)
+        ? std::wstring(object.GetNamedString(key, L""))
+        : std::wstring{};
+}
+
+[[nodiscard]] std::uint64_t json_unsigned(
+    const JsonObject& object,
+    const wchar_t* key)
+{
+    if (!object.HasKey(key)) {
+        return 0U;
+    }
+    const double value = object.GetNamedNumber(key, 0.0);
+    return value > 0.0 && value <=
+            static_cast<double>(std::numeric_limits<std::uint64_t>::max())
+        ? static_cast<std::uint64_t>(value)
+        : 0U;
+}
+
+[[nodiscard]] std::wstring artist_credit_name(const JsonArray& credit)
+{
+    std::wstring result;
+    for (std::uint32_t index = 0U; index < credit.Size(); ++index) {
+        const JsonObject item = credit.GetObjectAt(index);
+        std::wstring name = json_string(item, L"name");
+        if (name.empty() && item.HasKey(L"artist")) {
+            name = json_string(item.GetNamedObject(L"artist"), L"name");
+        }
+        result += name;
+        result += json_string(item, L"joinphrase");
+    }
+    return result;
+}
+
+[[nodiscard]] std::vector<std::wstring> artist_credit_ids(const JsonArray& credit)
+{
+    std::vector<std::wstring> result;
+    for (std::uint32_t index = 0U; index < credit.Size(); ++index) {
+        const JsonObject item = credit.GetObjectAt(index);
+        if (!item.HasKey(L"artist")) {
+            continue;
+        }
+        const std::wstring id = json_string(item.GetNamedObject(L"artist"), L"id");
+        if (!id.empty() && std::ranges::find(result, id) == result.end()) {
+            result.push_back(id);
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] std::vector<MusicBrainzMetadata> parse_release_detail_json_impl(
+    const std::span<const std::uint8_t> body,
+    const std::size_t expected_tracks)
+{
+    const std::string utf8(
+        reinterpret_cast<const char*>(body.data()),
+        body.size());
+    try {
+        const JsonObject release = JsonObject::Parse(detail::utf8_to_wide(utf8));
+        MusicBrainzMetadata base;
+        base.release_id = json_string(release, L"id");
+        base.album_title = json_string(release, L"title");
+        if (release.HasKey(L"release-group")) {
+            base.release_group_id = json_string(
+                release.GetNamedObject(L"release-group"), L"id");
+        }
+        if (release.HasKey(L"artist-credit")) {
+            base.album_artist = artist_credit_name(
+                release.GetNamedArray(L"artist-credit"));
+        }
+        if (base.release_id.empty() || base.album_title.empty() ||
+            !release.HasKey(L"media")) {
+            return {};
+        }
+        std::vector<MusicBrainzMetadata> candidates;
+        const JsonArray media = release.GetNamedArray(L"media");
+        for (std::uint32_t medium_index = 0U;
+             medium_index < media.Size();
+             ++medium_index) {
+            const JsonObject medium = media.GetObjectAt(medium_index);
+            if (json_unsigned(medium, L"track-count") != expected_tracks ||
+                !medium.HasKey(L"tracks")) {
+                continue;
+            }
+            const JsonArray tracks = medium.GetNamedArray(L"tracks");
+            if (tracks.Size() != expected_tracks) {
+                continue;
+            }
+            MusicBrainzMetadata candidate = base;
+            for (std::uint32_t track_index = 0U;
+                 track_index < tracks.Size();
+                 ++track_index) {
+                const JsonObject track = tracks.GetObjectAt(track_index);
+                const JsonObject recording = track.HasKey(L"recording")
+                    ? track.GetNamedObject(L"recording")
+                    : JsonObject{};
+                std::wstring title = json_string(track, L"title");
+                if (title.empty()) {
+                    title = json_string(recording, L"title");
+                }
+                std::uint64_t length = json_unsigned(track, L"length");
+                if (length == 0U) {
+                    length = json_unsigned(recording, L"length");
+                }
+                JsonArray credit;
+                if (track.HasKey(L"artist-credit")) {
+                    credit = track.GetNamedArray(L"artist-credit");
+                } else if (recording.HasKey(L"artist-credit")) {
+                    credit = recording.GetNamedArray(L"artist-credit");
+                }
+                candidate.track_titles.push_back(std::move(title));
+                candidate.track_artists.push_back(artist_credit_name(credit));
+                candidate.track_ids.push_back(json_string(track, L"id"));
+                candidate.recording_ids.push_back(json_string(recording, L"id"));
+                candidate.track_artist_ids.push_back(artist_credit_ids(credit));
+                candidate.track_lengths_milliseconds.push_back(length);
+            }
+            candidates.push_back(std::move(candidate));
+        }
+        return candidates;
+    } catch (const winrt::hresult_error&) {
+        return {};
+    }
+}
+
+[[nodiscard]] std::vector<std::wstring> parse_release_search_json(
+    const std::vector<std::uint8_t>& body,
+    const MusicBrainzContentQuery& query)
+{
+    const std::string utf8(
+        reinterpret_cast<const char*>(body.data()),
+        body.size());
+    try {
+        const JsonObject root = JsonObject::Parse(detail::utf8_to_wide(utf8));
+        if (!root.HasKey(L"releases")) {
+            return {};
+        }
+        std::vector<std::wstring> ids;
+        const JsonArray releases = root.GetNamedArray(L"releases");
+        for (std::uint32_t index = 0U; index < releases.Size() && ids.size() < 3U;
+             ++index) {
+            const JsonObject release = releases.GetObjectAt(index);
+            if (json_unsigned(release, L"track-count") != query.track_titles.size() ||
+                name_similarity(json_string(release, L"title"), query.album_title) < 900U) {
+                continue;
+            }
+            const std::wstring id = json_string(release, L"id");
+            if (!id.empty() && std::ranges::find(ids, id) == ids.end()) {
+                ids.push_back(id);
+            }
+        }
+        return ids;
+    } catch (const winrt::hresult_error&) {
+        return {};
+    }
+}
+
 } // namespace
 
 std::optional<MusicBrainzLookupPaths> make_musicbrainz_lookup_paths(
@@ -527,6 +900,203 @@ std::vector<MusicBrainzMetadata> parse_musicbrainz_candidates(
     return candidates;
 }
 
+std::vector<MusicBrainzMetadata> parse_musicbrainz_content_release(
+    const std::span<const std::uint8_t> body,
+    const std::size_t expected_track_count)
+{
+    return parse_release_detail_json_impl(body, expected_track_count);
+}
+
+std::optional<MusicBrainzMetadata> match_musicbrainz_content(
+    const MusicBrainzContentQuery& query,
+    const std::span<const MusicBrainzMetadata> candidates)
+{
+    const std::size_t count = query.track_titles.size();
+    if (count == 0U || query.track_lengths_milliseconds.size() != count ||
+        query.album_title.empty()) {
+        return std::nullopt;
+    }
+    struct RankedMatch final {
+        std::uint64_t score{};
+        MusicBrainzMetadata metadata;
+    };
+    std::vector<RankedMatch> matches;
+    for (const auto& candidate : candidates) {
+        if (candidate.track_titles.size() != count ||
+            candidate.track_lengths_milliseconds.size() != count ||
+            candidate.recording_ids.size() != count ||
+            name_similarity(query.album_title, candidate.album_title) < 850U) {
+            continue;
+        }
+        std::vector<std::vector<std::uint64_t>> costs(
+            count,
+            std::vector<std::uint64_t>(count));
+        for (std::size_t local = 0U; local < count; ++local) {
+            for (std::size_t remote = 0U; remote < count; ++remote) {
+                const std::uint32_t similarity = name_similarity(
+                    query.track_titles[local], candidate.track_titles[remote]);
+                const auto local_length = query.track_lengths_milliseconds[local];
+                const auto remote_length = candidate.track_lengths_milliseconds[remote];
+                const auto difference = local_length > remote_length
+                    ? local_length - remote_length
+                    : remote_length - local_length;
+                costs[local][remote] =
+                    static_cast<std::uint64_t>(1'000U - similarity) * 10'000U +
+                    std::min<std::uint64_t>(difference, 60'000U);
+            }
+        }
+        const std::vector<std::size_t> assignment = minimum_cost_assignment(costs);
+        if (assignment.size() != count) {
+            continue;
+        }
+        std::uint64_t total_duration_difference{};
+        std::uint64_t total_similarity{};
+        std::uint64_t score{};
+        bool valid = true;
+        for (std::size_t local = 0U; local < count; ++local) {
+            const std::size_t remote = assignment[local];
+            const std::uint32_t similarity = name_similarity(
+                query.track_titles[local], candidate.track_titles[remote]);
+            const auto local_length = query.track_lengths_milliseconds[local];
+            const auto remote_length = candidate.track_lengths_milliseconds[remote];
+            const auto difference = local_length > remote_length
+                ? local_length - remote_length
+                : remote_length - local_length;
+            if (similarity < 600U ||
+                difference > kMaximumSingleTrackDifferenceMilliseconds ||
+                candidate.recording_ids[remote].empty()) {
+                valid = false;
+                break;
+            }
+            total_similarity += similarity;
+            total_duration_difference += difference;
+            score += costs[local][remote];
+        }
+        if (!valid || total_similarity < 850U * count ||
+            total_duration_difference >
+                kMaximumAverageTrackDifferenceMilliseconds * count) {
+            continue;
+        }
+
+        MusicBrainzMetadata reordered = candidate;
+        reordered.track_titles.clear();
+        reordered.track_artists.clear();
+        reordered.track_ids.clear();
+        reordered.recording_ids.clear();
+        reordered.track_artist_ids.clear();
+        reordered.track_lengths_milliseconds.clear();
+        for (const std::size_t remote : assignment) {
+            reordered.track_titles.push_back(candidate.track_titles[remote]);
+            reordered.track_artists.push_back(
+                remote < candidate.track_artists.size()
+                    ? candidate.track_artists[remote]
+                    : std::wstring{});
+            reordered.recording_ids.push_back(candidate.recording_ids[remote]);
+            reordered.track_artist_ids.push_back(
+                remote < candidate.track_artist_ids.size()
+                    ? candidate.track_artist_ids[remote]
+                    : std::vector<std::wstring>{});
+            reordered.track_lengths_milliseconds.push_back(
+                candidate.track_lengths_milliseconds[remote]);
+        }
+        reordered.exact_disc_id_match = false;
+        reordered.content_match = true;
+        matches.push_back({score, std::move(reordered)});
+    }
+    std::ranges::sort(matches, {}, &RankedMatch::score);
+    if (matches.empty()) {
+        return std::nullopt;
+    }
+    if (matches.size() > 1U) {
+        const std::uint64_t ambiguity_margin = 200'000U * count;
+        const bool near_tie = matches[1].score <= matches[0].score + ambiguity_margin;
+        const bool same_recordings =
+            matches[1].metadata.recording_ids == matches[0].metadata.recording_ids;
+        if (near_tie && !same_recordings) {
+            return std::nullopt;
+        }
+    }
+    return std::move(matches.front().metadata);
+}
+
+std::filesystem::path download_musicbrainz_cover_art(
+    const std::wstring_view release_id,
+    const std::wstring_view release_group_id)
+{
+    return download_cover_art(
+        std::wstring(release_id),
+        std::wstring(release_group_id));
+}
+
+MusicBrainzLookupResult lookup_musicbrainz_by_content(
+    const MusicBrainzContentQuery& query)
+{
+    if (query.album_title.empty() || query.track_titles.empty() ||
+        query.track_titles.size() != query.track_lengths_milliseconds.size()) {
+        return {std::nullopt, ERROR_INVALID_PARAMETER, 0};
+    }
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error& error) {
+        return {
+            std::nullopt,
+            static_cast<unsigned long>(error.code().value),
+            0,
+        };
+    }
+    struct ApartmentGuard final {
+        ~ApartmentGuard() { winrt::uninit_apartment(); }
+    } apartment_guard;
+
+    const std::wstring expression = std::format(
+        L"release:\"{}\" AND tracks:{}",
+        query.album_title,
+        query.track_titles.size());
+    const std::wstring search_path = L"/ws/2/release/?query=" +
+        detail::percent_encode_utf8(expression) + L"&fmt=json&limit=10";
+    wait_for_musicbrainz_request_slot();
+    const auto search = detail::https_get(
+        L"musicbrainz.org", search_path, 4U * 1'024U * 1'024U);
+    if (search.system_error != ERROR_SUCCESS || search.status != 200U) {
+        return {std::nullopt, search.system_error, search.status};
+    }
+    const std::vector<std::wstring> release_ids =
+        parse_release_search_json(search.body, query);
+    if (release_ids.empty()) {
+        return {std::nullopt, ERROR_NOT_FOUND, search.status};
+    }
+
+    std::vector<MusicBrainzMetadata> candidates;
+    for (const auto& release_id : release_ids) {
+        const std::wstring path = L"/ws/2/release/" + release_id +
+            L"?inc=recordings+artist-credits+release-groups&fmt=json";
+        wait_for_musicbrainz_request_slot();
+        const auto response = detail::https_get(
+            L"musicbrainz.org", path, 4U * 1'024U * 1'024U);
+        if (response.system_error != ERROR_SUCCESS || response.status != 200U) {
+            continue;
+        }
+        auto parsed = parse_musicbrainz_content_release(
+            response.body, query.track_titles.size());
+        candidates.insert(
+            candidates.end(),
+            std::make_move_iterator(parsed.begin()),
+            std::make_move_iterator(parsed.end()));
+    }
+    auto metadata = match_musicbrainz_content(query, candidates);
+    if (metadata) {
+        metadata->cover_art_path = download_cover_art(
+            metadata->release_id,
+            metadata->release_group_id);
+    }
+    MusicBrainzLookupResult result;
+    result.metadata = std::move(metadata);
+    result.system_error = result.metadata ? ERROR_SUCCESS : ERROR_NOT_FOUND;
+    result.http_status = search.status;
+    result.candidates = std::move(candidates);
+    return result;
+}
+
 MusicBrainzLookupResult lookup_musicbrainz(
     const disc::Toc& toc,
     const std::wstring_view preferred_release_id)
@@ -537,7 +1107,7 @@ MusicBrainzLookupResult lookup_musicbrainz(
     }
 
     InternetHandle session(WinHttpOpen(
-        L"CD.404/0.1 (https://github.com/0x00416/CD.404)",
+        L"CD.404/0.2.0 (https://github.com/0x00416/CD.404)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -563,6 +1133,7 @@ MusicBrainzLookupResult lookup_musicbrainz(
     }
     unsigned long last_http_status{};
     for (const std::wstring* path : {&paths->exact, &paths->fuzzy}) {
+        wait_for_musicbrainz_request_slot();
         InternetHandle request(WinHttpOpenRequest(
             connection.get(),
             L"GET",
@@ -626,7 +1197,9 @@ MusicBrainzLookupResult lookup_musicbrainz(
         std::optional<MusicBrainzMetadata> metadata;
         if (!candidates.empty()) {
             metadata = candidates[selected];
-            metadata->cover_art_path = download_cover_art(metadata->release_id);
+            metadata->cover_art_path = download_cover_art(
+                metadata->release_id,
+                metadata->release_group_id);
         }
         MusicBrainzLookupResult lookup;
         lookup.metadata = std::move(metadata);

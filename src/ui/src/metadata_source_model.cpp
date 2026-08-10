@@ -24,7 +24,7 @@ std::vector<std::wstring> make_metadata_source_labels(
         append_unique(source);
     }
     if (online_sources.empty() && loaded_from_cache) {
-        append_unique(L"本地元数据缓存");
+        append_unique(L"Local");
     }
     return labels;
 }

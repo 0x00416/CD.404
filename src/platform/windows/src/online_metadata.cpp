@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <utility>
 
 namespace cd404::platform::windows {
@@ -124,7 +125,8 @@ std::optional<OnlineMetadata> lookup_online_metadata(
     const disc::Toc& toc,
     const std::wstring_view seed_album_title,
     const std::wstring_view seed_album_artist,
-    const std::wstring_view preferred_release_id)
+    const std::wstring_view preferred_release_id,
+    const OnlineMetadataOptions& options)
 {
     const std::size_t expected_tracks = toc.tracks().size();
     if (expected_tracks == 0U) {
@@ -139,9 +141,19 @@ std::optional<OnlineMetadata> lookup_online_metadata(
     auto musicbrainz_future = std::async(std::launch::async, [&toc, effective_release] {
         return lookup_musicbrainz(toc, effective_release);
     });
-    auto gnudb_future = std::async(std::launch::async, [&toc] {
-        return lookup_gnudb(toc);
-    });
+    std::optional<std::future<GnudbLookupResult>> gnudb_future;
+    if (options.cddb_enabled) {
+        gnudb_future.emplace(std::async(
+            std::launch::async,
+            [&toc, &options] {
+                return lookup_gnudb(
+                    toc,
+                    CddbClientConfiguration{
+                        options.cddb_server,
+                        options.cddb_email,
+                    });
+            }));
+    }
 
     OnlineMetadata merged;
     const MusicBrainzLookupResult musicbrainz = musicbrainz_future.get();
@@ -161,6 +173,9 @@ std::optional<OnlineMetadata> lookup_online_metadata(
         merged.recording_mbids = musicbrainz.metadata->recording_ids;
         merged.track_artist_mbids = musicbrainz.metadata->track_artist_ids;
         merged.cover_art_path = musicbrainz.metadata->cover_art_path;
+        if (!merged.cover_art_path.empty()) {
+            merged.cover_art_source = L"Cover Art Archive";
+        }
         merged.sources.emplace_back(L"MusicBrainz");
     }
     merged.used_fuzzy_musicbrainz_fallback = musicbrainz.used_fuzzy_fallback;
@@ -175,18 +190,67 @@ std::optional<OnlineMetadata> lookup_online_metadata(
         ? musicbrainz.metadata->release_id
         : effective_release;
 
-    const GnudbLookupResult gnudb = gnudb_future.get();
-    if (gnudb.metadata) {
-        merge_text_metadata(merged, *gnudb.metadata, expected_tracks);
-        merge_editable(
-            merged.editable,
-            gnudb.metadata->album_title,
-            gnudb.metadata->album_artist,
-            gnudb.metadata->track_titles,
-            gnudb.metadata->track_artists,
-            MetadataSource::gnudb,
-            expected_tracks);
-        merged.sources.emplace_back(L"GnuDB");
+    std::optional<GnudbLookupResult> gnudb;
+    if (gnudb_future) {
+        gnudb = gnudb_future->get();
+        if (gnudb->metadata) {
+            merge_text_metadata(merged, *gnudb->metadata, expected_tracks);
+            merge_editable(
+                merged.editable,
+                gnudb->metadata->album_title,
+                gnudb->metadata->album_artist,
+                gnudb->metadata->track_titles,
+                gnudb->metadata->track_artists,
+                MetadataSource::gnudb,
+                expected_tracks);
+            merged.cddb_category = gnudb->metadata->category;
+            merged.cddb_year = gnudb->metadata->year;
+            merged.cddb_revision = gnudb->metadata->revision;
+            merged.sources.emplace_back(L"CDDB/freedb");
+        }
+    }
+
+    if (!musicbrainz.metadata && gnudb && gnudb->metadata &&
+        gnudb->metadata->track_titles.size() == expected_tracks) {
+        MusicBrainzContentQuery query;
+        query.album_title = gnudb->metadata->album_title;
+        query.album_artist = gnudb->metadata->album_artist;
+        query.year = gnudb->metadata->year;
+        query.track_titles = gnudb->metadata->track_titles;
+        query.track_lengths_milliseconds.reserve(expected_tracks);
+        for (const auto& track : toc.tracks()) {
+            query.track_lengths_milliseconds.push_back(
+                static_cast<std::uint64_t>(
+                    track.frame_count * 1'000 /
+                    core::kCdSampleFramesPerSecond));
+        }
+        const MusicBrainzLookupResult content =
+            lookup_musicbrainz_by_content(query);
+        if (content.metadata) {
+            merged.reference_release_mbid = content.metadata->release_id;
+            merged.reference_release_group_mbid =
+                content.metadata->release_group_id;
+            merged.recording_mbids = content.metadata->recording_ids;
+            merged.track_artist_mbids = content.metadata->track_artist_ids;
+            if (merged.cover_art_path.empty()) {
+                merged.cover_art_path = content.metadata->cover_art_path;
+                if (!merged.cover_art_path.empty()) {
+                    merged.cover_art_source =
+                        L"MusicBrainz → Cover Art Archive";
+                }
+            }
+            merged.used_musicbrainz_content_match = true;
+            merged.sources.emplace_back(L"MusicBrainz · 内容关联");
+        }
+    }
+    if (merged.cover_art_path.empty() && gnudb && gnudb->metadata) {
+        for (const auto& art_id : gnudb->metadata->cover_art_ids) {
+            merged.cover_art_path = download_musicbrainz_cover_art(art_id);
+            if (!merged.cover_art_path.empty()) {
+                merged.cover_art_source = L"GnuDB → Cover Art Archive";
+                break;
+            }
+        }
     }
 
     const std::wstring_view itunes_title = merged.album_title.empty()
@@ -222,7 +286,7 @@ std::optional<OnlineMetadata> lookup_online_metadata(
         }
         merged.editable = cached->metadata;
         merged.selected_release_id = cached->selected_release_id;
-        merged.sources.emplace_back(L"本地缓存");
+        merged.sources.emplace_back(L"Local");
     }
     project_editable(merged);
     const auto now = static_cast<std::int64_t>(

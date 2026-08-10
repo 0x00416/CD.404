@@ -4,7 +4,10 @@
 
 namespace cd404::ui::detail {
 
-Layout calculate_layout(const float width, const float height) noexcept
+Layout calculate_layout(
+    const float width,
+    const float height,
+    const float settings_scroll_offset) noexcept
 {
     Layout result;
     result.width = width;
@@ -43,12 +46,26 @@ Layout calculate_layout(const float width, const float height) noexcept
     result.volume_hit = D2D1::RectF(
         volume_left - 4.0F, controls_y - 16.0F, volume_right + 4.0F, controls_y + 16.0F);
 
-    result.settings_page = D2D1::RectF(margin, 84.0F, width - margin, height - 24.0F);
-    result.settings_back = D2D1::RectF(width - margin - 132.0F, 88.0F, width - margin, 128.0F);
+    constexpr float settings_maximum_width = 1'052.0F;
+    constexpr float settings_bottom = 736.0F;
+    const float settings_shift = -std::max(0.0F, settings_scroll_offset);
+    const float settings_width = std::min(
+        std::max(0.0F, width - margin * 2.0F),
+        settings_maximum_width);
+    const float settings_left = (width - settings_width) * 0.5F;
+    const float settings_right = settings_left + settings_width;
+    result.settings_page = D2D1::RectF(
+        settings_left, 84.0F, settings_right, settings_bottom);
+    result.settings_back = D2D1::RectF(
+        settings_right - 132.0F, 88.0F, settings_right, 128.0F);
     result.settings_diagnostics_export = D2D1::RectF(
         result.settings_back.left - 164.0F, 88.0F,
         result.settings_back.left - 12.0F, 128.0F);
-    result.settings_audio_card = D2D1::RectF(margin, 148.0F, width - margin, 300.0F);
+    result.settings_audio_card = D2D1::RectF(
+        settings_left,
+        148.0F + settings_shift,
+        settings_right,
+        300.0F + settings_shift);
     result.settings_audio_engine = D2D1::RectF(
         result.settings_audio_card.left + 24.0F,
         result.settings_audio_card.top + 76.0F,
@@ -69,7 +86,11 @@ Layout calculate_layout(const float width, const float height) noexcept
         result.settings_audio_card.top + 100.0F,
         result.settings_audio_card.right - 24.0F,
         result.settings_audio_card.top + 128.0F);
-    result.settings_listenbrainz_card = D2D1::RectF(margin, 316.0F, width - margin, 510.0F);
+    result.settings_listenbrainz_card = D2D1::RectF(
+        settings_left,
+        316.0F + settings_shift,
+        settings_right,
+        510.0F + settings_shift);
     result.settings_edit = D2D1::RectF(
         result.settings_listenbrainz_card.left + 24.0F,
         result.settings_listenbrainz_card.top + 112.0F,
@@ -87,14 +108,73 @@ Layout calculate_layout(const float width, const float height) noexcept
         result.settings_listenbrainz_card.top + 156.0F);
     result.settings_listenbrainz_toggle = D2D1::RectF(
         result.settings_listenbrainz_card.right - 76.0F,
-        result.settings_listenbrainz_card.top + 22.0F,
+        result.settings_listenbrainz_card.top + 18.0F,
         result.settings_listenbrainz_card.right - 24.0F,
-        result.settings_listenbrainz_card.top + 50.0F);
+        result.settings_listenbrainz_card.top + 46.0F);
     result.settings_queue_clear = D2D1::RectF(
         result.settings_listenbrainz_card.right - 208.0F,
-        result.settings_listenbrainz_card.top + 66.0F,
+        result.settings_listenbrainz_card.top + 84.0F,
         result.settings_listenbrainz_card.right - 24.0F,
-        result.settings_listenbrainz_card.top + 102.0F);
+        result.settings_listenbrainz_card.top + 108.0F);
+    result.settings_cddb_card = D2D1::RectF(
+        settings_left,
+        526.0F + settings_shift,
+        settings_right,
+        settings_bottom + settings_shift);
+    result.settings_cddb_toggle = D2D1::RectF(
+        result.settings_cddb_card.right - 76.0F,
+        result.settings_cddb_card.top + 18.0F,
+        result.settings_cddb_card.right - 24.0F,
+        result.settings_cddb_card.top + 46.0F);
+    result.settings_cddb_server_edit = D2D1::RectF(
+        result.settings_cddb_card.left + 24.0F,
+        result.settings_cddb_card.top + 94.0F,
+        result.settings_cddb_card.right - 24.0F,
+        result.settings_cddb_card.top + 134.0F);
+    result.settings_cddb_email_edit = D2D1::RectF(
+        result.settings_cddb_card.left + 24.0F,
+        result.settings_cddb_card.top + 158.0F,
+        result.settings_cddb_card.right - 136.0F,
+        result.settings_cddb_card.top + 198.0F);
+    result.settings_cddb_save = D2D1::RectF(
+        result.settings_cddb_card.right - 120.0F,
+        result.settings_cddb_card.top + 158.0F,
+        result.settings_cddb_card.right - 24.0F,
+        result.settings_cddb_card.top + 198.0F);
+    result.metadata_button = D2D1::RectF(
+        result.track_list.left + 88.0F, 82.0F,
+        result.track_list.left + 184.0F, 122.0F);
+    result.metadata_page = D2D1::RectF(margin, 84.0F, width - margin, height - 24.0F);
+    result.metadata_back = D2D1::RectF(
+        width - margin - 132.0F, 88.0F, width - margin, 128.0F);
+    const float editor_top = 152.0F;
+    const float editor_gap = 16.0F;
+    const float editor_half = (width - margin * 2.0F - editor_gap) * 0.5F;
+    result.metadata_album_title_edit = D2D1::RectF(
+        margin, editor_top, margin + editor_half, editor_top + 42.0F);
+    result.metadata_album_artist_edit = D2D1::RectF(
+        margin + editor_half + editor_gap, editor_top,
+        width - margin, editor_top + 42.0F);
+    result.metadata_category_edit = D2D1::RectF(
+        margin, editor_top + 66.0F, margin + editor_half, editor_top + 108.0F);
+    result.metadata_year_edit = D2D1::RectF(
+        margin + editor_half + editor_gap, editor_top + 66.0F,
+        width - margin, editor_top + 108.0F);
+    result.metadata_track_list = D2D1::RectF(
+        margin, editor_top + 132.0F, width - margin, height - 150.0F);
+    result.metadata_track_title_edit = D2D1::RectF(
+        margin, height - 126.0F, margin + editor_half, height - 84.0F);
+    result.metadata_track_artist_edit = D2D1::RectF(
+        margin + editor_half + editor_gap, height - 126.0F,
+        width - margin, height - 84.0F);
+    result.metadata_save = D2D1::RectF(
+        margin, height - 68.0F, margin + 118.0F, height - 28.0F);
+    result.metadata_test_submit = D2D1::RectF(
+        width - margin - 254.0F, height - 68.0F,
+        width - margin - 126.0F, height - 28.0F);
+    result.metadata_submit = D2D1::RectF(
+        width - margin - 112.0F, height - 68.0F,
+        width - margin, height - 28.0F);
     return result;
 }
 

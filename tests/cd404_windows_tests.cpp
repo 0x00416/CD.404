@@ -11,6 +11,7 @@
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
+#include <cd404/platform/windows/gnudb_client.hpp>
 #include <cd404/platform/windows/listenbrainz_reporter.hpp>
 #include <cd404/platform/windows/listenbrainz_queue.hpp>
 #include <cd404/platform/windows/musicbrainz_client.hpp>
@@ -187,7 +188,7 @@ void test_metadata_source_capsules()
 
     const auto offline = ui::make_metadata_source_labels(true, true, {});
     expect(
-        offline == std::vector<std::wstring>{L"CD-TEXT", L"本地元数据缓存"},
+        offline == std::vector<std::wstring>{L"CD-TEXT", L"Local"},
         "offline metadata identifies CD-TEXT and persistent cache separately");
 }
 
@@ -871,6 +872,114 @@ void test_listenbrainz_fake_http_failures()
         "fake HTTP 5xx remains retryable and durable");
 }
 
+void test_cddb_configuration_contract()
+{
+    using namespace cd404;
+    using namespace cd404::platform::windows;
+
+    const auto default_server = parse_cddb_server(L"gnudb.gnudb.org");
+    expect(
+        default_server && default_server->secure &&
+            default_server->host == L"gnudb.gnudb.org" &&
+            default_server->port == 443U &&
+            default_server->query_path == L"/~cddb/cddb.cgi" &&
+            default_server->submit_path == L"/~cddb/submit.cgi",
+        "CDDB default host expands to the secure GnuDB CGI endpoints");
+
+    const auto custom_server = parse_cddb_server(
+        L"http://metadata.example.test:8080/freedb/query.cgi");
+    expect(
+        custom_server && !custom_server->secure &&
+            custom_server->host == L"metadata.example.test" &&
+            custom_server->port == 8080U &&
+            custom_server->query_path == L"/freedb/query.cgi" &&
+            custom_server->submit_path == L"/freedb/submit.cgi",
+        "CDDB custom origin preserves scheme, port and derives submit endpoint");
+    expect(
+        !parse_cddb_server(L"ftp://example.test") &&
+            !parse_cddb_server(L"https://user:secret@example.test") &&
+            !parse_cddb_server(L"https://example.test/path?query=1"),
+        "CDDB server parser rejects unsupported or ambiguous endpoints");
+    expect(
+        is_valid_cddb_email(L"listener@example.test") &&
+            !is_valid_cddb_email(L"listener") &&
+            !is_valid_cddb_email(L"a@b") &&
+            !is_valid_cddb_email(L"a@b.test\r\nInjected: value"),
+        "CDDB submission email validation rejects missing domains and header injection");
+
+    const auto direct_match = parse_gnudb_query_response(
+        "200 data 6506c88d Artist / Album\r\n");
+    const auto exact_matches = parse_gnudb_query_response(
+        "210 Found exact matches, list follows\r\n"
+        "data 6506c88d Artist / Album\r\n.\r\n");
+    const auto inexact_matches = parse_gnudb_query_response(
+        "211 Found inexact matches, list follows\r\n"
+        "data 6506c88d Artist / Album\r\n.\r\n");
+    const auto rejected = parse_gnudb_query_response(
+        "500 Unknown developer email for CD404WindowsAudioCDPlayer v0.2.0\r\n");
+    expect(
+        direct_match.protocol_status == 200U && direct_match.match &&
+            direct_match.match->gnucdid == "6506c88d" &&
+            exact_matches.protocol_status == 210U && exact_matches.match &&
+            inexact_matches.protocol_status == 211U && inexact_matches.match &&
+            rejected.protocol_status == 500U && !rejected.match &&
+            rejected.message.find("Unknown developer email") != std::string::npos,
+        "GnuDB query parser accepts gnucdid exact and inexact matches and preserves errors");
+
+    constexpr std::array entries{
+        disc::RawTocEntry{1, 0, true},
+        disc::RawTocEntry{2, 10'000, true},
+    };
+    disc::TocError toc_error{};
+    const auto toc = disc::Toc::create(entries, 20'000, toc_error);
+    const auto invalid_identity = toc
+        ? lookup_gnudb(*toc, {L"gnudb.gnudb.org", L"not-an-email"})
+        : GnudbLookupResult{};
+    expect(
+        !invalid_identity.metadata &&
+            invalid_identity.system_error == ERROR_INVALID_PARAMETER,
+        "GnuDB lookup rejects a malformed explicit user identity email");
+    disc::GnudbSubmissionMetadataUtf8 metadata;
+    metadata.album_title = "Album";
+    metadata.album_artist = "Artist";
+    metadata.category = "rock";
+    metadata.year = "2026";
+    metadata.track_titles = {"First Song", "Second Song"};
+    metadata.track_artists = {"Artist", "Artist"};
+    metadata.user_edited = true;
+    const auto test_request = toc
+        ? build_cddb_submission_request(
+              {L"gnudb.gnudb.org", L"listener@example.test"},
+              metadata,
+              *toc,
+              CddbSubmissionMode::test)
+        : std::nullopt;
+    expect(
+        test_request &&
+            test_request->headers.find(L"Category: rock\r\n") != std::wstring::npos &&
+            test_request->headers.find(L"User-Email: listener@example.test\r\n") !=
+                std::wstring::npos &&
+            test_request->headers.find(L"Submit-Mode: test\r\n") !=
+                std::wstring::npos &&
+            test_request->headers.find(L"Charset: UTF-8\r\n") !=
+                std::wstring::npos &&
+            std::string(test_request->body.begin(), test_request->body.end())
+                .find("DTITLE=Artist / Album\n") != std::string::npos,
+        "CDDB test submission request carries protocol headers and raw xmcd body");
+    const auto submit_request = toc
+        ? build_cddb_submission_request(
+              {L"https://metadata.example.test", L"listener@example.test"},
+              metadata,
+              *toc,
+              CddbSubmissionMode::submit)
+        : std::nullopt;
+    expect(
+        submit_request &&
+            submit_request->headers.find(L"Submit-Mode: submit\r\n") !=
+                std::wstring::npos,
+        "CDDB formal submission request is distinct from server-side test mode");
+}
+
 void test_system_media_controls_safe_fallback()
 {
     cd404::platform::windows::SystemMediaControls controls;
@@ -953,7 +1062,19 @@ void test_user_settings_round_trip()
     source.audio_output_engine = AudioOutputEngine::wasapi;
     source.audio_exclusive_mode = true;
     source.audio_allow_shared_fallback = true;
+    source.cddb_enabled = false;
+    source.cddb_server = L"https://metadata.example.test";
+    source.cddb_email = L"listener@example.test";
     source.playback_positions[disc_key] = {2, 123'456};
+    source.metadata_overrides[disc_key] = SavedDiscMetadata{
+        L"Edited Album",
+        L"Edited Artist",
+        L"classical",
+        L"2025",
+        {L"First", L"Second"},
+        {L"Artist A", L"Artist B"},
+        4,
+    };
     const std::wstring json = encode_user_settings(source);
     const UserSettings decoded = decode_user_settings(json);
     const auto position = decoded.playback_positions.find(disc_key);
@@ -963,7 +1084,9 @@ void test_user_settings_round_trip()
             decoded.audio_endpoint_id == source.audio_endpoint_id &&
             decoded.audio_output_engine == AudioOutputEngine::wasapi &&
             decoded.audio_exclusive_mode &&
-            decoded.audio_allow_shared_fallback,
+            decoded.audio_allow_shared_fallback && !decoded.cddb_enabled &&
+            decoded.cddb_server == L"https://metadata.example.test" &&
+            decoded.cddb_email == L"listener@example.test",
         "user settings JSON round-trips persistent options");
     expect(
         position != decoded.playback_positions.end() &&
@@ -976,6 +1099,15 @@ void test_user_settings_round_trip()
             json.find(L"\"audio_output_engine\":\"wasapi\"") !=
                 std::wstring::npos,
         "settings JSON never contains a ListenBrainz token");
+    const auto metadata = decoded.metadata_overrides.find(disc_key);
+    expect(
+        metadata != decoded.metadata_overrides.end() &&
+            metadata->second.album_title == L"Edited Album" &&
+            metadata->second.track_titles ==
+                std::vector<std::wstring>{L"First", L"Second"} &&
+            metadata->second.category == L"classical" &&
+            metadata->second.revision == 4,
+        "user settings JSON round-trips edited disc metadata");
 
     const UserSettings defaults = decode_user_settings(L"not json");
     expect(
@@ -983,7 +1115,8 @@ void test_user_settings_round_trip()
             defaults.audio_endpoint_id.empty() &&
             defaults.audio_output_engine == AudioOutputEngine::wasapi &&
             !defaults.audio_exclusive_mode &&
-            !defaults.audio_allow_shared_fallback,
+            !defaults.audio_allow_shared_fallback && defaults.cddb_enabled &&
+            defaults.cddb_server == kDefaultCddbServer,
         "malformed settings keep shared default output and safe volume");
 }
 
@@ -1049,6 +1182,119 @@ void test_musicbrainz_multiple_release_parsing()
             candidates[0].exact_disc_id_match &&
             candidates[1].exact_disc_id_match,
         "MusicBrainz parser retains all duration-compatible exact release candidates");
+}
+
+void test_musicbrainz_content_association_reorders_recordings()
+{
+    using namespace cd404::platform::windows;
+    MusicBrainzContentQuery query;
+    query.album_title = L"Re:BPM15Q by TeddyLoid";
+    query.album_artist = L"TeddyLoid";
+    query.track_titles = {
+        L"Overture",
+        L"はくちゅーむ",
+        L"BPM15Q!",
+        L"ANNARI",
+        L"すれ違い…",
+        L"コクハク…",
+        L"カタオモイ…",
+        L"ドキドキ…",
+    };
+    query.track_lengths_milliseconds = {
+        111'000U, 283'000U, 239'000U, 202'000U,
+        274'000U, 170'000U, 210'000U, 250'000U,
+    };
+
+    MusicBrainzMetadata official;
+    official.release_id = L"reference-release";
+    official.release_group_id = L"reference-group";
+    official.album_title = L"Re:BPM15Q by TeddyLoid";
+    official.album_artist = L"BPM15Q";
+    official.track_titles = {
+        L"Overture",
+        L"BPM15Q! (TeddyLoid Remix)",
+        L"HANNARI (TeddyLoid Remix)",
+        L"すれ違い…",
+        L"コクハク…",
+        L"カタオモイ…",
+        L"ドキドキ…",
+        L"はくちゅーむ",
+    };
+    official.track_lengths_milliseconds = {
+        111'000U, 239'000U, 202'000U, 274'000U,
+        170'000U, 210'000U, 250'000U, 283'000U,
+    };
+    official.track_ids = {
+        L"track-1", L"track-2", L"track-3", L"track-4",
+        L"track-5", L"track-6", L"track-7", L"track-8",
+    };
+    official.recording_ids = {
+        L"recording-1", L"recording-2", L"recording-3", L"recording-4",
+        L"recording-5", L"recording-6", L"recording-7", L"recording-8",
+    };
+    official.track_artists.assign(8U, L"BPM15Q");
+    official.track_artist_ids.assign(8U, {L"artist-bpm15q"});
+
+    const std::array candidates{official};
+    const auto matched = match_musicbrainz_content(query, candidates);
+    expect(
+        matched && matched->content_match &&
+            matched->release_id == L"reference-release" &&
+            matched->recording_ids == std::vector<std::wstring>{
+                L"recording-1", L"recording-8", L"recording-2", L"recording-3",
+                L"recording-4", L"recording-5", L"recording-6", L"recording-7",
+            } &&
+            matched->track_ids.empty(),
+        "MusicBrainz content association maps reordered custom discs without "
+        "claiming release-specific track identities");
+
+    MusicBrainzMetadata conflicting = official;
+    conflicting.release_id = L"different-release";
+    conflicting.recording_ids[0] = L"different-recording";
+    const std::array ambiguous{official, conflicting};
+    expect(
+        !match_musicbrainz_content(query, ambiguous),
+        "MusicBrainz content association rejects equally strong releases with "
+        "different recording identities");
+
+    official.track_lengths_milliseconds[7] += 30'000U;
+    const std::array wrong_duration{official};
+    expect(
+        !match_musicbrainz_content(query, wrong_duration),
+        "MusicBrainz content association rejects a title-only match with incompatible audio");
+}
+
+void test_musicbrainz_content_release_json_parsing()
+{
+    using namespace cd404::platform::windows;
+    const std::string json = R"json(
+        {"id":"dfe4a55b-d323-41c8-9d31-4e3347efd21c",
+         "title":"Re:BPM15Q by TeddyLoid",
+         "release-group":{"id":"42505aeb-5d69-4fe2-8e10-c96434c54403"},
+         "artist-credit":[{"name":"BPM15Q","artist":{"id":"artist-release","name":"BPM15Q"}}],
+         "media":[{"track-count":2,"tracks":[
+           {"id":"track-1","title":"Overture","length":110894,
+            "artist-credit":[{"name":"BPM15Q","artist":{"id":"artist-track","name":"BPM15Q"}}],
+            "recording":{"id":"recording-1","title":"Overture","length":110894}},
+           {"id":"track-2","title":"BPM15Q! (TeddyLoid Remix)","length":238588,
+            "recording":{"id":"recording-2","title":"BPM15Q! (TeddyLoid Remix)","length":238588,
+                         "artist-credit":[{"name":"BPM15Q","artist":{"id":"artist-track","name":"BPM15Q"}}]}}
+         ]}]}
+    )json";
+    const std::vector<std::uint8_t> body(json.begin(), json.end());
+    const auto parsed = parse_musicbrainz_content_release(body, 2U);
+    expect(
+        parsed.size() == 1U &&
+            parsed[0].release_id == L"dfe4a55b-d323-41c8-9d31-4e3347efd21c" &&
+            parsed[0].release_group_id ==
+                L"42505aeb-5d69-4fe2-8e10-c96434c54403" &&
+            parsed[0].track_lengths_milliseconds ==
+                std::vector<std::uint64_t>{110'894U, 238'588U} &&
+            parsed[0].recording_ids == std::vector<std::wstring>{
+                L"recording-1", L"recording-2"} &&
+            parsed[0].track_artist_ids[1] ==
+                std::vector<std::wstring>{L"artist-track"},
+        "MusicBrainz content parser accepts the real release JSON field layout");
 }
 
 void test_metadata_revision_selection_and_cache()
@@ -1298,11 +1544,14 @@ int main(const int argument_count, char** arguments)
     test_listenbrainz_payload_contract();
     test_listenbrainz_queue_restart_and_account_isolation();
     test_listenbrainz_fake_http_failures();
+    test_cddb_configuration_contract();
     test_system_media_controls_safe_fallback();
     test_system_media_controls_with_window();
     test_user_settings_round_trip();
     test_musicbrainz_exact_lookup_paths();
     test_musicbrainz_multiple_release_parsing();
+    test_musicbrainz_content_association_reorders_recordings();
+    test_musicbrainz_content_release_json_parsing();
     test_metadata_revision_selection_and_cache();
     test_diagnostic_names();
     if (argument_count == 2 &&

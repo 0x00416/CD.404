@@ -1,6 +1,6 @@
 # CD.404 隐私说明
 
-版本：0.2.0-public-beta.1（2026-08-09）
+版本：0.2.0-public-beta.1（2026-08-10）
 
 CD.404 不包含遥测、广告、用户画像或崩溃自动上传。播放音频在本机从光驱读取并送往
 Windows 音频设备，不会上传音频样本。
@@ -22,7 +22,8 @@ Windows 音频设备，不会上传音频样本。
 
 启用相应功能时，应用会直接连接 MusicBrainz/Cover Art Archive、GnuDB、Apple iTunes
 Search API 和 ListenBrainz。元数据请求发送由光盘 TOC/Disc ID 推导的标识、轨数/时长
-及已有专辑/艺术家查询词；封面请求发送 MusicBrainz 发行版 ID。ListenBrainz 请求只在
+及已有专辑、艺术家和曲目查询词；封面请求发送 MusicBrainz 发行版或发行组 ID。内容关联
+只在精确发行匹配失败且已有可信文本元数据时执行。ListenBrainz 请求只在
 用户配置 Token 且开启上报后发送曲名、艺术家、专辑、时长、起播时间和可用 MBID。
 各服务会按其隐私政策处理 IP 地址和请求内容。关闭 ListenBrainz 上报不会影响播放。
 
