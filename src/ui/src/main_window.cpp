@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <format>
 #include <limits>
@@ -60,6 +61,8 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t kWindowClassName[] = L"CD404.MainWindow";
+constexpr wchar_t kLyricsSearchWindowClassName[] = L"CD404.LyricsSearchWindow";
+constexpr wchar_t kLyricsOffsetWindowClassName[] = L"CD404.LyricsOffsetWindow";
 constexpr wchar_t kWindowTitle[] = L"CD.404";
 constexpr UINT kDiscReadyMessage = WM_APP + 1;
 constexpr UINT kMetadataReadyMessage = WM_APP + 2;
@@ -71,6 +74,10 @@ constexpr UINT kMetadataEditSaveMessage = WM_APP + 7;
 constexpr UINT kMetadataEditCloseMessage = WM_APP + 8;
 constexpr UINT kCddbSubmissionReadyMessage = WM_APP + 9;
 constexpr UINT kLyricsReadyMessage = WM_APP + 10;
+constexpr UINT kManualLyricsReadyMessage = WM_APP + 11;
+constexpr UINT kManualLyricsResolvedMessage = WM_APP + 12;
+constexpr UINT kLyricsManualMatchCommand = 20'001;
+constexpr UINT kLyricsOffsetWindowCommand = 20'002;
 constexpr int kSettingsTokenEditId = 1'001;
 constexpr int kSettingsCddbServerEditId = 1'002;
 constexpr int kSettingsCddbEmailEditId = 1'003;
@@ -80,6 +87,17 @@ constexpr int kMetadataCategoryEditId = 1'103;
 constexpr int kMetadataYearEditId = 1'104;
 constexpr int kMetadataTrackTitleEditId = 1'105;
 constexpr int kMetadataTrackArtistEditId = 1'106;
+constexpr int kLyricsSearchEditId = 1'201;
+constexpr int kLyricsSearchButtonId = 1'202;
+constexpr int kLyricsSearchListId = 1'203;
+constexpr int kLyricsSearchApplyId = 1'204;
+constexpr int kLyricsOffsetEditId = 1'251;
+constexpr int kLyricsOffsetAdvance100Id = 1'252;
+constexpr int kLyricsOffsetAdvance10Id = 1'253;
+constexpr int kLyricsOffsetDelay10Id = 1'254;
+constexpr int kLyricsOffsetDelay100Id = 1'255;
+constexpr int kLyricsOffsetResetId = 1'256;
+constexpr int kLyricsOffsetApplyId = 1'257;
 constexpr UINT_PTR kMaintenanceTimer = 1;
 constexpr UINT kMaintenanceIntervalMs = 50;
 constexpr UINT_PTR kSettingsScrollSettleTimer = 2;
@@ -147,6 +165,27 @@ struct LyricsSnapshot final {
     std::optional<core::LyricsDocument> lyrics;
     std::uint64_t generation{};
     std::size_t track_index{};
+};
+
+struct ManualLyricsSnapshot final {
+    platform::windows::OnlineLyricsCatalogResult result;
+    core::LyricsMatchQuery query;
+    std::uint64_t generation{};
+    std::size_t track_index{};
+};
+
+struct ManualLyricsResolvedSnapshot final {
+    platform::windows::OnlineLyricsLookupResult result;
+    platform::windows::OnlineLyricsSearchItem item;
+    core::LyricsMatchQuery query;
+    std::uint64_t generation{};
+    std::size_t track_index{};
+};
+
+struct DarkMenuItem final {
+    std::wstring text;
+    bool separator{};
+    bool submenu{};
 };
 #if 0 // 合并期间保留的旧内联快照实现；待 CDDB 编辑器拆分时删除。
 [[nodiscard]] std::wstring to_wstring(const std::u16string_view text)
@@ -399,14 +438,19 @@ public:
 
     ~MainWindow()
     {
+        close_lyrics_offset_window();
+        close_lyrics_search_window();
         close_metadata_edit();
         close_metadata_editor(false);
         close_settings();
         stop_playback();
         user_settings_.volume = volume_;
         static_cast<void>(platform::windows::save_user_settings(user_settings_));
-        if (settings_font_ != nullptr) {
+        if (settings_font_ != nullptr && !settings_font_is_stock_) {
             DeleteObject(settings_font_);
+        }
+        if (menu_font_ != nullptr && !menu_font_is_stock_) {
+            DeleteObject(menu_font_);
         }
         if (settings_edit_brush_ != nullptr) {
             DeleteObject(settings_edit_brush_);
@@ -439,6 +483,26 @@ public:
         window_class.hIconSm = window_class.hIcon;
         window_class.lpszClassName = kWindowClassName;
         if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            return false;
+        }
+        WNDCLASSEXW search_class{};
+        search_class.cbSize = sizeof(search_class);
+        search_class.style = CS_DBLCLKS;
+        search_class.lpfnWndProc = lyrics_search_window_proc;
+        search_class.hInstance = instance_;
+        search_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        search_class.hIcon = window_class.hIcon;
+        search_class.hIconSm = window_class.hIconSm;
+        search_class.lpszClassName = kLyricsSearchWindowClassName;
+        if (RegisterClassExW(&search_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            return false;
+        }
+        WNDCLASSEXW offset_class = search_class;
+        offset_class.lpfnWndProc = lyrics_offset_window_proc;
+        offset_class.lpszClassName = kLyricsOffsetWindowClassName;
+        if (RegisterClassExW(&offset_class) == 0 &&
             GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
             return false;
         }
@@ -524,6 +588,14 @@ public:
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
                 if (message.message == WM_QUIT) {
                     return static_cast<int>(message.wParam);
+                }
+                if (lyrics_search_window_ != nullptr &&
+                    IsDialogMessageW(lyrics_search_window_, &message) != FALSE) {
+                    continue;
+                }
+                if (lyrics_offset_window_ != nullptr &&
+                    IsDialogMessageW(lyrics_offset_window_, &message) != FALSE) {
+                    continue;
                 }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -732,6 +804,11 @@ private:
             }
             return 0;
         case WM_DPICHANGED: {
+            if (menu_font_ != nullptr && !menu_font_is_stock_) {
+                DeleteObject(menu_font_);
+            }
+            menu_font_ = nullptr;
+            menu_font_is_stock_ = false;
             const auto* suggested = reinterpret_cast<const RECT*>(lparam);
             SetWindowPos(
                 window_,
@@ -745,6 +822,7 @@ private:
                 const float dpi = static_cast<float>(HIWORD(wparam));
                 render_target_->SetDpi(dpi, dpi);
             }
+            rebuild_control_font(window_);
             if (!window_resizing_) {
                 hide_active_input_controls();
                 finish_input_control_relayout();
@@ -848,12 +926,33 @@ private:
             return 0;
         case WM_KEYDOWN:
             return handle_key_down(wparam);
+        case WM_CONTEXTMENU:
+            if (handle_lyrics_context_menu(lparam)) {
+                return 0;
+            }
+            break;
         case WM_COMMAND:
             if (LOWORD(wparam) == kSettingsTokenEditId &&
                 HIWORD(wparam) == EN_SETFOCUS) {
                 close_settings_dropdown();
             }
             break;
+        case WM_MEASUREITEM: {
+            auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+            if (measure != nullptr && measure->CtlType == ODT_MENU) {
+                measure_dark_menu(*measure);
+                return TRUE;
+            }
+            break;
+        }
+        case WM_DRAWITEM: {
+            auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+            if (draw != nullptr && draw->CtlType == ODT_MENU) {
+                draw_dark_menu(*draw);
+                return TRUE;
+            }
+            break;
+        }
         case WM_CTLCOLOREDIT:
             if (reinterpret_cast<HWND>(lparam) == settings_token_edit_ ||
                 reinterpret_cast<HWND>(lparam) == metadata_edit_ ||
@@ -890,6 +989,10 @@ private:
             if (wparam == kMaintenanceTimer) {
                 update_playback_clock();
                 ensure_lyrics_for_selected_track();
+                if (lyrics_offset_window_ != nullptr &&
+                    lyrics_offset_track_ != selected_track_) {
+                    close_lyrics_offset_window();
+                }
                 maybe_persist_playback_position();
                 if (active_page_ == AppPage::settings && settings_saved_ &&
                     listenbrainz_reporter_.status().state !=
@@ -940,6 +1043,15 @@ private:
         case kLyricsReadyMessage:
             receive_lyrics(std::unique_ptr<LyricsSnapshot>(
                 reinterpret_cast<LyricsSnapshot*>(lparam)));
+            return 0;
+        case kManualLyricsReadyMessage:
+            receive_manual_lyrics(std::unique_ptr<ManualLyricsSnapshot>(
+                reinterpret_cast<ManualLyricsSnapshot*>(lparam)));
+            return 0;
+        case kManualLyricsResolvedMessage:
+            receive_manual_lyrics_resolution(
+                std::unique_ptr<ManualLyricsResolvedSnapshot>(
+                    reinterpret_cast<ManualLyricsResolvedSnapshot*>(lparam)));
             return 0;
         case WM_DESTROY:
             KillTimer(window_, kMaintenanceTimer);
@@ -1102,15 +1214,20 @@ private:
             return result;
         }
 
-        icon_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        icon_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        logo_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        album_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        heading_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        body_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         button_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         button_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         caption_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         caption_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         track_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         track_duration_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        small_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         small_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        icon_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        icon_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         lyric_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         lyric_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         lyric_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
@@ -1306,6 +1423,8 @@ private:
         }
         settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
         apply_window_materials();
+        apply_lyrics_search_theme();
+        apply_lyrics_offset_theme();
         diagnostics_.record(
             L"theme",
             std::format(
@@ -2055,10 +2174,6 @@ private:
 
     void draw_lyrics(const float album_text_top)
     {
-        if (!lyrics_ || lyrics_->lines.empty() ||
-            lyrics_track_index_ != selected_track_) {
-            return;
-        }
         const D2D1_RECT_F cover = cover_image_rectangle();
         const D2D1_RECT_F area = D2D1::RectF(
             layout_.cover.left,
@@ -2067,11 +2182,20 @@ private:
             album_text_top - 4.0F);
         const float height = area.bottom - area.top;
         if (height < 28.0F) {
+            lyrics_hit_area_ = {};
             return;
         }
-        const core::LyricTime position_milliseconds =
+        lyrics_hit_area_ = area;
+        if (!lyrics_ || lyrics_->lines.empty() ||
+            lyrics_track_index_ != selected_track_) {
+            return;
+        }
+        const core::LyricTime playback_milliseconds =
             std::max<core::SampleFrame>(0, playback_track_frame_) * 1'000 /
             core::kCdSampleFramesPerSecond;
+        const core::LyricTime position_milliseconds = std::max<core::LyricTime>(
+            0,
+            playback_milliseconds + current_lyric_offset_milliseconds());
         const auto active = core::active_lyric_line(
             *lyrics_, position_milliseconds);
         std::size_t focus_index{};
@@ -3246,6 +3370,1422 @@ private:
             prefetch_next_lyrics(selected_track_);
         }
         InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    [[nodiscard]] core::LyricTime current_lyric_offset_milliseconds() const noexcept
+    {
+        if (current_disc_key_.empty() || selected_track_ >= disc_.tracks.size()) {
+            return 0;
+        }
+        const auto disc = user_settings_.lyric_offsets_ms.find(current_disc_key_);
+        if (disc == user_settings_.lyric_offsets_ms.end()) {
+            return 0;
+        }
+        const auto track = disc->second.find(disc_.tracks[selected_track_].number);
+        return track == disc->second.end() ? 0 : track->second;
+    }
+
+    void reset_lyric_visual_state() noexcept
+    {
+        lyric_visual_track_ = std::numeric_limits<std::size_t>::max();
+        lyric_visual_focus_.reset();
+        lyric_transition_direction_ = 0;
+        lyric_transition_running_ = false;
+    }
+
+    void set_lyric_offset(const core::LyricTime offset_milliseconds)
+    {
+        if (current_disc_key_.empty() || selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        const unsigned int track_number = disc_.tracks[selected_track_].number;
+        const auto adjusted = static_cast<std::int32_t>(std::clamp<core::LyricTime>(
+            offset_milliseconds,
+            -10'000,
+            10'000));
+        if (adjusted == 0) {
+            const auto disc = user_settings_.lyric_offsets_ms.find(current_disc_key_);
+            if (disc != user_settings_.lyric_offsets_ms.end()) {
+                disc->second.erase(track_number);
+                if (disc->second.empty()) {
+                    user_settings_.lyric_offsets_ms.erase(disc);
+                }
+            }
+        } else {
+            user_settings_.lyric_offsets_ms[current_disc_key_][track_number] = adjusted;
+        }
+        reset_lyric_visual_state();
+        persist_user_settings();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void adjust_lyric_offset(const core::LyricTime delta_milliseconds)
+    {
+        set_lyric_offset(
+            current_lyric_offset_milliseconds() + delta_milliseconds);
+    }
+
+    void ensure_menu_font()
+    {
+        if (menu_font_ != nullptr) {
+            return;
+        }
+        NONCLIENTMETRICSW metrics{};
+        metrics.cbSize = sizeof(metrics);
+        if (SystemParametersInfoForDpi(
+                SPI_GETNONCLIENTMETRICS,
+                sizeof(metrics),
+                &metrics,
+                0,
+                GetDpiForWindow(window_)) == FALSE) {
+            SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS,
+                sizeof(metrics),
+                &metrics,
+                0);
+        }
+        menu_font_ = CreateFontIndirectW(&metrics.lfMenuFont);
+        if (menu_font_ == nullptr) {
+            menu_font_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            menu_font_is_stock_ = true;
+        }
+    }
+
+    void measure_dark_menu(MEASUREITEMSTRUCT& measure)
+    {
+        ensure_menu_font();
+        const auto* item = reinterpret_cast<const DarkMenuItem*>(measure.itemData);
+        const float scale = static_cast<float>(GetDpiForWindow(window_)) / 96.0F;
+        if (item == nullptr || item->separator) {
+            measure.itemWidth = 24U;
+            measure.itemHeight = static_cast<UINT>(std::lround(9.0F * scale));
+            return;
+        }
+        const HDC context = GetDC(window_);
+        const HGDIOBJ previous = SelectObject(
+            context,
+            menu_font_);
+        SIZE extent{};
+        GetTextExtentPoint32W(
+            context,
+            item->text.c_str(),
+            static_cast<int>(item->text.size()),
+            &extent);
+        SelectObject(context, previous);
+        ReleaseDC(window_, context);
+        measure.itemWidth = static_cast<UINT>(extent.cx + std::lround(34.0F * scale));
+        measure.itemHeight = static_cast<UINT>(
+            extent.cy + std::lround(9.0F * scale));
+    }
+
+    void draw_dark_menu(const DRAWITEMSTRUCT& draw)
+    {
+        const auto* item = reinterpret_cast<const DarkMenuItem*>(draw.itemData);
+        if (item == nullptr) {
+            return;
+        }
+        const bool selected = (draw.itemState & ODS_SELECTED) != 0U;
+        const COLORREF background = colorref(
+            selected ? theme_.elevated : theme_.surface);
+        const HBRUSH brush = CreateSolidBrush(background);
+        FillRect(draw.hDC, &draw.rcItem, brush);
+        DeleteObject(brush);
+        if (item->separator) {
+            const int y = (draw.rcItem.top + draw.rcItem.bottom) / 2;
+            const HPEN pen = CreatePen(PS_SOLID, 1, colorref(theme_.border));
+            const HGDIOBJ previous_pen = SelectObject(draw.hDC, pen);
+            MoveToEx(draw.hDC, draw.rcItem.left + 12, y, nullptr);
+            LineTo(draw.hDC, draw.rcItem.right - 12, y);
+            SelectObject(draw.hDC, previous_pen);
+            DeleteObject(pen);
+            return;
+        }
+        SetBkMode(draw.hDC, TRANSPARENT);
+        SetTextColor(draw.hDC, colorref(theme_.text));
+        const HGDIOBJ previous = SelectObject(
+            draw.hDC,
+            menu_font_ != nullptr ? menu_font_ : GetStockObject(DEFAULT_GUI_FONT));
+        RECT text_rectangle = draw.rcItem;
+        text_rectangle.left += 14;
+        text_rectangle.right -= item->submenu ? 30 : 14;
+        DrawTextW(
+            draw.hDC,
+            item->text.c_str(),
+            static_cast<int>(item->text.size()),
+            &text_rectangle,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        if (item->submenu) {
+            RECT arrow = draw.rcItem;
+            arrow.left = arrow.right - 24;
+            DrawTextW(
+                draw.hDC,
+                L"›",
+                1,
+                &arrow,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+        SelectObject(draw.hDC, previous);
+    }
+
+    static void append_dark_menu_item(
+        const HMENU menu,
+        std::vector<std::unique_ptr<DarkMenuItem>>& storage,
+        const UINT flags,
+        const UINT_PTR command,
+        std::wstring text,
+        const bool separator = false,
+        const bool submenu = false)
+    {
+        auto item = std::make_unique<DarkMenuItem>();
+        item->text = std::move(text);
+        item->separator = separator;
+        item->submenu = submenu;
+        const auto* raw = item.get();
+        storage.push_back(std::move(item));
+        AppendMenuW(
+            menu,
+            flags | MF_OWNERDRAW,
+            command,
+            reinterpret_cast<LPCWSTR>(raw));
+    }
+
+    [[nodiscard]] bool handle_lyrics_context_menu(const LPARAM location)
+    {
+        if (active_page_ != AppPage::player || selected_track_ >= disc_.tracks.size() ||
+            !disc_.tracks[selected_track_].is_audio ||
+            lyrics_hit_area_.bottom <= lyrics_hit_area_.top) {
+            return false;
+        }
+        POINT screen_point{};
+        if (GET_X_LPARAM(location) == -1 && GET_Y_LPARAM(location) == -1) {
+            screen_point = {
+                static_cast<LONG>(std::lround(
+                    (lyrics_hit_area_.left + lyrics_hit_area_.right) * 0.5F *
+                    static_cast<float>(GetDpiForWindow(window_)) / 96.0F)),
+                static_cast<LONG>(std::lround(
+                    (lyrics_hit_area_.top + lyrics_hit_area_.bottom) * 0.5F *
+                    static_cast<float>(GetDpiForWindow(window_)) / 96.0F)),
+            };
+            ClientToScreen(window_, &screen_point);
+        } else {
+            screen_point = {GET_X_LPARAM(location), GET_Y_LPARAM(location)};
+        }
+        POINT client_point = screen_point;
+        ScreenToClient(window_, &client_point);
+        if (!contains(
+                lyrics_hit_area_,
+                D2D1::Point2F(
+                    pixel_to_dip(client_point.x),
+                    pixel_to_dip(client_point.y)))) {
+            return false;
+        }
+
+        const HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return true;
+        }
+        std::vector<std::unique_ptr<DarkMenuItem>> menu_items;
+        append_dark_menu_item(
+            menu,
+            menu_items,
+            MF_STRING,
+            kLyricsManualMatchCommand,
+            L"手动搜索匹配歌词…");
+        append_dark_menu_item(
+            menu,
+            menu_items,
+            MF_STRING,
+            kLyricsOffsetWindowCommand,
+            L"调整歌词偏移量…");
+        const HBRUSH menu_brush = CreateSolidBrush(colorref(theme_.surface));
+        MENUINFO menu_info{};
+        menu_info.cbSize = sizeof(menu_info);
+        menu_info.fMask = MIM_BACKGROUND;
+        menu_info.hbrBack = menu_brush;
+        SetMenuInfo(menu, &menu_info);
+        SetForegroundWindow(window_);
+        const UINT command = TrackPopupMenuEx(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            screen_point.x,
+            screen_point.y,
+            window_,
+            nullptr);
+        DestroyMenu(menu);
+        DeleteObject(menu_brush);
+        switch (command) {
+        case kLyricsManualMatchCommand:
+            open_lyrics_search_window();
+            break;
+        case kLyricsOffsetWindowCommand:
+            open_lyrics_offset_window();
+            break;
+        default:
+            break;
+        }
+        return true;
+    }
+
+    static LRESULT CALLBACK lyrics_search_window_proc(
+        const HWND window,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        MainWindow* self{};
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+            self = static_cast<MainWindow*>(create->lpCreateParams);
+            SetWindowLongPtrW(
+                window,
+                GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(self));
+        } else {
+            self = reinterpret_cast<MainWindow*>(
+                GetWindowLongPtrW(window, GWLP_USERDATA));
+        }
+        return self != nullptr
+            ? self->handle_lyrics_search_message(window, message, wparam, lparam)
+            : DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    static LRESULT CALLBACK lyrics_offset_window_proc(
+        const HWND window,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        MainWindow* self{};
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+            self = static_cast<MainWindow*>(create->lpCreateParams);
+            SetWindowLongPtrW(
+                window,
+                GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(self));
+        } else {
+            self = reinterpret_cast<MainWindow*>(
+                GetWindowLongPtrW(window, GWLP_USERDATA));
+        }
+        return self != nullptr
+            ? self->handle_lyrics_offset_message(window, message, wparam, lparam)
+            : DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    void ensure_control_resources(const HWND reference_window)
+    {
+        if (settings_font_ == nullptr) {
+            NONCLIENTMETRICSW metrics{};
+            metrics.cbSize = sizeof(metrics);
+            const UINT dpi = reference_window != nullptr
+                ? GetDpiForWindow(reference_window)
+                : GetDpiForWindow(window_);
+            if (SystemParametersInfoForDpi(
+                    SPI_GETNONCLIENTMETRICS,
+                    sizeof(metrics),
+                    &metrics,
+                    0,
+                    dpi) == FALSE) {
+                SystemParametersInfoW(
+                    SPI_GETNONCLIENTMETRICS,
+                    sizeof(metrics),
+                    &metrics,
+                    0);
+            }
+            settings_font_ = CreateFontIndirectW(&metrics.lfMessageFont);
+            if (settings_font_ == nullptr) {
+                settings_font_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                settings_font_is_stock_ = true;
+            }
+        }
+        if (settings_edit_brush_ == nullptr) {
+            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
+        }
+    }
+
+    void rebuild_control_font(const HWND reference_window)
+    {
+        if (settings_font_ != nullptr && !settings_font_is_stock_) {
+            DeleteObject(settings_font_);
+        }
+        settings_font_ = nullptr;
+        settings_font_is_stock_ = false;
+        ensure_control_resources(reference_window);
+        const HWND controls[]{
+            metadata_edit_,
+            settings_token_edit_, settings_cddb_server_edit_, settings_cddb_email_edit_,
+            metadata_album_title_edit_, metadata_album_artist_edit_,
+            metadata_category_edit_, metadata_year_edit_,
+            metadata_track_title_edit_, metadata_track_artist_edit_,
+            lyrics_search_edit_, lyrics_search_button_, lyrics_search_list_,
+            lyrics_search_apply_,
+            lyrics_offset_edit_, lyrics_offset_unit_, lyrics_offset_advance100_,
+            lyrics_offset_advance10_, lyrics_offset_delay10_,
+            lyrics_offset_delay100_, lyrics_offset_reset_, lyrics_offset_apply_,
+        };
+        for (const HWND control : controls) {
+            if (control != nullptr) {
+                SendMessageW(
+                    control,
+                    WM_SETFONT,
+                    reinterpret_cast<WPARAM>(settings_font_),
+                    TRUE);
+            }
+        }
+    }
+
+    [[nodiscard]] int preferred_edit_height(
+        const HWND reference_window,
+        const bool client_edge) const
+    {
+        const HWND reference = reference_window != nullptr
+            ? reference_window
+            : window_;
+        const UINT dpi = GetDpiForWindow(reference);
+        const HDC context = GetDC(reference);
+        TEXTMETRICW metrics{};
+        HGDIOBJ previous{};
+        if (context != nullptr) {
+            previous = SelectObject(
+                context,
+                settings_font_ != nullptr
+                    ? settings_font_
+                    : GetStockObject(DEFAULT_GUI_FONT));
+            GetTextMetricsW(context, &metrics);
+            SelectObject(context, previous);
+            ReleaseDC(reference, context);
+        }
+        const int fallback = MulDiv(15, static_cast<int>(dpi), 96);
+        const int text_height = metrics.tmHeight > 0 ? metrics.tmHeight : fallback;
+        const int vertical_padding = MulDiv(6, static_cast<int>(dpi), 96);
+        const int edge_height = client_edge
+            ? GetSystemMetricsForDpi(SM_CYEDGE, dpi) * 2
+            : 0;
+        return text_height + vertical_padding + edge_height;
+    }
+
+    void open_lyrics_search_window()
+    {
+        if (lyrics_search_window_ != nullptr) {
+            ShowWindow(lyrics_search_window_, SW_RESTORE);
+            SetForegroundWindow(lyrics_search_window_);
+            SetFocus(lyrics_search_edit_);
+            return;
+        }
+        ensure_control_resources(window_);
+        const UINT dpi = GetDpiForWindow(window_);
+        RECT rectangle{0, 0, 760, 520};
+        AdjustWindowRectExForDpi(
+            &rectangle,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+            FALSE,
+            WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+            dpi);
+        RECT owner{};
+        GetWindowRect(window_, &owner);
+        const int width = rectangle.right - rectangle.left;
+        const int height = rectangle.bottom - rectangle.top;
+        const int left = owner.left + std::max<LONG>(
+            0, (owner.right - owner.left - width) / 2);
+        const int top = owner.top + std::max<LONG>(
+            0, (owner.bottom - owner.top - height) / 2);
+        lyrics_search_window_ = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+            kLyricsSearchWindowClassName,
+            L"手动搜索歌词",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+            left,
+            top,
+            width,
+            height,
+            window_,
+            nullptr,
+            instance_,
+            this);
+        if (lyrics_search_window_ == nullptr) {
+            return;
+        }
+        apply_lyrics_search_theme();
+        ShowWindow(lyrics_search_window_, SW_SHOW);
+        UpdateWindow(lyrics_search_window_);
+        SetFocus(lyrics_search_edit_);
+    }
+
+    void create_lyrics_search_controls(const HWND window)
+    {
+        ensure_control_resources(window);
+        lyrics_search_edit_ = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 1, 1,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLyricsSearchEditId)),
+            instance_,
+            nullptr);
+        lyrics_search_button_ = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"搜索",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | BS_DEFPUSHBUTTON,
+            0, 0, 1, 1,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLyricsSearchButtonId)),
+            instance_,
+            nullptr);
+        lyrics_search_list_ = CreateWindowExW(
+            0,
+            L"LISTBOX",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_BORDER |
+                LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED |
+                LBS_HASSTRINGS | LBS_WANTKEYBOARDINPUT,
+            0, 0, 1, 1,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLyricsSearchListId)),
+            instance_,
+            nullptr);
+        lyrics_search_apply_ = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"应用",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0, 0, 1, 1,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLyricsSearchApplyId)),
+            instance_,
+            nullptr);
+        const HWND controls[]{
+            lyrics_search_edit_, lyrics_search_button_, lyrics_search_list_,
+            lyrics_search_apply_,
+        };
+        for (const HWND control : controls) {
+            if (control != nullptr) {
+                SendMessageW(
+                    control,
+                    WM_SETFONT,
+                    reinterpret_cast<WPARAM>(settings_font_),
+                    TRUE);
+            }
+        }
+        SendMessageW(lyrics_search_edit_, EM_SETLIMITTEXT, 512, 0);
+        SetWindowLongPtrW(
+            lyrics_search_edit_,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(this));
+        lyrics_search_edit_original_proc_ = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(
+                lyrics_search_edit_,
+                GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(lyrics_search_edit_window_proc)));
+        const float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0F;
+        SendMessageW(
+            lyrics_search_list_,
+            LB_SETITEMHEIGHT,
+            0,
+            static_cast<LPARAM>(std::lround(58.0F * scale)));
+        const core::LyricsMatchQuery query = lyrics_query(selected_track_);
+        const std::wstring keywords = query.artist.empty()
+            ? query.title
+            : query.artist + L" " + query.title;
+        SetWindowTextW(lyrics_search_edit_, keywords.c_str());
+        EnableWindow(lyrics_search_apply_, FALSE);
+        update_lyrics_search_layout(window);
+    }
+
+    static LRESULT CALLBACK lyrics_search_edit_window_proc(
+        const HWND edit,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        auto* self = reinterpret_cast<MainWindow*>(
+            GetWindowLongPtrW(edit, GWLP_USERDATA));
+        if (self != nullptr && message == WM_KEYDOWN) {
+            if (wparam == VK_RETURN) {
+                self->start_manual_lyrics_search();
+                return 0;
+            }
+            if (wparam == VK_ESCAPE && self->lyrics_search_window_ != nullptr) {
+                DestroyWindow(self->lyrics_search_window_);
+                return 0;
+            }
+        }
+        return self != nullptr && self->lyrics_search_edit_original_proc_ != nullptr
+            ? CallWindowProcW(
+                  self->lyrics_search_edit_original_proc_,
+                  edit,
+                  message,
+                  wparam,
+                  lparam)
+            : DefWindowProcW(edit, message, wparam, lparam);
+    }
+
+    void update_lyrics_search_layout(const HWND window) const
+    {
+        if (lyrics_search_edit_ == nullptr) {
+            return;
+        }
+        RECT client{};
+        GetClientRect(window, &client);
+        const float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0F;
+        const int margin = static_cast<int>(std::lround(18.0F * scale));
+        const int gap = static_cast<int>(std::lround(10.0F * scale));
+        const int row = static_cast<int>(std::lround(38.0F * scale));
+        const int edit_height = std::min(row, preferred_edit_height(window, true));
+        const int button_width = static_cast<int>(std::lround(92.0F * scale));
+        const int action_height = static_cast<int>(std::lround(34.0F * scale));
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        SetWindowPos(lyrics_search_edit_, nullptr,
+            margin, margin + (row - edit_height) / 2,
+            width - margin * 2 - button_width - gap, edit_height,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        SetWindowPos(lyrics_search_button_, nullptr,
+            width - margin - button_width, margin, button_width, row,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        SetWindowPos(lyrics_search_list_, nullptr,
+            margin, margin + row + gap,
+            width - margin * 2,
+            std::max(1, height - margin * 3 - row - gap - action_height),
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        SetWindowPos(lyrics_search_apply_, nullptr,
+            width - margin - button_width,
+            height - margin - action_height,
+            button_width,
+            action_height,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+
+    void apply_lyrics_search_theme()
+    {
+        if (lyrics_search_window_ == nullptr) {
+            return;
+        }
+        const BOOL dark = theme_.dark && !theme_.high_contrast;
+        DwmSetWindowAttribute(
+            lyrics_search_window_,
+            kDwmUseImmersiveDarkMode,
+            &dark,
+            sizeof(dark));
+        if (lyrics_search_edit_ != nullptr) {
+            SetWindowTheme(lyrics_search_edit_, L" ", L" ");
+            SetWindowTheme(lyrics_search_list_, L" ", L" ");
+            RedrawWindow(
+                lyrics_search_window_, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        }
+    }
+
+    void close_lyrics_search_window()
+    {
+        if (lyrics_search_window_ != nullptr) {
+            DestroyWindow(lyrics_search_window_);
+        }
+    }
+
+    void open_lyrics_offset_window()
+    {
+        if (lyrics_offset_window_ != nullptr) {
+            ShowWindow(lyrics_offset_window_, SW_RESTORE);
+            SetForegroundWindow(lyrics_offset_window_);
+            SetFocus(lyrics_offset_edit_);
+            SendMessageW(lyrics_offset_edit_, EM_SETSEL, 0, -1);
+            return;
+        }
+        if (selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        ensure_control_resources(window_);
+        lyrics_offset_track_ = selected_track_;
+        const UINT dpi = GetDpiForWindow(window_);
+        RECT rectangle{0, 0, 660, 142};
+        AdjustWindowRectExForDpi(
+            &rectangle,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            FALSE,
+            WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+            dpi);
+        RECT owner{};
+        GetWindowRect(window_, &owner);
+        const int width = rectangle.right - rectangle.left;
+        const int height = rectangle.bottom - rectangle.top;
+        const int left = owner.left + std::max<LONG>(
+            0, (owner.right - owner.left - width) / 2);
+        const int top = owner.top + std::max<LONG>(
+            0, (owner.bottom - owner.top - height) / 2);
+        lyrics_offset_window_ = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+            kLyricsOffsetWindowClassName,
+            L"歌词偏移",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            left,
+            top,
+            width,
+            height,
+            window_,
+            nullptr,
+            instance_,
+            this);
+        if (lyrics_offset_window_ == nullptr) {
+            lyrics_offset_track_ = std::numeric_limits<std::size_t>::max();
+            return;
+        }
+        apply_lyrics_offset_theme();
+        ShowWindow(lyrics_offset_window_, SW_SHOW);
+        UpdateWindow(lyrics_offset_window_);
+        SetFocus(lyrics_offset_edit_);
+        SendMessageW(lyrics_offset_edit_, EM_SETSEL, 0, -1);
+    }
+
+    void create_lyrics_offset_controls(const HWND window)
+    {
+        ensure_control_resources(window);
+        const auto create_button = [this, window](
+            const int identifier,
+            const wchar_t* const text) {
+            return CreateWindowExW(
+                0,
+                L"BUTTON",
+                text,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 1, 1,
+                window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(identifier)),
+                instance_,
+                nullptr);
+        };
+        lyrics_offset_advance100_ = create_button(kLyricsOffsetAdvance100Id, L"提前 100");
+        lyrics_offset_advance10_ = create_button(kLyricsOffsetAdvance10Id, L"提前 10");
+        lyrics_offset_edit_ = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"0",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER,
+            0, 0, 1, 1,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLyricsOffsetEditId)),
+            instance_,
+            nullptr);
+        lyrics_offset_unit_ = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"ms",
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+            0, 0, 1, 1,
+            window,
+            nullptr,
+            instance_,
+            nullptr);
+        lyrics_offset_delay10_ = create_button(kLyricsOffsetDelay10Id, L"延后 10");
+        lyrics_offset_delay100_ = create_button(kLyricsOffsetDelay100Id, L"延后 100");
+        lyrics_offset_reset_ = create_button(kLyricsOffsetResetId, L"重置");
+        lyrics_offset_apply_ = create_button(kLyricsOffsetApplyId, L"应用");
+        const HWND controls[]{
+            lyrics_offset_advance100_, lyrics_offset_advance10_, lyrics_offset_edit_,
+            lyrics_offset_unit_, lyrics_offset_delay10_, lyrics_offset_delay100_,
+            lyrics_offset_reset_, lyrics_offset_apply_,
+        };
+        for (const HWND control : controls) {
+            if (control != nullptr) {
+                SendMessageW(
+                    control,
+                    WM_SETFONT,
+                    reinterpret_cast<WPARAM>(settings_font_),
+                    TRUE);
+            }
+        }
+        SendMessageW(lyrics_offset_edit_, EM_SETLIMITTEXT, 6, 0);
+        SetWindowLongPtrW(
+            lyrics_offset_edit_,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(this));
+        lyrics_offset_edit_original_proc_ = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(
+                lyrics_offset_edit_,
+                GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(lyrics_offset_edit_window_proc)));
+        update_lyrics_offset_edit_value();
+        update_lyrics_offset_layout(window);
+    }
+
+    static LRESULT CALLBACK lyrics_offset_edit_window_proc(
+        const HWND edit,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        auto* self = reinterpret_cast<MainWindow*>(
+            GetWindowLongPtrW(edit, GWLP_USERDATA));
+        if (self != nullptr && message == WM_KEYDOWN) {
+            if (wparam == VK_RETURN) {
+                self->apply_lyrics_offset_edit();
+                return 0;
+            }
+            if (wparam == VK_ESCAPE && self->lyrics_offset_window_ != nullptr) {
+                DestroyWindow(self->lyrics_offset_window_);
+                return 0;
+            }
+        }
+        return self != nullptr && self->lyrics_offset_edit_original_proc_ != nullptr
+            ? CallWindowProcW(
+                  self->lyrics_offset_edit_original_proc_,
+                  edit,
+                  message,
+                  wparam,
+                  lparam)
+            : DefWindowProcW(edit, message, wparam, lparam);
+    }
+
+    void update_lyrics_offset_layout(const HWND window) const
+    {
+        if (lyrics_offset_edit_ == nullptr) {
+            return;
+        }
+        RECT client{};
+        GetClientRect(window, &client);
+        const float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0F;
+        const int margin = static_cast<int>(std::lround(18.0F * scale));
+        const int gap = static_cast<int>(std::lround(8.0F * scale));
+        const int row = static_cast<int>(std::lround(36.0F * scale));
+        const int edit_height = std::min(row, preferred_edit_height(window, true));
+        const int step_width = static_cast<int>(std::lround(88.0F * scale));
+        const int unit_width = static_cast<int>(std::lround(28.0F * scale));
+        const int action_width = static_cast<int>(std::lround(92.0F * scale));
+        const int action_height = static_cast<int>(std::lround(34.0F * scale));
+        const int width = client.right - client.left;
+        const int content_width = std::max(1, width - margin * 2);
+        const int edit_width = std::max(
+            static_cast<int>(std::lround(84.0F * scale)),
+            content_width - step_width * 4 - gap * 5 - unit_width);
+        int x = margin;
+        SetWindowPos(lyrics_offset_advance100_, nullptr, x, margin, step_width, row,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        x += step_width + gap;
+        SetWindowPos(lyrics_offset_advance10_, nullptr, x, margin, step_width, row,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        x += step_width + gap;
+        SetWindowPos(lyrics_offset_edit_, nullptr, x, margin + (row - edit_height) / 2,
+            edit_width, edit_height, SWP_NOACTIVATE | SWP_NOZORDER);
+        x += edit_width;
+        SetWindowPos(lyrics_offset_unit_, nullptr, x, margin, unit_width, row,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        x += unit_width + gap;
+        SetWindowPos(lyrics_offset_delay10_, nullptr, x, margin, step_width, row,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        x += step_width + gap;
+        SetWindowPos(lyrics_offset_delay100_, nullptr, x, margin, step_width, row,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        const int action_top = client.bottom - margin - action_height;
+        SetWindowPos(lyrics_offset_reset_, nullptr,
+            margin, action_top, action_width, action_height,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        SetWindowPos(lyrics_offset_apply_, nullptr,
+            width - margin - action_width, action_top, action_width, action_height,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+
+    void update_lyrics_offset_edit_value() const
+    {
+        if (lyrics_offset_edit_ != nullptr) {
+            SetWindowTextW(
+                lyrics_offset_edit_,
+                std::to_wstring(current_lyric_offset_milliseconds()).c_str());
+        }
+    }
+
+    [[nodiscard]] std::optional<core::LyricTime> parsed_lyrics_offset() const
+    {
+        if (lyrics_offset_edit_ == nullptr) {
+            return std::nullopt;
+        }
+        wchar_t text[16]{};
+        const int length = GetWindowTextW(
+            lyrics_offset_edit_, text, static_cast<int>(std::size(text)));
+        int begin = 0;
+        while (begin < length && iswspace(text[begin]) != 0) {
+            ++begin;
+        }
+        int end = length;
+        while (end > begin && iswspace(text[end - 1]) != 0) {
+            --end;
+        }
+        bool negative = false;
+        if (begin < end && (text[begin] == L'+' || text[begin] == L'-')) {
+            negative = text[begin] == L'-';
+            ++begin;
+        }
+        if (begin == end) {
+            return std::nullopt;
+        }
+        core::LyricTime value{};
+        for (int index = begin; index < end; ++index) {
+            if (text[index] < L'0' || text[index] > L'9') {
+                return std::nullopt;
+            }
+            value = value * 10 + (text[index] - L'0');
+            if (value > 10'000) {
+                return std::nullopt;
+            }
+        }
+        return negative ? -value : value;
+    }
+
+    void apply_lyrics_offset_edit()
+    {
+        const auto value = parsed_lyrics_offset();
+        if (!value) {
+            MessageBeep(MB_ICONWARNING);
+            SetFocus(lyrics_offset_edit_);
+            SendMessageW(lyrics_offset_edit_, EM_SETSEL, 0, -1);
+            return;
+        }
+        set_lyric_offset(*value);
+        update_lyrics_offset_edit_value();
+        SetFocus(lyrics_offset_edit_);
+        SendMessageW(lyrics_offset_edit_, EM_SETSEL, 0, -1);
+    }
+
+    void step_lyrics_offset(const core::LyricTime delta)
+    {
+        adjust_lyric_offset(delta);
+        update_lyrics_offset_edit_value();
+        SetFocus(lyrics_offset_edit_);
+        SendMessageW(lyrics_offset_edit_, EM_SETSEL, 0, -1);
+    }
+
+    void apply_lyrics_offset_theme()
+    {
+        if (lyrics_offset_window_ == nullptr) {
+            return;
+        }
+        const BOOL dark = theme_.dark && !theme_.high_contrast;
+        DwmSetWindowAttribute(
+            lyrics_offset_window_,
+            kDwmUseImmersiveDarkMode,
+            &dark,
+            sizeof(dark));
+        if (lyrics_offset_edit_ != nullptr) {
+            SetWindowTheme(lyrics_offset_edit_, L" ", L" ");
+        }
+        RedrawWindow(
+            lyrics_offset_window_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+
+    void close_lyrics_offset_window()
+    {
+        if (lyrics_offset_window_ != nullptr) {
+            DestroyWindow(lyrics_offset_window_);
+        }
+    }
+
+    void start_manual_lyrics_search()
+    {
+        if (manual_lyrics_worker_.joinable() ||
+            lyrics_search_edit_ == nullptr ||
+            selected_track_ >= disc_.tracks.size()) {
+            return;
+        }
+        const int length = GetWindowTextLengthW(lyrics_search_edit_);
+        std::wstring keywords(
+            static_cast<std::size_t>(std::max(0, length)) + 1U,
+            L'\0');
+        if (length > 0) {
+            const int copied = GetWindowTextW(
+                lyrics_search_edit_, keywords.data(), length + 1);
+            keywords.resize(static_cast<std::size_t>(std::max(0, copied)));
+        } else {
+            keywords.clear();
+        }
+        const auto first = keywords.find_first_not_of(L" \t\r\n");
+        const auto last = keywords.find_last_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) {
+            MessageBeep(MB_ICONWARNING);
+            SetFocus(lyrics_search_edit_);
+            SendMessageW(lyrics_search_edit_, EM_SETSEL, 0, -1);
+            return;
+        }
+        keywords = keywords.substr(first, last - first + 1U);
+        const std::size_t track_index = selected_track_;
+        const std::uint64_t generation = lyrics_generation_;
+        const core::LyricsMatchQuery query = lyrics_query(track_index);
+        const HWND target_window = window_;
+        SendMessageW(lyrics_search_list_, LB_RESETCONTENT, 0, 0);
+        lyrics_search_items_.clear();
+        EnableWindow(lyrics_search_button_, FALSE);
+        EnableWindow(lyrics_search_apply_, FALSE);
+        SetWindowTextW(lyrics_search_button_, L"搜索中…");
+        SetWindowTextW(lyrics_search_window_, L"手动搜索歌词");
+        manual_lyrics_worker_ = std::jthread([
+            target_window,
+            keywords = std::move(keywords),
+            query,
+            generation,
+            track_index] {
+            auto snapshot = std::make_unique<ManualLyricsSnapshot>();
+            snapshot->query = query;
+            snapshot->generation = generation;
+            snapshot->track_index = track_index;
+            snapshot->result = platform::windows::search_online_lyrics_catalog(
+                keywords,
+                query);
+            auto* const raw_snapshot = snapshot.release();
+            if (PostMessageW(
+                    target_window,
+                    kManualLyricsReadyMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(raw_snapshot)) == FALSE) {
+                delete raw_snapshot;
+            }
+        });
+    }
+
+    [[nodiscard]] static std::wstring search_item_accessible_text(
+        const platform::windows::OnlineLyricsSearchItem& item)
+    {
+        return std::format(
+            L"{} | {} — {} | {} | {}",
+            item.source,
+            item.identity.title,
+            item.identity.artist,
+            item.identity.album,
+            format_duration(
+                item.identity.duration_milliseconds *
+                core::kCdSampleFramesPerSecond / 1'000));
+    }
+
+    void receive_manual_lyrics(std::unique_ptr<ManualLyricsSnapshot> snapshot)
+    {
+        if (manual_lyrics_worker_.joinable()) {
+            manual_lyrics_worker_.join();
+        }
+        if (lyrics_search_window_ == nullptr) {
+            return;
+        }
+        EnableWindow(lyrics_search_button_, TRUE);
+        SetWindowTextW(lyrics_search_button_, L"搜索");
+        if (snapshot->generation != lyrics_generation_ ||
+            snapshot->track_index != selected_track_) {
+            MessageBeep(MB_ICONWARNING);
+            SetWindowTextW(lyrics_search_window_, L"手动搜索歌词");
+            return;
+        }
+        manual_lyrics_query_ = snapshot->query;
+        manual_lyrics_track_ = snapshot->track_index;
+        manual_lyrics_generation_ = snapshot->generation;
+        lyrics_search_items_ = std::move(snapshot->result.items);
+        SendMessageW(lyrics_search_list_, LB_RESETCONTENT, 0, 0);
+        for (const auto& item : lyrics_search_items_) {
+            const std::wstring text = search_item_accessible_text(item);
+            SendMessageW(
+                lyrics_search_list_,
+                LB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(text.c_str()));
+        }
+        if (lyrics_search_items_.empty()) {
+            EnableWindow(lyrics_search_apply_, FALSE);
+            SetWindowTextW(lyrics_search_window_, L"手动搜索歌词 · 0");
+            return;
+        }
+        SendMessageW(lyrics_search_list_, LB_SETCURSEL, 0, 0);
+        EnableWindow(lyrics_search_apply_, TRUE);
+        SetWindowTextW(
+            lyrics_search_window_,
+            std::format(L"手动搜索歌词 · {}", lyrics_search_items_.size()).c_str());
+        InvalidateRect(lyrics_search_list_, nullptr, TRUE);
+    }
+
+    void start_manual_lyrics_resolution()
+    {
+        if (manual_lyrics_resolve_worker_.joinable() ||
+            lyrics_search_list_ == nullptr) {
+            return;
+        }
+        const LRESULT selection = SendMessageW(
+            lyrics_search_list_, LB_GETCURSEL, 0, 0);
+        if (selection == LB_ERR ||
+            static_cast<std::size_t>(selection) >= lyrics_search_items_.size()) {
+            MessageBeep(MB_ICONWARNING);
+            SetFocus(lyrics_search_list_);
+            return;
+        }
+        const auto item = lyrics_search_items_[static_cast<std::size_t>(selection)];
+        const core::LyricsMatchQuery query = manual_lyrics_query_;
+        const std::uint64_t generation = manual_lyrics_generation_;
+        const std::size_t track_index = manual_lyrics_track_;
+        const HWND target_window = window_;
+        EnableWindow(lyrics_search_apply_, FALSE);
+        EnableWindow(lyrics_search_button_, FALSE);
+        SetWindowTextW(lyrics_search_apply_, L"读取中…");
+        manual_lyrics_resolve_worker_ = std::jthread([
+            target_window,
+            item,
+            query,
+            generation,
+            track_index] {
+            auto snapshot = std::make_unique<ManualLyricsResolvedSnapshot>();
+            snapshot->item = item;
+            snapshot->query = query;
+            snapshot->generation = generation;
+            snapshot->track_index = track_index;
+            snapshot->result = platform::windows::resolve_online_lyrics_item(item);
+            auto* const raw_snapshot = snapshot.release();
+            if (PostMessageW(
+                    target_window,
+                    kManualLyricsResolvedMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(raw_snapshot)) == FALSE) {
+                delete raw_snapshot;
+            }
+        });
+    }
+
+    void receive_manual_lyrics_resolution(
+        std::unique_ptr<ManualLyricsResolvedSnapshot> snapshot)
+    {
+        if (manual_lyrics_resolve_worker_.joinable()) {
+            manual_lyrics_resolve_worker_.join();
+        }
+        if (lyrics_search_window_ != nullptr) {
+            EnableWindow(lyrics_search_button_, TRUE);
+            EnableWindow(lyrics_search_apply_, TRUE);
+            SetWindowTextW(lyrics_search_button_, L"搜索");
+            SetWindowTextW(lyrics_search_apply_, L"应用");
+        }
+        if (snapshot->generation != lyrics_generation_ ||
+            snapshot->track_index != selected_track_) {
+            MessageBeep(MB_ICONWARNING);
+            return;
+        }
+        if (!snapshot->result.lyrics) {
+            MessageBeep(MB_ICONWARNING);
+            return;
+        }
+        ++lyrics_generation_;
+        if (lyrics_documents_.size() != disc_.tracks.size() ||
+            lyrics_resolved_.size() != disc_.tracks.size()) {
+            lyrics_documents_.assign(disc_.tracks.size(), std::nullopt);
+            lyrics_resolved_.assign(disc_.tracks.size(), false);
+        }
+        platform::windows::cache_online_lyrics_selection(
+            snapshot->query,
+            *snapshot->result.lyrics);
+        lyrics_documents_[selected_track_] = std::move(snapshot->result.lyrics);
+        lyrics_resolved_[selected_track_] = true;
+        lyrics_ = lyrics_documents_[selected_track_];
+        lyrics_track_index_ = selected_track_;
+        reset_lyric_visual_state();
+        diagnostics_.record(
+            L"lyrics",
+            std::format(
+                L"manual track={} source={} title={} album={} score={:.2f}",
+                disc_.tracks[selected_track_].number,
+                lyrics_->source,
+                snapshot->item.identity.title,
+                snapshot->item.identity.album,
+                snapshot->item.score));
+        close_lyrics_search_window();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void draw_lyrics_search_item(const DRAWITEMSTRUCT& draw) const
+    {
+        if (draw.itemID == static_cast<UINT>(-1) ||
+            draw.itemID >= lyrics_search_items_.size()) {
+            return;
+        }
+        const auto& item = lyrics_search_items_[draw.itemID];
+        const bool selected = (draw.itemState & ODS_SELECTED) != 0U;
+        const HBRUSH background = CreateSolidBrush(colorref(
+            selected ? theme_.elevated : theme_.surface));
+        FillRect(draw.hDC, &draw.rcItem, background);
+        DeleteObject(background);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        const HGDIOBJ previous = SelectObject(draw.hDC, settings_font_);
+        const int middle = (draw.rcItem.top + draw.rcItem.bottom) / 2;
+        RECT primary = draw.rcItem;
+        primary.left += 14;
+        primary.right -= 12;
+        primary.top += 4;
+        primary.bottom = middle + 2;
+        SetTextColor(draw.hDC, colorref(theme_.text));
+        const std::wstring title = std::format(
+            L"[{}]  {} — {}",
+            item.source,
+            item.identity.title,
+            item.identity.artist);
+        DrawTextW(draw.hDC, title.c_str(), -1, &primary,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        RECT secondary = draw.rcItem;
+        secondary.left += 14;
+        secondary.right -= 12;
+        secondary.top = middle - 2;
+        secondary.bottom -= 4;
+        SetTextColor(draw.hDC, colorref(theme_.secondary));
+        const std::wstring details = std::format(
+            L"{}  ·  {}",
+            item.identity.album.empty() ? L"未标注专辑" : item.identity.album,
+            format_duration(
+                item.identity.duration_milliseconds *
+                core::kCdSampleFramesPerSecond / 1'000));
+        DrawTextW(draw.hDC, details.c_str(), -1, &secondary,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(draw.hDC, previous);
+        if ((draw.itemState & ODS_FOCUS) != 0U) {
+            DrawFocusRect(draw.hDC, &draw.rcItem);
+        }
+    }
+
+    void draw_lyrics_search_button(const DRAWITEMSTRUCT& draw) const
+    {
+        const bool disabled = (draw.itemState & ODS_DISABLED) != 0U;
+        const bool pressed = (draw.itemState & ODS_SELECTED) != 0U;
+        const int identifier = GetDlgCtrlID(draw.hwndItem);
+        const bool primary = identifier == kLyricsSearchButtonId ||
+            identifier == kLyricsSearchApplyId ||
+            identifier == kLyricsOffsetApplyId;
+        const HBRUSH background = CreateSolidBrush(colorref(
+            disabled || !primary
+                ? (pressed ? theme_.surface : theme_.elevated)
+                : (pressed ? theme_.surface : theme_.accent)));
+        FillRect(draw.hDC, &draw.rcItem, background);
+        DeleteObject(background);
+        wchar_t text[64]{};
+        GetWindowTextW(draw.hwndItem, text, static_cast<int>(std::size(text)));
+        SetBkMode(draw.hDC, TRANSPARENT);
+        SetTextColor(draw.hDC, colorref(
+            disabled ? theme_.muted : primary ? theme_.accent_text : theme_.text));
+        const HGDIOBJ previous = SelectObject(draw.hDC, settings_font_);
+        RECT rectangle = draw.rcItem;
+        DrawTextW(draw.hDC, text, -1, &rectangle,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(draw.hDC, previous);
+    }
+
+    LRESULT handle_lyrics_search_message(
+        const HWND window,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        switch (message) {
+        case WM_CREATE:
+            create_lyrics_search_controls(window);
+            return 0;
+        case WM_SIZE:
+            update_lyrics_search_layout(window);
+            return 0;
+        case WM_DPICHANGED: {
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(window, nullptr,
+                suggested->left, suggested->top,
+                suggested->right - suggested->left,
+                suggested->bottom - suggested->top,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+            rebuild_control_font(window);
+            update_lyrics_search_layout(window);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            const HDC context = BeginPaint(window, &paint);
+            const HBRUSH background = CreateSolidBrush(colorref(theme_.background));
+            FillRect(context, &paint.rcPaint, background);
+            DeleteObject(background);
+            EndPaint(window, &paint);
+            return 0;
+        }
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+        case WM_CTLCOLORSTATIC: {
+            const HDC context = reinterpret_cast<HDC>(wparam);
+            SetTextColor(context, colorref(
+                message == WM_CTLCOLORSTATIC ? theme_.secondary : theme_.text));
+            SetBkColor(context, colorref(theme_.elevated));
+            SetBkMode(context, OPAQUE);
+            return reinterpret_cast<LRESULT>(settings_edit_brush_);
+        }
+        case WM_MEASUREITEM: {
+            auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+            if (measure != nullptr && measure->CtlID == kLyricsSearchListId) {
+                const float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0F;
+                measure->itemHeight = static_cast<UINT>(std::lround(58.0F * scale));
+                return TRUE;
+            }
+            break;
+        }
+        case WM_DRAWITEM: {
+            const auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+            if (draw != nullptr && draw->CtlID == kLyricsSearchListId) {
+                draw_lyrics_search_item(*draw);
+                return TRUE;
+            }
+            if (draw != nullptr &&
+                (draw->CtlID == kLyricsSearchButtonId ||
+                 draw->CtlID == kLyricsSearchApplyId)) {
+                draw_lyrics_search_button(*draw);
+                return TRUE;
+            }
+            break;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wparam) == kLyricsSearchButtonId &&
+                HIWORD(wparam) == BN_CLICKED) {
+                start_manual_lyrics_search();
+                return 0;
+            }
+            if ((LOWORD(wparam) == kLyricsSearchApplyId &&
+                 HIWORD(wparam) == BN_CLICKED) ||
+                (LOWORD(wparam) == kLyricsSearchListId &&
+                 HIWORD(wparam) == LBN_DBLCLK)) {
+                start_manual_lyrics_resolution();
+                return 0;
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                DestroyWindow(window);
+                return 0;
+            }
+            break;
+        case WM_VKEYTOITEM:
+            if (LOWORD(wparam) == VK_RETURN) {
+                start_manual_lyrics_resolution();
+                return -2;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(window);
+            return 0;
+        case WM_NCDESTROY:
+            lyrics_search_window_ = nullptr;
+            lyrics_search_edit_ = nullptr;
+            lyrics_search_button_ = nullptr;
+            lyrics_search_list_ = nullptr;
+            lyrics_search_apply_ = nullptr;
+            lyrics_search_edit_original_proc_ = nullptr;
+            lyrics_search_items_.clear();
+            return 0;
+        default:
+            break;
+        }
+        return DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    LRESULT handle_lyrics_offset_message(
+        const HWND window,
+        const UINT message,
+        const WPARAM wparam,
+        const LPARAM lparam)
+    {
+        switch (message) {
+        case WM_CREATE:
+            create_lyrics_offset_controls(window);
+            return 0;
+        case WM_SIZE:
+            update_lyrics_offset_layout(window);
+            return 0;
+        case WM_DPICHANGED: {
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(window, nullptr,
+                suggested->left, suggested->top,
+                suggested->right - suggested->left,
+                suggested->bottom - suggested->top,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+            rebuild_control_font(window);
+            update_lyrics_offset_layout(window);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            const HDC context = BeginPaint(window, &paint);
+            const HBRUSH background = CreateSolidBrush(colorref(theme_.background));
+            FillRect(context, &paint.rcPaint, background);
+            DeleteObject(background);
+            EndPaint(window, &paint);
+            return 0;
+        }
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORSTATIC: {
+            const HDC context = reinterpret_cast<HDC>(wparam);
+            SetTextColor(context, colorref(
+                message == WM_CTLCOLORSTATIC ? theme_.secondary : theme_.text));
+            SetBkColor(context, colorref(theme_.elevated));
+            SetBkMode(context, OPAQUE);
+            return reinterpret_cast<LRESULT>(settings_edit_brush_);
+        }
+        case WM_DRAWITEM: {
+            const auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+            if (draw != nullptr &&
+                (draw->CtlID == kLyricsOffsetAdvance100Id ||
+                 draw->CtlID == kLyricsOffsetAdvance10Id ||
+                 draw->CtlID == kLyricsOffsetDelay10Id ||
+                 draw->CtlID == kLyricsOffsetDelay100Id ||
+                 draw->CtlID == kLyricsOffsetResetId ||
+                 draw->CtlID == kLyricsOffsetApplyId)) {
+                draw_lyrics_search_button(*draw);
+                return TRUE;
+            }
+            break;
+        }
+        case WM_COMMAND:
+            if (HIWORD(wparam) == BN_CLICKED) {
+                switch (LOWORD(wparam)) {
+                case kLyricsOffsetAdvance100Id:
+                    step_lyrics_offset(100);
+                    return 0;
+                case kLyricsOffsetAdvance10Id:
+                    step_lyrics_offset(10);
+                    return 0;
+                case kLyricsOffsetDelay10Id:
+                    step_lyrics_offset(-10);
+                    return 0;
+                case kLyricsOffsetDelay100Id:
+                    step_lyrics_offset(-100);
+                    return 0;
+                case kLyricsOffsetResetId:
+                    set_lyric_offset(0);
+                    update_lyrics_offset_edit_value();
+                    SetFocus(lyrics_offset_edit_);
+                    SendMessageW(lyrics_offset_edit_, EM_SETSEL, 0, -1);
+                    return 0;
+                case kLyricsOffsetApplyId:
+                    apply_lyrics_offset_edit();
+                    return 0;
+                default:
+                    break;
+                }
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                DestroyWindow(window);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(window);
+            return 0;
+        case WM_NCDESTROY:
+            lyrics_offset_window_ = nullptr;
+            lyrics_offset_edit_ = nullptr;
+            lyrics_offset_unit_ = nullptr;
+            lyrics_offset_advance100_ = nullptr;
+            lyrics_offset_advance10_ = nullptr;
+            lyrics_offset_delay10_ = nullptr;
+            lyrics_offset_delay100_ = nullptr;
+            lyrics_offset_reset_ = nullptr;
+            lyrics_offset_apply_ = nullptr;
+            lyrics_offset_edit_original_proc_ = nullptr;
+            lyrics_offset_track_ = std::numeric_limits<std::size_t>::max();
+            return 0;
+        default:
+            break;
+        }
+        return DefWindowProcW(window, message, wparam, lparam);
     }
 
     [[nodiscard]] std::size_t first_audio_track() const
@@ -4475,16 +6015,7 @@ private:
         case MetadataEditField::none:
             return;
         }
-        if (settings_font_ == nullptr) {
-            settings_font_ = CreateFontW(
-                -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
-                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        }
-        if (settings_edit_brush_ == nullptr) {
-            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
-        }
+        ensure_control_resources(window_);
         metadata_edit_ = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             L"EDIT",
@@ -4536,7 +6067,12 @@ private:
         }
         const float scale = static_cast<float>(GetDpiForWindow(window_)) / 96.0F;
         const int left = static_cast<int>(std::lround(24.0F * scale));
-        const int top = static_cast<int>(std::lround(62.0F * scale));
+        const int row_top = static_cast<int>(std::lround(62.0F * scale));
+        const int row_height = static_cast<int>(std::lround(38.0F * scale));
+        const int edit_height = std::min(
+            row_height,
+            preferred_edit_height(window_, true));
+        const int top = row_top + (row_height - edit_height) / 2;
         RECT client{};
         GetClientRect(window_, &client);
         SetWindowPos(
@@ -4545,7 +6081,7 @@ private:
             left,
             top,
             std::max(static_cast<int>(client.right) - left * 2, 160),
-            static_cast<int>(std::lround(38.0F * scale)),
+            edit_height,
             SWP_NOACTIVATE);
     }
 
@@ -4692,26 +6228,7 @@ private:
         selected_audio_endpoint_ = find_audio_endpoint_index(
             audio_endpoints_, user_settings_.audio_endpoint_id);
         cddb_settings_error_.clear();
-        if (settings_font_ == nullptr) {
-            settings_font_ = CreateFontW(
-                -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
-                0,
-                0,
-                0,
-                FW_NORMAL,
-                FALSE,
-                FALSE,
-                FALSE,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE,
-                L"Segoe UI");
-        }
-        if (settings_edit_brush_ == nullptr) {
-            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
-        }
+        ensure_control_resources(window_);
         settings_token_edit_ = CreateWindowExW(
             0,
             L"EDIT",
@@ -5403,9 +6920,13 @@ private:
                 rectangle.top >= kSettingsContentTop &&
                 rectangle.bottom <= layout_.height - 24.0F;
             const int left = to_pixel(rectangle.left + 13.0F);
-            const int top = to_pixel(rectangle.top + 8.0F);
             const int width = to_pixel(rectangle.right - rectangle.left - 26.0F);
-            const int height = to_pixel(rectangle.bottom - rectangle.top - 16.0F);
+            const int field_top = to_pixel(rectangle.top);
+            const int field_height = to_pixel(rectangle.bottom - rectangle.top);
+            const int height = std::min(
+                field_height,
+                preferred_edit_height(window_, false));
+            const int top = field_top + (field_height - height) / 2;
             RECT current{};
             GetWindowRect(edit, &current);
             MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&current), 2);
@@ -5975,16 +7496,7 @@ private:
             return;
         }
         active_page_ = AppPage::metadata_editor;
-        if (settings_font_ == nullptr) {
-            settings_font_ = CreateFontW(
-                -MulDiv(14, static_cast<int>(GetDpiForWindow(window_)), 72),
-                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        }
-        if (settings_edit_brush_ == nullptr) {
-            settings_edit_brush_ = CreateSolidBrush(colorref(theme_.elevated));
-        }
+        ensure_control_resources(window_);
         metadata_editor_working_ = {
             disc_.album_title,
             disc_.album_artist,
@@ -6102,13 +7614,18 @@ private:
             if (edit == nullptr) {
                 return;
             }
+            const int field_top = to_pixel(rectangle.top);
+            const int field_height = to_pixel(rectangle.bottom - rectangle.top);
+            const int edit_height = std::min(
+                field_height,
+                preferred_edit_height(window_, false));
             SetWindowPos(
                 edit,
                 HWND_TOP,
                 to_pixel(rectangle.left + 13.0F),
-                to_pixel(rectangle.top + 8.0F),
+                field_top + (field_height - edit_height) / 2,
                 to_pixel(rectangle.right - rectangle.left - 26.0F),
-                to_pixel(rectangle.bottom - rectangle.top - 16.0F),
+                edit_height,
                 SWP_NOACTIVATE);
         };
         position(metadata_album_title_edit_, layout_.metadata_album_title_edit);
@@ -6622,6 +8139,8 @@ private:
     std::jthread disc_worker_;
     std::jthread metadata_worker_;
     std::jthread lyrics_worker_;
+    std::jthread manual_lyrics_worker_;
+    std::jthread manual_lyrics_resolve_worker_;
     std::optional<core::LyricsDocument> lyrics_;
     std::vector<std::optional<core::LyricsDocument>> lyrics_documents_;
     std::vector<bool> lyrics_resolved_;
@@ -6633,6 +8152,28 @@ private:
     std::chrono::steady_clock::time_point lyric_transition_started_{};
     int lyric_transition_direction_{};
     bool lyric_transition_running_{};
+    D2D1_RECT_F lyrics_hit_area_{};
+    HWND lyrics_search_window_{};
+    HWND lyrics_search_edit_{};
+    HWND lyrics_search_button_{};
+    HWND lyrics_search_list_{};
+    HWND lyrics_search_apply_{};
+    WNDPROC lyrics_search_edit_original_proc_{};
+    HWND lyrics_offset_window_{};
+    HWND lyrics_offset_edit_{};
+    HWND lyrics_offset_unit_{};
+    HWND lyrics_offset_advance100_{};
+    HWND lyrics_offset_advance10_{};
+    HWND lyrics_offset_delay10_{};
+    HWND lyrics_offset_delay100_{};
+    HWND lyrics_offset_reset_{};
+    HWND lyrics_offset_apply_{};
+    WNDPROC lyrics_offset_edit_original_proc_{};
+    std::size_t lyrics_offset_track_{std::numeric_limits<std::size_t>::max()};
+    std::vector<platform::windows::OnlineLyricsSearchItem> lyrics_search_items_;
+    core::LyricsMatchQuery manual_lyrics_query_;
+    std::size_t manual_lyrics_track_{std::numeric_limits<std::size_t>::max()};
+    std::uint64_t manual_lyrics_generation_{};
     std::uint64_t disc_generation_{};
     bool disc_loading_{};
     Layout layout_{};
@@ -6692,6 +8233,9 @@ private:
     bool metadata_editor_feedback_error_{};
     std::jthread cddb_submission_worker_;
     HFONT settings_font_{};
+    bool settings_font_is_stock_{};
+    HFONT menu_font_{};
+    bool menu_font_is_stock_{};
     HBRUSH settings_edit_brush_{};
     HWND metadata_edit_{};
     WNDPROC metadata_edit_original_proc_{};

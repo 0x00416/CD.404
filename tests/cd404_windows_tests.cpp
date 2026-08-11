@@ -497,6 +497,25 @@ void test_online_lyrics_matching_and_parsing()
             client->headers[0].find(L"admin@416.best") != std::wstring::npos,
         "lyrics providers receive encoded metadata and an identifying user agent");
 
+    auto catalog_client = std::make_shared<LyricsHttpClient>();
+    std::optional<platform::windows::OnlineLyricsCatalogResult> catalog;
+    std::jthread catalog_worker([&] {
+        catalog = platform::windows::search_online_lyrics_catalog(
+            L"Synthetic Karaoke Test Artist",
+            core::LyricsMatchQuery{
+                L"Synthetic Karaoke", L"Test Artist", L"Test Album", 120'000},
+            catalog_client);
+    });
+    catalog_worker.join();
+    expect(
+        catalog && catalog->items.size() == 1U &&
+            catalog->items[0].source == L"LRCLIB" &&
+            catalog->items[0].provider_key == L"1" &&
+            !catalog_client->paths.empty() &&
+            catalog_client->paths[0].find(
+                L"q=Synthetic%20Karaoke%20Test%20Artist") != std::wstring::npos,
+        "manual lyrics catalog uses user keywords and exposes every searchable item");
+
     std::optional<platform::windows::OnlineLyricsLookupResult> preference;
     std::jthread preference_worker([&] {
         preference = platform::windows::lookup_online_lyrics(
@@ -512,11 +531,48 @@ void test_online_lyrics_matching_and_parsing()
     preference_worker.join();
     expect(
         preference && preference->lyrics &&
-            preference->lyrics->source == L"NetEase" &&
-            preference->lyrics->has_word_timing &&
-            preference->lyrics->lines[0].tokens.size() == 2U &&
-            preference->lyrics->lines[0].translation == L"\u4e00\u4e8c",
-        "a close word-timed YRC candidate wins and receives a missing Chinese translation");
+            preference->lyrics->source == L"LRCLIB" &&
+            !preference->lyrics->has_word_timing &&
+            preference->lyrics->lines.size() == 2U,
+        "an exact identity match is not displaced by a weaker word-timed candidate");
+
+    std::optional<platform::windows::OnlineLyricsLookupResult> resolved;
+    std::jthread resolve_worker([&] {
+        resolved = platform::windows::resolve_online_lyrics_item(
+            platform::windows::OnlineLyricsSearchItem{
+                platform::windows::OnlineLyricsProvider::netease,
+                L"42",
+                L"NetEase",
+                {L"Preference Song Live", L"Alpha Beta", L"Preference Album",
+                 120'000, true, true},
+                90.0,
+            },
+            std::make_shared<WordPreferenceLyricsHttpClient>());
+    });
+    resolve_worker.join();
+    expect(
+        resolved && resolved->lyrics && resolved->lyrics->source == L"NetEase" &&
+            resolved->lyrics->has_word_timing &&
+            resolved->lyrics->lines[0].tokens.size() == 2U,
+        "manual lyrics selection resolves only the chosen provider item");
+
+    std::vector<platform::windows::OnlineLyricsCandidate> priority{
+        {{L"Song", L"Artist", L"Album", 120'000, true, true},
+         {{{1'000, 2'000, L"Wrong", {}, L"", {}}}, L"Kugou", true},
+         99.0},
+        {{L"Song", L"Artist", L"Album", 120'000, true, true},
+         {{{1'000, 2'000, L"Correct", {}, L"", {}}}, L"QQ Music", true},
+         82.0},
+    };
+    expect(
+        platform::windows::select_online_lyrics_candidate(priority) ==
+            std::optional<std::size_t>(1U),
+        "Kugou remains an automatic fallback even when its metadata score is higher");
+    priority.erase(priority.begin() + 1);
+    expect(
+        platform::windows::select_online_lyrics_candidate(priority) ==
+            std::optional<std::size_t>(0U),
+        "Kugou can still supply lyrics when every other provider is unavailable");
 }
 
 void test_cloud_lyrics_codecs()
@@ -602,6 +658,59 @@ void test_online_lyrics_live()
             (result->lyrics->source == L"QQ Music" ||
              result->lyrics->source == L"Kugou"),
         "live lyrics providers return a verified word-timed document");
+}
+
+void test_marchen_track_two_live()
+{
+    using namespace cd404;
+    const core::LyricsMatchQuery query{
+        L"深淵のマーメイド",
+        L"Aiobahn",
+        L"Märchen EP",
+        178'560,
+    };
+    std::optional<platform::windows::OnlineLyricsLookupResult> result;
+    std::jthread worker([&] {
+        result = platform::windows::lookup_online_lyrics(
+            query,
+            {},
+            false);
+    });
+    worker.join();
+    expect(
+        result && result->lyrics &&
+            (result->lyrics->source == L"QQ Music" ||
+             result->lyrics->source == L"NetEase") &&
+            !result->lyrics->lines.empty() &&
+            result->lyrics->lines.front().text == L"深い深い世界で",
+        "Märchen track two rejects Kugou's mismatched generated subtitle");
+
+    std::optional<platform::windows::OnlineLyricsCatalogResult> catalog;
+    std::jthread catalog_worker([&] {
+        catalog = platform::windows::search_online_lyrics_catalog(
+            L"Aiobahn 深淵のマーメイド",
+            query);
+    });
+    catalog_worker.join();
+    expect(
+        catalog && catalog->items.size() > 3U &&
+            catalog->items.front().provider !=
+                platform::windows::OnlineLyricsProvider::kugou &&
+            catalog->items.back().provider ==
+                platform::windows::OnlineLyricsProvider::kugou,
+        "manual live search exposes the full catalog and keeps Kugou results last");
+    if (catalog && !catalog->items.empty()) {
+        std::optional<platform::windows::OnlineLyricsLookupResult> selected;
+        std::jthread selected_worker([&] {
+            selected = platform::windows::resolve_online_lyrics_item(
+                catalog->items.front());
+        });
+        selected_worker.join();
+        expect(
+            selected && selected->lyrics && !selected->lyrics->lines.empty() &&
+                selected->lyrics->lines.front().text == L"深い深い世界で",
+            "manual live selection resolves the exact chosen result");
+    }
 }
 
 void test_krc_translation_alignment_live()
@@ -1363,6 +1472,7 @@ void test_user_settings_round_trip()
     source.cddb_server = L"https://metadata.example.test";
     source.cddb_email = L"listener@example.test";
     source.playback_positions[disc_key] = {2, 123'456};
+    source.lyric_offsets_ms[disc_key][2] = 650;
     source.metadata_overrides[disc_key] = SavedDiscMetadata{
         L"Edited Album",
         L"Edited Artist",
@@ -1375,6 +1485,7 @@ void test_user_settings_round_trip()
     const std::wstring json = encode_user_settings(source);
     const UserSettings decoded = decode_user_settings(json);
     const auto position = decoded.playback_positions.find(disc_key);
+    const auto offsets = decoded.lyric_offsets_ms.find(disc_key);
     expect(
         decoded.volume > 0.369F && decoded.volume < 0.371F &&
             !decoded.listenbrainz_reporting_enabled &&
@@ -1390,6 +1501,11 @@ void test_user_settings_round_trip()
             position->second.track_number == 2 &&
             position->second.offset_frames == 123'456,
         "user settings JSON round-trips per-disc playback position");
+    expect(
+        offsets != decoded.lyric_offsets_ms.end() &&
+            offsets->second.find(2) != offsets->second.end() &&
+            offsets->second.at(2) == 650,
+        "user settings JSON round-trips per-track lyric offsets");
     expect(
         json.find(L"Token") == std::wstring::npos &&
             json.find(L"token") == std::wstring::npos &&
@@ -1866,6 +1982,9 @@ int main(const int argument_count, char** arguments)
     } else if (argument_count == 2 &&
                std::string_view(arguments[1]) == "--online-krc") {
         test_krc_translation_alignment_live();
+    } else if (argument_count == 2 &&
+               std::string_view(arguments[1]) == "--online-marchen-track2") {
+        test_marchen_track_two_live();
     }
 
     if (failures != 0) {

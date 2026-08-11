@@ -37,6 +37,43 @@ struct ProviderCandidate final {
     double score{};
 };
 
+[[nodiscard]] bool payload_identity_matches(
+    const ProviderCandidate& candidate) noexcept
+{
+    if (candidate.document.lines.empty()) {
+        return false;
+    }
+    const auto& first = candidate.document.lines.front();
+    if (first.text.find(L"TME AI") != std::wstring::npos ||
+        first.text.find(L"本字幕由TME AI技术生成") != std::wstring::npos) {
+        return false;
+    }
+    if (first.start_milliseconds > 500) {
+        return true;
+    }
+    constexpr std::wstring_view separators[]{L" - ", L" — ", L" – "};
+    for (const std::wstring_view separator : separators) {
+        const std::size_t position = first.text.find(separator);
+        if (position == std::wstring::npos) {
+            continue;
+        }
+        const std::wstring_view left(first.text.data(), position);
+        const std::wstring_view right(
+            first.text.data() + position + separator.size(),
+            first.text.size() - position - separator.size());
+        const core::LyricsMatchQuery expected{
+            candidate.identity.title, L"", L"", 0};
+        const auto title_score = [&](const std::wstring_view text) {
+            return core::lyrics_match_score(
+                expected,
+                core::LyricsMatchCandidate{
+                    std::wstring(text), L"", L"", 0, true, false});
+        };
+        return title_score(left) > 0.0 || title_score(right) > 0.0;
+    }
+    return true;
+}
+
 [[nodiscard]] std::wstring json_string(
     const JsonObject& object,
     const wchar_t* name)
@@ -383,7 +420,7 @@ void attach_krc_translations_impl(
                 candidate.document.has_word_timing,
             };
             candidate.score = core::lyrics_match_score(query, candidate.identity);
-            if (candidate.score >= 55.0) {
+            if (candidate.score >= 55.0 && payload_identity_matches(candidate)) {
                 candidates.push_back(std::move(candidate));
             }
         }
@@ -393,15 +430,12 @@ void attach_krc_translations_impl(
     return candidates;
 }
 
-[[nodiscard]] std::optional<JsonArray> netease_search(
+[[nodiscard]] std::optional<JsonArray> netease_search_keyword(
     HttpClient& client,
-    const core::LyricsMatchQuery& query,
+    const std::wstring_view keyword,
     unsigned long& system_error,
     unsigned long& status)
 {
-    const std::wstring keyword = query.artist.empty()
-        ? query.title
-        : query.artist + L" " + query.title;
     const HttpResponse response = client.get(
         L"music.163.com",
         L"/api/search/get?s=" + detail::percent_encode_utf8(keyword) +
@@ -425,6 +459,18 @@ void attach_krc_translations_impl(
         system_error = ERROR_INVALID_DATA;
         return std::nullopt;
     }
+}
+
+[[nodiscard]] std::optional<JsonArray> netease_search(
+    HttpClient& client,
+    const core::LyricsMatchQuery& query,
+    unsigned long& system_error,
+    unsigned long& status)
+{
+    const std::wstring keyword = query.artist.empty()
+        ? query.title
+        : query.artist + L" " + query.title;
+    return netease_search_keyword(client, keyword, system_error, status);
 }
 
 [[nodiscard]] std::vector<ProviderCandidate> netease_candidates(
@@ -509,7 +555,9 @@ void attach_krc_translations_impl(
             candidate.identity.has_word_timing = resolved.document.has_word_timing;
             resolved.identity = candidate.identity;
             resolved.score = core::lyrics_match_score(query, resolved.identity);
-            result.push_back(std::move(resolved));
+            if (payload_identity_matches(resolved)) {
+                result.push_back(std::move(resolved));
+            }
         } catch (const winrt::hresult_error&) {
             system_error = ERROR_INVALID_DATA;
         }
@@ -781,7 +829,9 @@ void insert_number(JsonObject& object, const wchar_t* key, const double value)
         candidate.identity.has_word_timing = resolved.document.has_word_timing;
         resolved.identity = candidate.identity;
         resolved.score = core::lyrics_match_score(query, resolved.identity);
-        result.push_back(std::move(resolved));
+        if (payload_identity_matches(resolved)) {
+            result.push_back(std::move(resolved));
+        }
     }
     return result;
 }
@@ -900,12 +950,443 @@ void insert_number(JsonObject& object, const wchar_t* key, const double value)
             candidate.identity.has_word_timing = resolved.document.has_word_timing;
             resolved.identity = candidate.identity;
             resolved.score = core::lyrics_match_score(query, resolved.identity);
-            result.push_back(std::move(resolved));
+            if (payload_identity_matches(resolved)) {
+                result.push_back(std::move(resolved));
+            }
         } catch (const winrt::hresult_error&) {
             system_error = ERROR_INVALID_DATA;
         }
     }
     return result;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> unsigned_key(
+    const std::wstring_view value) noexcept
+{
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    std::uint64_t result{};
+    for (const wchar_t character : value) {
+        if (character < L'0' || character > L'9' ||
+            result > (std::numeric_limits<std::uint64_t>::max() -
+                static_cast<unsigned int>(character - L'0')) / 10U) {
+            return std::nullopt;
+        }
+        result = result * 10U + static_cast<unsigned int>(character - L'0');
+    }
+    return result;
+}
+
+void append_lrclib_catalog(
+    HttpClient& client,
+    const std::wstring_view keywords,
+    const core::LyricsMatchQuery& expected,
+    OnlineLyricsCatalogResult& result)
+{
+    const HttpResponse response = client.get(
+        L"lrclib.net",
+        L"/api/search?q=" + detail::percent_encode_utf8(keywords),
+        L"Accept: application/json\r\n"
+        L"User-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+        4U * 1'024U * 1'024U);
+    result.system_error = response.system_error;
+    result.status = response.status;
+    if (response.system_error != ERROR_SUCCESS || response.status != 200U) {
+        return;
+    }
+    try {
+        const JsonArray records = JsonArray::Parse(body_text(response));
+        for (std::uint32_t index{}; index < records.Size(); ++index) {
+            const JsonObject record = records.GetObjectAt(index);
+            const std::uint64_t id = json_unsigned(record, L"id");
+            if (id == 0U || json_string(record, L"syncedLyrics").empty()) {
+                continue;
+            }
+            OnlineLyricsSearchItem item;
+            item.provider = OnlineLyricsProvider::lrclib;
+            item.provider_key = std::to_wstring(id);
+            item.source = L"LRCLIB";
+            item.identity = {
+                json_string(record, L"trackName"),
+                json_string(record, L"artistName"),
+                json_string(record, L"albumName"),
+                static_cast<core::LyricTime>(json_unsigned(record, L"duration") * 1'000U),
+                true,
+                false,
+            };
+            item.score = core::lyrics_match_score(expected, item.identity);
+            result.items.push_back(std::move(item));
+        }
+    } catch (const winrt::hresult_error&) {
+        result.system_error = ERROR_INVALID_DATA;
+    }
+}
+
+void append_netease_catalog(
+    HttpClient& client,
+    const std::wstring_view keywords,
+    const core::LyricsMatchQuery& expected,
+    OnlineLyricsCatalogResult& result)
+{
+    const auto songs = netease_search_keyword(
+        client, keywords, result.system_error, result.status);
+    if (!songs) {
+        return;
+    }
+    for (std::uint32_t index{}; index < songs->Size(); ++index) {
+        try {
+            const JsonObject song = songs->GetObjectAt(index);
+            const std::uint64_t id = json_unsigned(song, L"id");
+            if (id == 0U) {
+                continue;
+            }
+            const JsonObject album = song.GetNamedObject(L"album", JsonObject{});
+            OnlineLyricsSearchItem item;
+            item.provider = OnlineLyricsProvider::netease;
+            item.provider_key = std::to_wstring(id);
+            item.source = L"NetEase";
+            item.identity = {
+                json_string(song, L"name"),
+                joined_artists(song),
+                json_string(album, L"name"),
+                static_cast<core::LyricTime>(json_unsigned(song, L"duration")),
+                true,
+                false,
+            };
+            item.score = core::lyrics_match_score(expected, item.identity);
+            result.items.push_back(std::move(item));
+        } catch (const winrt::hresult_error&) {
+            continue;
+        }
+    }
+}
+
+void append_qq_catalog(
+    HttpClient& client,
+    const std::wstring_view keywords,
+    const core::LyricsMatchQuery& expected,
+    OnlineLyricsCatalogResult& result)
+{
+    const HttpResponse response = client.get(
+        L"c.y.qq.com",
+        L"/soso/fcgi-bin/client_search_cp?p=1&n=20&format=json&w=" +
+            detail::percent_encode_utf8(keywords),
+        L"Accept: application/json\r\n"
+        L"Referer: https://y.qq.com/\r\n"
+        L"User-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+        4U * 1'024U * 1'024U);
+    result.system_error = response.system_error;
+    result.status = response.status;
+    if (response.system_error != ERROR_SUCCESS || response.status != 200U) {
+        return;
+    }
+    try {
+        const JsonArray songs = JsonObject::Parse(body_text(response))
+            .GetNamedObject(L"data").GetNamedObject(L"song").GetNamedArray(L"list");
+        for (std::uint32_t index{}; index < songs.Size(); ++index) {
+            const JsonObject song = songs.GetObjectAt(index);
+            const std::uint64_t id = json_unsigned(song, L"songid");
+            if (id == 0U) {
+                continue;
+            }
+            std::wstring artists;
+            const JsonArray singers = song.GetNamedArray(L"singer", JsonArray{});
+            for (std::uint32_t singer{}; singer < singers.Size(); ++singer) {
+                const std::wstring name = json_string(singers.GetObjectAt(singer), L"name");
+                if (!name.empty()) {
+                    artists += (artists.empty() ? L"" : L" / ") + name;
+                }
+            }
+            OnlineLyricsSearchItem item;
+            item.provider = OnlineLyricsProvider::qq_music;
+            item.provider_key = std::to_wstring(id);
+            item.source = L"QQ Music";
+            item.identity = {
+                json_string(song, L"songname"),
+                std::move(artists),
+                json_string(song, L"albumname"),
+                static_cast<core::LyricTime>(json_unsigned(song, L"interval") * 1'000U),
+                true,
+                true,
+            };
+            item.score = core::lyrics_match_score(expected, item.identity);
+            result.items.push_back(std::move(item));
+        }
+    } catch (const winrt::hresult_error&) {
+        result.system_error = ERROR_INVALID_DATA;
+    }
+}
+
+void append_kugou_catalog(
+    HttpClient& client,
+    const std::wstring_view keywords,
+    const core::LyricsMatchQuery& expected,
+    OnlineLyricsCatalogResult& result)
+{
+    const HttpResponse response = client.get(
+        L"songsearch.kugou.com",
+        L"/song_search_v2?keyword=" + detail::percent_encode_utf8(keywords) +
+            L"&page=1&pagesize=20&platform=WebFilter",
+        L"Accept: application/json\r\n"
+        L"User-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+        4U * 1'024U * 1'024U);
+    result.system_error = response.system_error;
+    result.status = response.status;
+    if (response.system_error != ERROR_SUCCESS || response.status != 200U) {
+        return;
+    }
+    try {
+        const JsonArray songs = JsonObject::Parse(body_text(response))
+            .GetNamedObject(L"data").GetNamedArray(L"lists");
+        for (std::uint32_t index{}; index < songs.Size(); ++index) {
+            const JsonObject song = songs.GetObjectAt(index);
+            const std::wstring hash = json_string(song, L"FileHash");
+            if (hash.empty()) {
+                continue;
+            }
+            OnlineLyricsSearchItem item;
+            item.provider = OnlineLyricsProvider::kugou;
+            item.provider_key = hash;
+            item.source = L"Kugou";
+            item.identity = {
+                json_string(song, L"SongName"),
+                json_string(song, L"SingerName"),
+                json_string(song, L"AlbumName"),
+                static_cast<core::LyricTime>(json_unsigned(song, L"Duration") * 1'000U),
+                true,
+                true,
+            };
+            item.score = core::lyrics_match_score(expected, item.identity);
+            result.items.push_back(std::move(item));
+        }
+    } catch (const winrt::hresult_error&) {
+        result.system_error = ERROR_INVALID_DATA;
+    }
+}
+
+[[nodiscard]] std::optional<ProviderCandidate> resolve_lrclib_item(
+    HttpClient& client,
+    const OnlineLyricsSearchItem& item,
+    unsigned long& system_error,
+    unsigned long& status)
+{
+    const HttpResponse response = client.get(
+        L"lrclib.net",
+        L"/api/get/" + detail::percent_encode_utf8(item.provider_key),
+        L"Accept: application/json\r\n"
+        L"User-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+        4U * 1'024U * 1'024U);
+    system_error = response.system_error;
+    status = response.status;
+    if (response.system_error != ERROR_SUCCESS || response.status != 200U) {
+        return std::nullopt;
+    }
+    try {
+        const JsonObject root = JsonObject::Parse(body_text(response));
+        ProviderCandidate candidate;
+        candidate.identity = item.identity;
+        candidate.document = core::parse_lrc(json_string(root, L"syncedLyrics"));
+        candidate.document.source = L"LRCLIB";
+        candidate.identity.has_word_timing = candidate.document.has_word_timing;
+        return candidate.document.lines.empty() ? std::nullopt
+            : std::optional(std::move(candidate));
+    } catch (const winrt::hresult_error&) {
+        system_error = ERROR_INVALID_DATA;
+        return std::nullopt;
+    }
+}
+
+[[nodiscard]] std::optional<ProviderCandidate> resolve_netease_item(
+    HttpClient& client,
+    const OnlineLyricsSearchItem& item,
+    unsigned long& system_error,
+    unsigned long& status)
+{
+    const auto id = unsigned_key(item.provider_key);
+    if (!id) {
+        system_error = ERROR_INVALID_PARAMETER;
+        return std::nullopt;
+    }
+    const HttpResponse response = client.get(
+        L"music.163.com",
+        std::format(L"/api/song/lyric?os=pc&id={}&lv=-1&kv=-1&tv=-1&yv=-1&rv=-1", *id),
+        L"Accept: application/json\r\n"
+        L"Referer: https://music.163.com/\r\n"
+        L"User-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+        4U * 1'024U * 1'024U);
+    system_error = response.system_error;
+    status = response.status;
+    if (response.system_error != ERROR_SUCCESS || response.status != 200U) {
+        return std::nullopt;
+    }
+    try {
+        const JsonObject root = JsonObject::Parse(body_text(response));
+        const std::wstring yrc = json_string(root.GetNamedObject(L"yrc", JsonObject{}), L"lyric");
+        const std::wstring lrc = json_string(root.GetNamedObject(L"lrc", JsonObject{}), L"lyric");
+        ProviderCandidate candidate;
+        candidate.identity = item.identity;
+        candidate.document = !yrc.empty() ? core::parse_yrc(yrc) : core::parse_lrc(lrc);
+        if (candidate.document.lines.empty()) {
+            return std::nullopt;
+        }
+        const std::wstring translation = json_string(
+            root.GetNamedObject(L"tlyric", JsonObject{}), L"lyric");
+        if (!translation.empty()) {
+            attach_translations(candidate.document, core::parse_lrc(translation));
+        }
+        candidate.document.source = L"NetEase";
+        candidate.identity.has_word_timing = candidate.document.has_word_timing;
+        return candidate;
+    } catch (const winrt::hresult_error&) {
+        system_error = ERROR_INVALID_DATA;
+        return std::nullopt;
+    }
+}
+
+[[nodiscard]] std::optional<ProviderCandidate> resolve_qq_item(
+    HttpClient& client,
+    const OnlineLyricsSearchItem& item,
+    unsigned long& system_error,
+    unsigned long& status)
+{
+    const auto id = unsigned_key(item.provider_key);
+    if (!id) {
+        system_error = ERROR_INVALID_PARAMETER;
+        return std::nullopt;
+    }
+    JsonObject comm = qq_comm();
+    JsonObject session_parameters;
+    insert_number(session_parameters, L"caller", 0);
+    insert_string(session_parameters, L"uid", L"0");
+    insert_number(session_parameters, L"vkey", 0);
+    const auto session_data = qq_request(
+        client, comm, L"GetSession", L"music.getSession.session",
+        session_parameters, system_error, status);
+    if (!session_data) {
+        return std::nullopt;
+    }
+    try {
+        const JsonObject session = session_data->GetNamedObject(L"session");
+        comm.Insert(L"uid", session.GetNamedValue(L"uid"));
+        insert_string(comm, L"sid", json_string(session, L"sid"));
+        insert_string(comm, L"userip", json_string(session, L"userip"));
+    } catch (const winrt::hresult_error&) {
+        return std::nullopt;
+    }
+    JsonObject parameters;
+    insert_string(parameters, L"albumName", encode_base64_utf8(item.identity.album));
+    insert_number(parameters, L"crypt", 1);
+    insert_number(parameters, L"ct", 19);
+    insert_number(parameters, L"cv", 2111);
+    insert_number(parameters, L"interval", static_cast<double>(
+        item.identity.duration_milliseconds / 1'000));
+    insert_number(parameters, L"lrc_t", 0);
+    insert_number(parameters, L"qrc", 1);
+    insert_number(parameters, L"qrc_t", 0);
+    insert_number(parameters, L"roma", 1);
+    insert_number(parameters, L"roma_t", 0);
+    insert_string(parameters, L"singerName", encode_base64_utf8(item.identity.artist));
+    insert_number(parameters, L"songID", static_cast<double>(*id));
+    insert_string(parameters, L"songName", encode_base64_utf8(item.identity.title));
+    insert_number(parameters, L"trans", 1);
+    insert_number(parameters, L"trans_t", 0);
+    insert_number(parameters, L"type", 0);
+    const auto data = qq_request(
+        client, comm, L"GetPlayLyricInfo",
+        L"music.musichallSong.PlayLyricInfo", parameters, system_error, status);
+    if (!data) {
+        return std::nullopt;
+    }
+    const auto plain = detail::decode_qrc(
+        detail::wide_to_utf8(json_string(*data, L"lyric")));
+    if (!plain) {
+        return std::nullopt;
+    }
+    ProviderCandidate candidate;
+    candidate.identity = item.identity;
+    candidate.document = parse_qrc_payload(*plain);
+    if (candidate.document.lines.empty()) {
+        return std::nullopt;
+    }
+    const std::wstring encrypted_translation = json_string(*data, L"trans");
+    if (!encrypted_translation.empty()) {
+        if (const auto translation = detail::decode_qrc(
+                detail::wide_to_utf8(encrypted_translation))) {
+            attach_translations(candidate.document, parse_qrc_payload(*translation));
+        }
+    }
+    candidate.document.source = L"QQ Music";
+    candidate.identity.has_word_timing = candidate.document.has_word_timing;
+    return candidate;
+}
+
+[[nodiscard]] std::optional<ProviderCandidate> resolve_kugou_item(
+    HttpClient& client,
+    const OnlineLyricsSearchItem& item,
+    unsigned long& system_error,
+    unsigned long& status)
+{
+    const HttpResponse lyric_search = client.get(
+        L"lyrics.kugou.com",
+        L"/search?ver=1&man=yes&client=pc&keyword=" +
+            detail::percent_encode_utf8(item.identity.title) + L"&hash=" +
+            detail::percent_encode_utf8(item.provider_key) + L"&duration=" +
+            std::to_wstring(item.identity.duration_milliseconds),
+        L"Accept: application/json\r\nUser-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+        4U * 1'024U * 1'024U);
+    system_error = lyric_search.system_error;
+    status = lyric_search.status;
+    if (lyric_search.system_error != ERROR_SUCCESS || lyric_search.status != 200U) {
+        return std::nullopt;
+    }
+    try {
+        const JsonArray lyrics = JsonObject::Parse(body_text(lyric_search))
+            .GetNamedArray(L"candidates", JsonArray{});
+        if (lyrics.Size() == 0U) {
+            return std::nullopt;
+        }
+        const JsonObject lyric = lyrics.GetObjectAt(0);
+        const std::wstring id = json_string(lyric, L"id");
+        const std::wstring key = json_string(lyric, L"accesskey");
+        if (id.empty() || key.empty()) {
+            return std::nullopt;
+        }
+        const HttpResponse download = client.get(
+            L"lyrics.kugou.com",
+            L"/download?ver=1&client=pc&id=" + detail::percent_encode_utf8(id) +
+                L"&accesskey=" + detail::percent_encode_utf8(key) +
+                L"&fmt=krc&charset=utf8",
+            L"Accept: application/json\r\nUser-Agent: CD.404/0.2.0 (admin@416.best)\r\n",
+            8U * 1'024U * 1'024U);
+        system_error = download.system_error;
+        status = download.status;
+        if (download.system_error != ERROR_SUCCESS || download.status != 200U) {
+            return std::nullopt;
+        }
+        const auto encrypted = detail::decode_base64(json_string(
+            JsonObject::Parse(body_text(download)), L"content"));
+        if (!encrypted) {
+            return std::nullopt;
+        }
+        const auto plain = detail::decode_krc(*encrypted);
+        if (!plain) {
+            return std::nullopt;
+        }
+        ProviderCandidate candidate;
+        candidate.identity = item.identity;
+        candidate.document = core::parse_krc(*plain);
+        if (candidate.document.lines.empty()) {
+            return std::nullopt;
+        }
+        detail::attach_krc_translations(candidate.document, *plain);
+        candidate.document.source = L"Kugou";
+        candidate.identity.has_word_timing = candidate.document.has_word_timing;
+        return candidate;
+    } catch (const winrt::hresult_error&) {
+        system_error = ERROR_INVALID_DATA;
+        return std::nullopt;
+    }
 }
 
 [[nodiscard]] std::filesystem::path cache_path(const core::LyricsMatchQuery& query)
@@ -976,7 +1457,7 @@ void insert_number(JsonObject& object, const wchar_t* key, const double value)
             std::istreambuf_iterator<char>()
         };
         const JsonObject root = JsonObject::Parse(detail::utf8_to_wide(bytes));
-        if (json_unsigned(root, L"version") != 2U) {
+        if (json_unsigned(root, L"version") != 3U) {
             return std::nullopt;
         }
         core::LyricsDocument document;
@@ -1015,7 +1496,7 @@ void save_cache(
 {
     try {
         JsonObject root;
-        root.Insert(L"version", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(2));
+        root.Insert(L"version", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(3));
         root.Insert(L"source", winrt::Windows::Data::Json::JsonValue::CreateStringValue(document.source));
         root.Insert(L"word_timed", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(
             document.has_word_timing));
@@ -1046,6 +1527,41 @@ void save_cache(
     }
 }
 
+struct ProviderSearchResult final {
+    std::vector<ProviderCandidate> candidates;
+    unsigned long system_error{};
+    unsigned long status{};
+};
+
+[[nodiscard]] ProviderSearchResult collect_provider_candidates(
+    HttpClient& client,
+    const core::LyricsMatchQuery& query)
+{
+    ProviderSearchResult result;
+    result.candidates = lrclib_candidates(
+        client, query, result.system_error, result.status);
+    auto netease = netease_candidates(
+        client, query, result.system_error, result.status);
+    result.candidates.insert(
+        result.candidates.end(),
+        std::make_move_iterator(netease.begin()),
+        std::make_move_iterator(netease.end()));
+    auto qq = qq_candidates(client, query, result.system_error, result.status);
+    result.candidates.insert(
+        result.candidates.end(),
+        std::make_move_iterator(qq.begin()),
+        std::make_move_iterator(qq.end()));
+    auto kugou = kugou_candidates(
+        client, query, result.system_error, result.status);
+    result.candidates.insert(
+        result.candidates.end(),
+        std::make_move_iterator(kugou.begin()),
+        std::make_move_iterator(kugou.end()));
+    std::ranges::stable_sort(
+        result.candidates, std::greater{}, &ProviderCandidate::score);
+    return result;
+}
+
 } // namespace
 
 void detail::attach_krc_translations(
@@ -1053,6 +1569,158 @@ void detail::attach_krc_translations(
     const std::wstring_view plain)
 {
     attach_krc_translations_impl(document, plain);
+}
+
+OnlineLyricsCatalogResult search_online_lyrics_catalog(
+    const std::wstring_view keywords,
+    const core::LyricsMatchQuery& expected,
+    std::shared_ptr<HttpClient> http_client)
+{
+    if (keywords.empty() || keywords.size() > 512U) {
+        return {{}, ERROR_INVALID_PARAMETER, 0};
+    }
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error& error) {
+        return {{}, static_cast<unsigned long>(error.code().value), 0};
+    }
+    struct ApartmentGuard final { ~ApartmentGuard() { winrt::uninit_apartment(); } } guard;
+    if (!http_client) {
+        http_client = make_win_http_client();
+    }
+    OnlineLyricsCatalogResult result;
+    append_lrclib_catalog(*http_client, keywords, expected, result);
+    append_netease_catalog(*http_client, keywords, expected, result);
+    append_qq_catalog(*http_client, keywords, expected, result);
+    append_kugou_catalog(*http_client, keywords, expected, result);
+    std::ranges::stable_sort(
+        result.items,
+        [](const OnlineLyricsSearchItem& left,
+           const OnlineLyricsSearchItem& right) {
+            const bool left_kugou = left.provider == OnlineLyricsProvider::kugou;
+            const bool right_kugou = right.provider == OnlineLyricsProvider::kugou;
+            if (left_kugou != right_kugou) {
+                return !left_kugou;
+            }
+            return left.score > right.score;
+        });
+    return result;
+}
+
+OnlineLyricsLookupResult resolve_online_lyrics_item(
+    const OnlineLyricsSearchItem& item,
+    std::shared_ptr<HttpClient> http_client)
+{
+    if (item.provider_key.empty() || item.identity.title.empty()) {
+        return {std::nullopt, ERROR_INVALID_PARAMETER, 0};
+    }
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error& error) {
+        return {std::nullopt, static_cast<unsigned long>(error.code().value), 0};
+    }
+    struct ApartmentGuard final { ~ApartmentGuard() { winrt::uninit_apartment(); } } guard;
+    if (!http_client) {
+        http_client = make_win_http_client();
+    }
+    unsigned long system_error{};
+    unsigned long status{};
+    std::optional<ProviderCandidate> candidate;
+    switch (item.provider) {
+    case OnlineLyricsProvider::lrclib:
+        candidate = resolve_lrclib_item(
+            *http_client, item, system_error, status);
+        break;
+    case OnlineLyricsProvider::netease:
+        candidate = resolve_netease_item(
+            *http_client, item, system_error, status);
+        break;
+    case OnlineLyricsProvider::qq_music:
+        candidate = resolve_qq_item(
+            *http_client, item, system_error, status);
+        break;
+    case OnlineLyricsProvider::kugou:
+        candidate = resolve_kugou_item(
+            *http_client, item, system_error, status);
+        break;
+    }
+    if (!candidate || !payload_identity_matches(*candidate)) {
+        return {std::nullopt, system_error, status};
+    }
+    static_cast<void>(attach_machine_translations(
+        *http_client, candidate->document));
+    return {std::move(candidate->document), ERROR_SUCCESS, 200};
+}
+
+OnlineLyricsSearchResult search_online_lyrics(
+    const core::LyricsMatchQuery& query,
+    std::shared_ptr<HttpClient> http_client)
+{
+    if (query.title.empty() || query.duration_milliseconds <= 0 ||
+        query.title.starts_with(L"音轨 ")) {
+        return {{}, ERROR_INVALID_PARAMETER, 0};
+    }
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error& error) {
+        return {{}, static_cast<unsigned long>(error.code().value), 0};
+    }
+    struct ApartmentGuard final { ~ApartmentGuard() { winrt::uninit_apartment(); } } guard;
+    if (!http_client) {
+        http_client = make_win_http_client();
+    }
+    ProviderSearchResult found = collect_provider_candidates(*http_client, query);
+    OnlineLyricsSearchResult result;
+    result.system_error = found.system_error;
+    result.status = found.status;
+    result.candidates.reserve(found.candidates.size());
+    for (auto& candidate : found.candidates) {
+        result.candidates.push_back({
+            std::move(candidate.identity),
+            std::move(candidate.document),
+            candidate.score,
+        });
+    }
+    return result;
+}
+
+std::optional<std::size_t> select_online_lyrics_candidate(
+    const std::vector<OnlineLyricsCandidate>& candidates) noexcept
+{
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+    const bool has_non_kugou = std::ranges::any_of(
+        candidates,
+        [](const OnlineLyricsCandidate& candidate) {
+            return candidate.lyrics.source != L"Kugou";
+        });
+    std::optional<std::size_t> selected;
+    for (std::size_t index{}; index < candidates.size(); ++index) {
+        const auto& candidate = candidates[index];
+        if (has_non_kugou && candidate.lyrics.source == L"Kugou") {
+            continue;
+        }
+        if (!selected) {
+            selected = index;
+            continue;
+        }
+        const auto& current = candidates[*selected];
+        if (candidate.score > current.score + 0.001 ||
+            (std::abs(candidate.score - current.score) <= 0.001 &&
+             candidate.lyrics.has_word_timing &&
+             !current.lyrics.has_word_timing)) {
+            selected = index;
+        }
+    }
+    return selected;
+}
+
+void cache_online_lyrics_selection(
+    const core::LyricsMatchQuery& query,
+    const core::LyricsDocument& lyrics) noexcept
+{
+    save_cache(query, lyrics);
 }
 
 OnlineLyricsLookupResult lookup_online_lyrics(
@@ -1082,48 +1750,30 @@ OnlineLyricsLookupResult lookup_online_lyrics(
         }
         return {std::move(cached), ERROR_SUCCESS, 200};
     }
-    unsigned long system_error{};
-    unsigned long status{};
-    auto candidates = lrclib_candidates(*http_client, query, system_error, status);
-    auto netease = netease_candidates(*http_client, query, system_error, status);
-    candidates.insert(
-        candidates.end(),
-        std::make_move_iterator(netease.begin()),
-        std::make_move_iterator(netease.end()));
-    auto qq = qq_candidates(*http_client, query, system_error, status);
-    candidates.insert(
-        candidates.end(),
-        std::make_move_iterator(qq.begin()),
-        std::make_move_iterator(qq.end()));
-    auto kugou = kugou_candidates(*http_client, query, system_error, status);
-    candidates.insert(
-        candidates.end(),
-        std::make_move_iterator(kugou.begin()),
-        std::make_move_iterator(kugou.end()));
-    if (candidates.empty()) {
-        return {std::nullopt, system_error, status};
+    ProviderSearchResult found = collect_provider_candidates(*http_client, query);
+    if (found.candidates.empty()) {
+        return {std::nullopt, found.system_error, found.status};
     }
-    const double highest = std::ranges::max(candidates, {}, &ProviderCandidate::score).score;
-    auto selected = candidates.end();
-    for (auto iterator = candidates.begin(); iterator != candidates.end(); ++iterator) {
-        if (iterator->score + 15.0 < highest) {
-            continue;
-        }
-        if (selected == candidates.end() ||
-            (iterator->document.has_word_timing &&
-             !selected->document.has_word_timing) ||
-            (iterator->document.has_word_timing ==
-                 selected->document.has_word_timing &&
-             iterator->score > selected->score)) {
-            selected = iterator;
-        }
+    std::vector<OnlineLyricsCandidate> candidates;
+    candidates.reserve(found.candidates.size());
+    for (auto& candidate : found.candidates) {
+        candidates.push_back({
+            std::move(candidate.identity),
+            std::move(candidate.document),
+            candidate.score,
+        });
     }
+    const auto selected_index = select_online_lyrics_candidate(candidates);
+    if (!selected_index) {
+        return {std::nullopt, found.system_error, found.status};
+    }
+    auto& selected = candidates[*selected_index];
     static_cast<void>(attach_machine_translations(
-        *http_client, selected->document));
+        *http_client, selected.lyrics));
     if (use_cache) {
-        save_cache(query, selected->document);
+        save_cache(query, selected.lyrics);
     }
-    return {std::move(selected->document), ERROR_SUCCESS, 200};
+    return {std::move(selected.lyrics), ERROR_SUCCESS, 200};
 }
 
 } // namespace cd404::platform::windows

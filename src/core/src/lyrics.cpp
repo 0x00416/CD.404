@@ -752,6 +752,12 @@ double lyrics_match_score(
         return 0.0;
     }
     const double title = dice_similarity(query.title, candidate.title) * 100.0;
+    // A matching artist and a similar duration must never rescue a different
+    // song. Automatic matching is intentionally conservative; the UI exposes
+    // lower-confidence provider results through manual matching instead.
+    if (title < 60.0) {
+        return 0.0;
+    }
     const double artist = query.artist.empty() || candidate.artist.empty()
         ? -1.0
         : dice_similarity(query.artist, candidate.artist) * 100.0;
@@ -766,9 +772,6 @@ double lyrics_match_score(
             : title * 0.5 + artist * 0.5;
     } else if (album >= 0.0) {
         score = std::max(title * 0.7 + album * 0.3, title * 0.8);
-    }
-    if (title < 30.0) {
-        score = std::max(0.0, score - 35.0);
     }
     if (candidate.has_word_timing) {
         score += 2.0;

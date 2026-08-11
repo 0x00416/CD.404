@@ -126,7 +126,7 @@ std::wstring make_disc_settings_key(const disc::Toc& toc)
 std::wstring encode_user_settings(const UserSettings& settings)
 {
     JsonObject root;
-    root.Insert(L"version", JsonValue::CreateNumberValue(3));
+    root.Insert(L"version", JsonValue::CreateNumberValue(4));
     root.Insert(
         L"volume",
         JsonValue::CreateNumberValue(std::clamp(settings.volume, 0.0F, 1.0F)));
@@ -176,6 +176,27 @@ std::wstring encode_user_settings(const UserSettings& settings)
         positions.Insert(disc_key, entry);
     }
     root.Insert(L"playback_positions", positions);
+
+    JsonObject lyric_offsets;
+    for (const auto& [disc_key, tracks] : settings.lyric_offsets_ms) {
+        if (disc_key.empty()) {
+            continue;
+        }
+        JsonObject entry;
+        for (const auto& [track_number, offset] : tracks) {
+            if (track_number == 0U || track_number > 99U ||
+                offset < -10'000 || offset > 10'000 || offset == 0) {
+                continue;
+            }
+            entry.Insert(
+                std::to_wstring(track_number),
+                JsonValue::CreateNumberValue(offset));
+        }
+        if (entry.Size() != 0U) {
+            lyric_offsets.Insert(disc_key, entry);
+        }
+    }
+    root.Insert(L"lyric_offsets_ms", lyric_offsets);
 
     JsonObject metadata_overrides;
     for (const auto& [disc_key, metadata] : settings.metadata_overrides) {
@@ -284,6 +305,45 @@ UserSettings decode_user_settings(const std::wstring& json) noexcept
                     static_cast<unsigned int>(track),
                     static_cast<core::SampleFrame>(offset),
                 });
+        }
+
+        const JsonObject lyric_offsets = root.GetNamedObject(
+            L"lyric_offsets_ms",
+            JsonObject{});
+        for (const auto& disc_pair : lyric_offsets) {
+            const std::wstring disc_key = disc_pair.Key().c_str();
+            if (disc_key.empty() ||
+                disc_pair.Value().ValueType() != JsonValueType::Object) {
+                continue;
+            }
+            std::map<unsigned int, std::int32_t> tracks;
+            for (const auto& track_pair : disc_pair.Value().GetObject()) {
+                const std::wstring key = track_pair.Key().c_str();
+                unsigned int track_number{};
+                bool valid_track = !key.empty();
+                for (const wchar_t character : key) {
+                    if (character < L'0' || character > L'9' ||
+                        track_number > 99U / 10U) {
+                        valid_track = false;
+                        break;
+                    }
+                    track_number = track_number * 10U +
+                        static_cast<unsigned int>(character - L'0');
+                }
+                if (!valid_track || track_number == 0U || track_number > 99U ||
+                    track_pair.Value().ValueType() != JsonValueType::Number) {
+                    continue;
+                }
+                const double value = track_pair.Value().GetNumber();
+                if (!std::isfinite(value) || value < -10'000.0 ||
+                    value > 10'000.0 || std::trunc(value) != value || value == 0.0) {
+                    continue;
+                }
+                tracks.emplace(track_number, static_cast<std::int32_t>(value));
+            }
+            if (!tracks.empty()) {
+                settings.lyric_offsets_ms.emplace(disc_key, std::move(tracks));
+            }
         }
 
         const JsonObject metadata_overrides = root.GetNamedObject(
