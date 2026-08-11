@@ -26,6 +26,7 @@
 #include <cd404/platform/windows/optical_drive.hpp>
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
+#include <cd404/ui/animation_timing.hpp>
 #include <cd404/ui/main_window.hpp>
 #include <cd404/ui/metadata_source_model.hpp>
 #include <cd404/ui/playback_presenter.hpp>
@@ -79,10 +80,11 @@ constexpr int kMetadataCategoryEditId = 1'103;
 constexpr int kMetadataYearEditId = 1'104;
 constexpr int kMetadataTrackTitleEditId = 1'105;
 constexpr int kMetadataTrackArtistEditId = 1'106;
-constexpr UINT_PTR kAnimationTimer = 1;
-constexpr UINT kAnimationIntervalMs = 50;
+constexpr UINT_PTR kMaintenanceTimer = 1;
+constexpr UINT kMaintenanceIntervalMs = 50;
 constexpr UINT_PTR kSettingsScrollSettleTimer = 2;
 constexpr UINT kSettingsScrollSettleDelayMs = 150;
+constexpr DWORD kHighResolutionTimerFlag = 0x00000002;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmWindowCornerPreference = 33;
 constexpr DWORD kDwmSystemBackdropType = 38;
@@ -409,6 +411,10 @@ public:
         if (settings_edit_brush_ != nullptr) {
             DeleteObject(settings_edit_brush_);
         }
+        if (frame_timer_ != nullptr) {
+            static_cast<void>(CancelWaitableTimer(frame_timer_));
+            CloseHandle(frame_timer_);
+        }
     }
 
     [[nodiscard]] bool create(const int show_command)
@@ -467,6 +473,7 @@ public:
         if (window_ == nullptr) {
             return false;
         }
+        initialize_frame_scheduler();
 
         static_cast<void>(system_media_controls_.initialize(
             window_,
@@ -485,15 +492,139 @@ public:
 
     [[nodiscard]] int run()
     {
-        MSG message{};
-        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+        while (true) {
+            update_frame_timer_state();
+            const DWORD handle_count = frame_timer_armed_ ? 1U : 0U;
+            const DWORD result = MsgWaitForMultipleObjectsEx(
+                handle_count,
+                handle_count != 0U ? &frame_timer_ : nullptr,
+                INFINITE,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE);
+            if (result == WAIT_FAILED) {
+                return 1;
+            }
+            if (handle_count != 0U && result == WAIT_OBJECT_0) {
+                frame_timer_armed_ = false;
+                if (needs_animation_frames()) {
+                    arm_frame_timer();
+                }
+                render_animation_frame();
+                if (frame_timer_armed_ &&
+                    WaitForSingleObject(frame_timer_, 0) == WAIT_OBJECT_0) {
+                    // Rendering exceeded one display interval. Drop the stale
+                    // tick and schedule from the current frame instead of
+                    // entering an unbounded catch-up loop.
+                    frame_timer_armed_ = false;
+                }
+                continue;
+            }
+
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
+                if (message.message == WM_QUIT) {
+                    return static_cast<int>(message.wParam);
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
-        return static_cast<int>(message.wParam);
     }
 
 private:
+    void refresh_frame_interval()
+    {
+        DWM_TIMING_INFO timing{};
+        timing.cbSize = sizeof(timing);
+        frame_interval_100ns_ = SUCCEEDED(
+            DwmGetCompositionTimingInfo(nullptr, &timing))
+            ? display_refresh_interval_100ns(
+                  timing.rateRefresh.uiNumerator,
+                  timing.rateRefresh.uiDenominator)
+            : kDefaultFrameInterval100ns;
+    }
+
+    void refresh_animation_preference()
+    {
+        BOOL enabled = TRUE;
+        client_animations_enabled_ =
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                &enabled,
+                0) == FALSE ||
+            enabled != FALSE;
+        if (!client_animations_enabled_) {
+            lyric_transition_running_ = false;
+        }
+    }
+
+    void initialize_frame_scheduler()
+    {
+        refresh_frame_interval();
+        refresh_animation_preference();
+        frame_timer_ = CreateWaitableTimerExW(
+            nullptr,
+            nullptr,
+            kHighResolutionTimerFlag,
+            TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (frame_timer_ == nullptr) {
+            frame_timer_ = CreateWaitableTimerExW(
+                nullptr,
+                nullptr,
+                0,
+                TIMER_MODIFY_STATE | SYNCHRONIZE);
+        }
+    }
+
+    [[nodiscard]] bool needs_animation_frames() const noexcept
+    {
+        return window_ != nullptr && IsWindowVisible(window_) != FALSE &&
+            IsIconic(window_) == FALSE && active_page_ == AppPage::player &&
+            ((playback_active_ && !playback_paused_) ||
+             lyric_transition_running_);
+    }
+
+    void arm_frame_timer()
+    {
+        if (frame_timer_ == nullptr || frame_timer_armed_) {
+            return;
+        }
+        LARGE_INTEGER due_time{};
+        due_time.QuadPart = -std::max<std::int64_t>(
+            1,
+            frame_interval_100ns_);
+        frame_timer_armed_ = SetWaitableTimerEx(
+            frame_timer_,
+            &due_time,
+            0,
+            nullptr,
+            nullptr,
+            nullptr,
+            0) != FALSE;
+        if (!frame_timer_armed_) {
+            CloseHandle(frame_timer_);
+            frame_timer_ = nullptr;
+        }
+    }
+
+    void update_frame_timer_state()
+    {
+        if (needs_animation_frames()) {
+            arm_frame_timer();
+        } else if (frame_timer_armed_) {
+            static_cast<void>(CancelWaitableTimer(frame_timer_));
+            frame_timer_armed_ = false;
+        }
+    }
+
+    void render_animation_frame()
+    {
+        update_playback_clock(false);
+        InvalidateRect(window_, nullptr, FALSE);
+        UpdateWindow(window_);
+    }
+
     static LRESULT CALLBACK window_proc(
         const HWND window,
         const UINT message,
@@ -527,8 +658,8 @@ private:
         case WM_CREATE:
             static_cast<void>(SetTimer(
                 window_,
-                kAnimationTimer,
-                kAnimationIntervalMs,
+                kMaintenanceTimer,
+                kMaintenanceIntervalMs,
                 nullptr));
             refresh_disc();
             update_accessible_name();
@@ -536,7 +667,11 @@ private:
         case WM_THEMECHANGED:
         case WM_SYSCOLORCHANGE:
         case WM_SETTINGCHANGE:
+            refresh_animation_preference();
             refresh_theme();
+            return 0;
+        case WM_DISPLAYCHANGE:
+            refresh_frame_interval();
             return 0;
         case WM_GETOBJECT:
             if (static_cast<long>(lparam) == OBJID_CLIENT) {
@@ -573,6 +708,7 @@ private:
             return 0;
         case WM_EXITSIZEMOVE:
             window_resizing_ = false;
+            refresh_frame_interval();
             finish_input_control_relayout();
             return 0;
         case WM_SIZE:
@@ -751,7 +887,7 @@ private:
                 settle_settings_scroll_session();
                 return 0;
             }
-            if (wparam == kAnimationTimer) {
+            if (wparam == kMaintenanceTimer) {
                 update_playback_clock();
                 ensure_lyrics_for_selected_track();
                 maybe_persist_playback_position();
@@ -760,7 +896,10 @@ private:
                         platform::windows::ListenBrainzState::validating) {
                     settings_saved_ = false;
                 }
-                InvalidateRect(window_, nullptr, FALSE);
+                if (frame_timer_ == nullptr ||
+                    active_page_ == AppPage::settings) {
+                    InvalidateRect(window_, nullptr, FALSE);
+                }
             }
             return 0;
         case kDiscReadyMessage:
@@ -803,7 +942,7 @@ private:
                 reinterpret_cast<LyricsSnapshot*>(lparam)));
             return 0;
         case WM_DESTROY:
-            KillTimer(window_, kAnimationTimer);
+            KillTimer(window_, kMaintenanceTimer);
             KillTimer(window_, kSettingsScrollSettleTimer);
             persist_playback_position();
             persist_user_settings();
@@ -1951,6 +2090,30 @@ private:
                 std::distance(lyrics_->lines.begin(), upcoming));
         }
 
+        const auto animation_now = std::chrono::steady_clock::now();
+        if (lyric_visual_track_ != selected_track_ || !lyric_visual_focus_) {
+            lyric_visual_track_ = selected_track_;
+            lyric_visual_focus_ = focus_index;
+            lyric_transition_running_ = false;
+            lyric_transition_direction_ = 0;
+        } else if (*lyric_visual_focus_ != focus_index) {
+            const std::size_t previous_focus = *lyric_visual_focus_;
+            const bool adjacent =
+                focus_index + 1U == previous_focus ||
+                previous_focus + 1U == focus_index;
+            lyric_visual_focus_ = focus_index;
+            lyric_transition_direction_ = focus_index > previous_focus ? 1 : -1;
+            lyric_transition_started_ = animation_now;
+            lyric_transition_running_ = client_animations_enabled_ && adjacent;
+        }
+        LyricTransitionFrame transition{1.0F, 0.0F, 1.0F, false};
+        if (lyric_transition_running_) {
+            transition = lyric_transition_frame(
+                std::chrono::duration<double>(
+                    animation_now - lyric_transition_started_).count());
+            lyric_transition_running_ = transition.active;
+        }
+
         struct ContextLineLayout final {
             std::size_t index{};
             float primary_height{};
@@ -1958,6 +2121,7 @@ private:
             float height{};
         };
         const float width = area.right - area.left;
+        constexpr float translation_gap = 4.0F;
         const auto measure_line = [&](const std::size_t index, const float scale) {
             const auto& line = lyrics_->lines[index];
             const bool current = index == focus_index;
@@ -1966,20 +2130,22 @@ private:
                 line.text,
                 current ? lyric_format_.Get() : lyric_translation_format_.Get(),
                 width,
-                (current ? 18.0F : 14.0F) * scale,
                 (current ? 20.0F : 16.0F) * scale,
-                (current ? 15.5F : 12.5F) * scale);
+                (current ? 22.0F : 18.0F) * scale,
+                (current ? 17.0F : 14.0F) * scale);
             item.translation_height = line.translation.empty()
                 ? 0.0F
                 : measure_lyric_text(
                     line.translation,
                     lyric_translation_format_.Get(),
                     width,
-                    (current ? 13.0F : 11.0F) * scale,
-                    (current ? 15.0F : 13.0F) * scale,
-                    (current ? 11.5F : 10.0F) * scale);
+                    (current ? 14.0F : 12.0F) * scale,
+                    (current ? 16.0F : 14.0F) * scale,
+                    (current ? 12.5F : 10.5F) * scale);
             item.height = item.primary_height + item.translation_height +
-                (item.translation_height > 0.0F ? 2.0F : 0.0F);
+                (item.translation_height > 0.0F
+                    ? translation_gap * scale
+                    : 0.0F);
             return item;
         };
 
@@ -2035,7 +2201,20 @@ private:
         context.push_back(focus);
         context.insert(context.end(), next_lines.begin(), next_lines.end());
 
-        float top = focus_top - previous_height;
+        float slide_distance = 20.0F * scale;
+        if (lyric_transition_direction_ > 0 && !previous_lines.empty() &&
+            previous_lines.front().index + 1U == focus_index) {
+            slide_distance = previous_lines.front().height + sentence_gap * scale;
+        } else if (lyric_transition_direction_ < 0 && !next_lines.empty() &&
+                   next_lines.front().index == focus_index + 1U) {
+            slide_distance = focus.height + sentence_gap * scale;
+        }
+        const float animation_offset = static_cast<float>(
+            lyric_transition_direction_) * slide_distance * transition.offset_factor;
+        float top = focus_top - previous_height + animation_offset;
+        render_target_->PushAxisAlignedClip(
+            area,
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         for (std::size_t visual_index{};
              visual_index < context.size(); ++visual_index) {
             const auto& item = context[visual_index];
@@ -2043,22 +2222,26 @@ private:
             const bool current = item.index == focus_index;
             const float primary_bottom = top + item.primary_height;
             if (current) {
+                text_brush_->SetOpacity(transition.incoming_opacity);
+                secondary_brush_->SetOpacity(transition.incoming_opacity);
+                accent_brush_->SetOpacity(transition.incoming_opacity);
+                muted_brush_->SetOpacity(transition.incoming_opacity);
                 draw_karaoke_line(
                     line,
                     position_milliseconds,
                     D2D1::RectF(area.left, top, area.right, primary_bottom),
-                    18.0F * scale,
                     20.0F * scale,
-                    15.5F * scale);
+                    22.0F * scale,
+                    17.0F * scale);
             } else {
                 draw_wrapped_lyric_text(
                     line.text,
                     lyric_translation_format_.Get(),
                     D2D1::RectF(area.left, top, area.right, primary_bottom),
                     secondary_brush_.Get(),
-                    14.0F * scale,
                     16.0F * scale,
-                    12.5F * scale);
+                    18.0F * scale,
+                    14.0F * scale);
             }
             if (item.translation_height > 0.0F) {
                 draw_wrapped_lyric_text(
@@ -2066,19 +2249,26 @@ private:
                     lyric_translation_format_.Get(),
                     D2D1::RectF(
                         area.left,
-                        primary_bottom + 2.0F,
+                        primary_bottom + translation_gap * scale,
                         area.right,
                         top + item.height),
                     muted_brush_.Get(),
-                    (current ? 13.0F : 11.0F) * scale,
-                    (current ? 15.0F : 13.0F) * scale,
-                    (current ? 11.5F : 10.0F) * scale);
+                    (current ? 14.0F : 12.0F) * scale,
+                    (current ? 16.0F : 14.0F) * scale,
+                    (current ? 12.5F : 10.5F) * scale);
+            }
+            if (current) {
+                text_brush_->SetOpacity(1.0F);
+                secondary_brush_->SetOpacity(1.0F);
+                accent_brush_->SetOpacity(1.0F);
+                muted_brush_->SetOpacity(1.0F);
             }
             top += item.height;
             if (visual_index + 1U < context.size()) {
                 top += sentence_gap * scale;
             }
         }
+        render_target_->PopAxisAlignedClip();
     }
 
     void draw_cover()
@@ -3622,14 +3812,15 @@ private:
         }
     }
 
-    void update_playback_clock()
+    void update_playback_clock(const bool synchronize_services = true)
     {
         if (!playback_active_) {
             return;
         }
 
         const auto progress = playback_engine_.progress();
-        if (progress.frames_rendered >= core::kCdSampleFramesPerSecond) {
+        if (synchronize_services &&
+            progress.frames_rendered >= core::kCdSampleFramesPerSecond) {
             playback_recovery_.playback_became_stable();
         }
         if (playback_seek_pending_) {
@@ -3661,11 +3852,13 @@ private:
                 selected_track_ = track_index;
                 playback_track_frame_ = track_frame;
                 ensure_selected_track_visible();
-                update_listenbrainz_tracker(
-                    track_index,
-                    track_frame,
-                    progress.state);
-                sync_system_media(false);
+                if (synchronize_services) {
+                    update_listenbrainz_tracker(
+                        track_index,
+                        track_frame,
+                        progress.state);
+                    sync_system_media(false);
+                }
                 return;
             }
             track_frame -= duration;
@@ -3675,12 +3868,16 @@ private:
             selected_track_ = *last_audio_track;
             playback_track_frame_ = disc_.tracks[*last_audio_track].frame_count;
             ensure_selected_track_visible();
-            update_listenbrainz_tracker(
-                *last_audio_track,
-                disc_.tracks[*last_audio_track].frame_count,
-                progress.state);
+            if (synchronize_services) {
+                update_listenbrainz_tracker(
+                    *last_audio_track,
+                    disc_.tracks[*last_audio_track].frame_count,
+                    progress.state);
+            }
         }
-        sync_system_media(false);
+        if (synchronize_services) {
+            sync_system_media(false);
+        }
     }
 
     void receive_playback_result(const std::uint64_t generation)
@@ -6382,6 +6579,10 @@ private:
     HWND window_{};
     HWND resize_focus_{};
     bool window_resizing_{};
+    HANDLE frame_timer_{};
+    std::int64_t frame_interval_100ns_{kDefaultFrameInterval100ns};
+    bool frame_timer_armed_{};
+    bool client_animations_enabled_{true};
     ThemePalette theme_{};
     std::wstring accessible_name_;
     ComPtr<ID2D1Factory> factory_;
@@ -6427,6 +6628,11 @@ private:
     std::uint64_t lyrics_generation_{};
     std::size_t lyrics_track_index_{std::numeric_limits<std::size_t>::max()};
     std::size_t lyrics_pending_track_{std::numeric_limits<std::size_t>::max()};
+    std::size_t lyric_visual_track_{std::numeric_limits<std::size_t>::max()};
+    std::optional<std::size_t> lyric_visual_focus_;
+    std::chrono::steady_clock::time_point lyric_transition_started_{};
+    int lyric_transition_direction_{};
+    bool lyric_transition_running_{};
     std::uint64_t disc_generation_{};
     bool disc_loading_{};
     Layout layout_{};

@@ -21,6 +21,7 @@
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
+#include <cd404/ui/animation_timing.hpp>
 #include <cd404/ui/theme.hpp>
 #include <cd404/ui/playback_presenter.hpp>
 #include <cd404/ui/metadata_source_model.hpp>
@@ -32,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -89,6 +91,33 @@ void test_theme_palettes()
             high.border == high.text && high.accent != high.background &&
             high.accent_text != high.accent,
         "high-contrast palette has explicit system-independent foreground separation");
+}
+
+void test_animation_timing()
+{
+    using namespace cd404::ui;
+
+    expect(
+        display_refresh_interval_100ns(60U, 1U) == 166'667 &&
+            display_refresh_interval_100ns(144U, 1U) == 69'444 &&
+            display_refresh_interval_100ns(60'000U, 1'001U) == 166'833 &&
+            display_refresh_interval_100ns(0U, 1U) ==
+                kDefaultFrameInterval100ns &&
+            display_refresh_interval_100ns(1'000U, 1U) ==
+                kDefaultFrameInterval100ns,
+        "display refresh ratios produce bounded high-resolution frame intervals");
+
+    const auto beginning = lyric_transition_frame(0.0);
+    const auto middle = lyric_transition_frame(0.14);
+    const auto end = lyric_transition_frame(0.28);
+    expect(
+        beginning.active && beginning.progress == 0.0F &&
+            beginning.offset_factor == 1.0F &&
+            std::abs(middle.progress - 0.875F) < 0.0001F &&
+            std::abs(middle.offset_factor - 0.125F) < 0.0001F &&
+            !end.active && end.progress == 1.0F &&
+            end.offset_factor == 0.0F && end.incoming_opacity == 1.0F,
+        "lyric transition uses a frame-rate-independent cubic ease-out");
 }
 
 void test_settings_model()
@@ -508,6 +537,25 @@ void test_cloud_lyrics_codecs()
             krc_lyrics.lines[0].tokens[1].start_milliseconds == 1'300,
         "KRC XOR and zlib decoding feeds absolute word cues into the parser");
 
+    constexpr std::wstring_view bilingual_krc =
+        L"[language:eyJjb250ZW50IjpbeyJ0eXBlIjoxLCJseXJpY0NvbnRlbnQiOltbXSxbXSxbXSxbIlQxIl0sWyJUMiJdXX1dfQ==]\n"
+        L"[100,100]<0,100,0>Artist - Title\n"
+        L"[200,100]<0,100,0>作词: Author\n"
+        L"[300,100]<0,100,0>作曲: Composer\n"
+        L"[1000,500]<0,500,0>Line one\n"
+        L"[2000,500]<0,500,0>Line two";
+    auto bilingual = core::parse_krc(bilingual_krc);
+    platform::windows::detail::attach_krc_translations(
+        bilingual, bilingual_krc);
+    expect(
+        bilingual.lines.size() == 3U &&
+            bilingual.lines[0].translation.empty() &&
+            bilingual.lines[1].text == L"Line one" &&
+            bilingual.lines[1].translation == L"T1" &&
+            bilingual.lines[2].text == L"Line two" &&
+            bilingual.lines[2].translation == L"T2",
+        "KRC translations retain raw row alignment when credit rows are filtered");
+
     constexpr std::string_view qrc =
         "C90DB2E3F6940A43538B45865EB6753863C981F936A71A093B450246D48B65F0"
         "33262599ECFCF75E9EBBED19160162D3B56E50BC145B0D892B98EA6E463D5B7E"
@@ -554,6 +602,40 @@ void test_online_lyrics_live()
             (result->lyrics->source == L"QQ Music" ||
              result->lyrics->source == L"Kugou"),
         "live lyrics providers return a verified word-timed document");
+}
+
+void test_krc_translation_alignment_live()
+{
+    using namespace cd404;
+    std::optional<platform::windows::OnlineLyricsLookupResult> result;
+    std::jthread worker([&] {
+        result = platform::windows::lookup_online_lyrics(
+            core::LyricsMatchQuery{
+                L"バンブーディスコ",
+                L"Yunomi feat. TORIENA",
+                L"大江戸コントローラー EP",
+                196'000,
+            },
+            {},
+            false);
+    });
+    worker.join();
+    const auto translation_for = [&](const std::wstring_view text) {
+        if (!result || !result->lyrics) {
+            return std::wstring{};
+        }
+        const auto line = std::ranges::find(
+            result->lyrics->lines, text, &core::LyricLine::text);
+        return line == result->lyrics->lines.end()
+            ? std::wstring{}
+            : line->translation;
+    };
+    expect(
+        result && result->lyrics && result->lyrics->source == L"Kugou" &&
+            translation_for(L"今宵は月が出た") == L"今宵明月升起" &&
+            translation_for(L"ニュートーキョー") == L"新东京" &&
+            translation_for(L"悲しい歌が漏れる") == L"流淌出悲伤的歌谣",
+        "live Kugou KRC translation rows survive filtered credits without shifting");
 }
 
 void test_wasapi_negotiation_and_fallback()
@@ -1746,6 +1828,7 @@ int main(const int argument_count, char** arguments)
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
     test_theme_palettes();
+    test_animation_timing();
     test_settings_model();
     test_playback_error_presentation();
     test_metadata_source_capsules();
@@ -1780,6 +1863,9 @@ int main(const int argument_count, char** arguments)
     } else if (argument_count == 2 &&
                std::string_view(arguments[1]) == "--online-lyrics") {
         test_online_lyrics_live();
+    } else if (argument_count == 2 &&
+               std::string_view(arguments[1]) == "--online-krc") {
+        test_krc_translation_alignment_live();
     }
 
     if (failures != 0) {

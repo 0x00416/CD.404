@@ -240,7 +240,7 @@ std::optional<OnlineMetadata> lookup_online_metadata(
                 }
             }
             merged.used_musicbrainz_content_match = true;
-            merged.sources.emplace_back(L"MusicBrainz · 内容关联");
+            merged.sources.emplace_back(L"MusicBrainz");
         }
     }
     if (merged.cover_art_path.empty() && gnudb && gnudb->metadata) {

@@ -214,7 +214,26 @@ void attach_translations(
     return document.lines.empty() ? core::parse_lrc(text) : document;
 }
 
-void attach_krc_translations(
+[[nodiscard]] bool krc_timed_row(const std::wstring_view line) noexcept
+{
+    if (line.size() < 5U || line.front() != L'[') {
+        return false;
+    }
+    std::size_t position = 1U;
+    const auto consume_number = [&]() {
+        const std::size_t begin = position;
+        while (position < line.size() && line[position] >= L'0' &&
+               line[position] <= L'9') {
+            ++position;
+        }
+        return position != begin;
+    };
+    return consume_number() && position < line.size() &&
+        line[position++] == L',' && consume_number() &&
+        position < line.size() && line[position] == L']';
+}
+
+void attach_krc_translations_impl(
     core::LyricsDocument& document,
     const std::wstring_view plain)
 {
@@ -246,12 +265,70 @@ void attach_krc_translations(
             }
             const JsonArray lines = language.GetNamedArray(
                 L"lyricContent", JsonArray{});
-            const std::uint32_t count = std::min<std::uint32_t>(
-                lines.Size(), static_cast<std::uint32_t>(document.lines.size()));
-            for (std::uint32_t index{}; index < count; ++index) {
-                const JsonArray row = lines.GetArrayAt(index);
-                if (row.Size() != 0U && document.lines[index].translation.empty()) {
-                    document.lines[index].translation = row.GetStringAt(0);
+            struct TimedRow final {
+                std::uint32_t raw_index{};
+                std::optional<core::LyricLine> parsed;
+            };
+            std::vector<TimedRow> timed_rows;
+            std::size_t position{};
+            while (position <= plain.size()) {
+                const std::size_t newline = plain.find_first_of(L"\r\n", position);
+                const std::size_t row_end = newline == std::wstring_view::npos
+                    ? plain.size()
+                    : newline;
+                const std::wstring_view raw_row = plain.substr(
+                    position, row_end - position);
+                if (krc_timed_row(raw_row)) {
+                    TimedRow row{
+                        static_cast<std::uint32_t>(timed_rows.size()),
+                        std::nullopt,
+                    };
+                    auto parsed = core::parse_krc(raw_row);
+                    if (parsed.lines.size() == 1U) {
+                        row.parsed = std::move(parsed.lines.front());
+                    }
+                    timed_rows.push_back(std::move(row));
+                }
+                if (newline == std::wstring_view::npos) {
+                    break;
+                }
+                position = newline + 1U;
+                if (plain[newline] == L'\r' && position < plain.size() &&
+                    plain[position] == L'\n') {
+                    ++position;
+                }
+            }
+
+            if (lines.Size() == timed_rows.size()) {
+                for (const auto& timed_row : timed_rows) {
+                    if (!timed_row.parsed) {
+                        continue;
+                    }
+                    const auto target = std::ranges::find_if(
+                        document.lines,
+                        [&](const core::LyricLine& line) {
+                            return line.start_milliseconds ==
+                                    timed_row.parsed->start_milliseconds &&
+                                line.text == timed_row.parsed->text;
+                        });
+                    const JsonArray row = lines.GetArrayAt(timed_row.raw_index);
+                    if (target != document.lines.end() && row.Size() != 0U &&
+                        target->translation.empty()) {
+                        target->translation = row.GetStringAt(0);
+                    }
+                }
+            } else {
+                // Some KRC producers omit filtered credit rows from the
+                // language block. Preserve compatibility with those files.
+                const std::uint32_t count = std::min<std::uint32_t>(
+                    lines.Size(),
+                    static_cast<std::uint32_t>(document.lines.size()));
+                for (std::uint32_t index{}; index < count; ++index) {
+                    const JsonArray row = lines.GetArrayAt(index);
+                    if (row.Size() != 0U &&
+                        document.lines[index].translation.empty()) {
+                        document.lines[index].translation = row.GetStringAt(0);
+                    }
                 }
             }
             return;
@@ -818,7 +895,7 @@ void insert_number(JsonObject& object, const wchar_t* key, const double value)
             if (resolved.document.lines.empty()) {
                 continue;
             }
-            attach_krc_translations(resolved.document, *plain);
+            detail::attach_krc_translations(resolved.document, *plain);
             resolved.document.source = L"Kugou";
             candidate.identity.has_word_timing = resolved.document.has_word_timing;
             resolved.identity = candidate.identity;
@@ -899,7 +976,7 @@ void insert_number(JsonObject& object, const wchar_t* key, const double value)
             std::istreambuf_iterator<char>()
         };
         const JsonObject root = JsonObject::Parse(detail::utf8_to_wide(bytes));
-        if (json_unsigned(root, L"version") != 1U) {
+        if (json_unsigned(root, L"version") != 2U) {
             return std::nullopt;
         }
         core::LyricsDocument document;
@@ -938,7 +1015,7 @@ void save_cache(
 {
     try {
         JsonObject root;
-        root.Insert(L"version", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(1));
+        root.Insert(L"version", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(2));
         root.Insert(L"source", winrt::Windows::Data::Json::JsonValue::CreateStringValue(document.source));
         root.Insert(L"word_timed", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(
             document.has_word_timing));
@@ -970,6 +1047,13 @@ void save_cache(
 }
 
 } // namespace
+
+void detail::attach_krc_translations(
+    core::LyricsDocument& document,
+    const std::wstring_view plain)
+{
+    attach_krc_translations_impl(document, plain);
+}
 
 OnlineLyricsLookupResult lookup_online_lyrics(
     const core::LyricsMatchQuery& query,
