@@ -36,6 +36,8 @@ struct Layout final {
     D2D1_RECT_F settings_cddb_email_edit{};
     D2D1_RECT_F settings_cddb_save{};
     D2D1_RECT_F settings_cddb_toggle{};
+    D2D1_RECT_F settings_autoplay_card{};
+    D2D1_RECT_F settings_autoplay_repair{};
     D2D1_RECT_F metadata_button{};
     D2D1_RECT_F metadata_page{};
     D2D1_RECT_F metadata_back{};

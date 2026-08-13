@@ -63,6 +63,7 @@ struct OnlineMetadataSnapshot final {
     std::uint64_t disc_generation{};
 };
 
-[[nodiscard]] DiscSnapshot load_disc_snapshot();
+[[nodiscard]] DiscSnapshot load_disc_snapshot(
+    std::wstring_view preferred_drive_root = {});
 
 } // namespace cd404::ui::detail

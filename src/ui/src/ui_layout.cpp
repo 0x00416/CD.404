@@ -141,6 +141,16 @@ Layout calculate_layout(
         result.settings_cddb_card.top + 158.0F,
         result.settings_cddb_card.right - 24.0F,
         result.settings_cddb_card.top + 198.0F);
+    result.settings_autoplay_card = D2D1::RectF(
+        settings_left,
+        settings_bottom + 16.0F + settings_shift,
+        settings_right,
+        settings_bottom + 120.0F + settings_shift);
+    result.settings_autoplay_repair = D2D1::RectF(
+        result.settings_autoplay_card.right - 120.0F,
+        result.settings_autoplay_card.top + 46.0F,
+        result.settings_autoplay_card.right - 24.0F,
+        result.settings_autoplay_card.top + 86.0F);
     result.metadata_button = D2D1::RectF(
         result.track_list.left + 88.0F, 82.0F,
         result.track_list.left + 184.0F, 122.0F);

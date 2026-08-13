@@ -8,6 +8,7 @@
 
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/core/version.hpp>
+#include <cd404/platform/windows/autoplay_policy.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
@@ -22,6 +23,7 @@
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/platform/windows/wasapi_output.hpp>
 #include <cd404/ui/animation_timing.hpp>
+#include <cd404/ui/application_launch.hpp>
 #include <cd404/ui/theme.hpp>
 #include <cd404/ui/playback_presenter.hpp>
 #include <cd404/ui/metadata_source_model.hpp>
@@ -41,6 +43,7 @@
 #include <random>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -74,6 +77,140 @@ void test_result_semantics()
     expect(
         !result.succeeded(),
         "non-terminal playback is not reported as successful");
+}
+
+void test_autoplay_launch_arguments()
+{
+    using cd404::ui::normalize_autoplay_drive_root;
+    expect(
+        normalize_autoplay_drive_root(L"d:\\") == L"D:\\" &&
+            normalize_autoplay_drive_root(L" E:/ ") == L"E:\\" &&
+            normalize_autoplay_drive_root(L"F:") == L"F:\\",
+        "AutoPlay normalizes shell-provided optical drive roots");
+    expect(
+        !normalize_autoplay_drive_root(L"C:\\music") &&
+            !normalize_autoplay_drive_root(L"\\\\server\\disc") &&
+            !normalize_autoplay_drive_root(L"not-a-drive"),
+        "AutoPlay rejects paths that are not drive roots");
+
+    const std::array<std::wstring_view, 3> autoplay{
+        L"CD.404.exe", L"/autoplay", L"g:\\"};
+    const auto options = cd404::ui::parse_application_launch_options(autoplay);
+    expect(
+        options.autoplay_drive_root == L"G:\\",
+        "AutoPlay command line selects the drive supplied by Windows Shell");
+    const std::array<std::wstring_view, 1> normal{L"CD.404.exe"};
+    expect(
+        !cd404::ui::parse_application_launch_options(normal).autoplay_drive_root,
+        "normal launches do not request automatic playback");
+}
+
+void test_autoplay_policy_masks()
+{
+    using namespace cd404::platform::windows;
+
+    expect(
+        drive_type_mask_blocks_cdrom(0xB1U) &&
+            !drive_type_mask_blocks_cdrom(0x91U) &&
+            clear_cdrom_from_drive_type_mask(0xB1U) == 0x91U,
+        "AutoPlay policy repair clears only the CD-ROM disable bit");
+
+    AudioCdAutoplayPolicyStatus status;
+    expect(
+        status.enabled() && !status.repairable_for_current_user(),
+        "AutoPlay status reports an unblocked policy as enabled");
+    status.current_user_blocked = true;
+    expect(
+        !status.enabled() && status.repairable_for_current_user(),
+        "current-user CD-ROM policy blocks AutoPlay and is repairable");
+    status.current_user_blocked = false;
+    status.machine_blocked = true;
+    expect(
+        !status.enabled() && !status.repairable_for_current_user(),
+        "machine CD-ROM policy is detected without claiming user-level repair");
+}
+
+void test_autoplay_policy_repair_live()
+{
+    using namespace cd404::platform::windows;
+    constexpr wchar_t policy_key[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer";
+    constexpr wchar_t value_name[] = L"NoDriveTypeAutoRun";
+
+    HKEY key{};
+    const LSTATUS open_status = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        policy_key,
+        0,
+        nullptr,
+        0,
+        KEY_QUERY_VALUE | KEY_SET_VALUE,
+        nullptr,
+        &key,
+        nullptr);
+    expect(open_status == ERROR_SUCCESS, "live AutoPlay test opens the user policy key");
+    if (open_status != ERROR_SUCCESS) {
+        return;
+    }
+
+    DWORD original_type{};
+    DWORD original_size{};
+    const LSTATUS original_status = RegQueryValueExW(
+        key, value_name, nullptr, &original_type, nullptr, &original_size);
+    std::vector<BYTE> original_data(original_size);
+    if (original_status == ERROR_SUCCESS && original_size != 0U) {
+        DWORD read_size = original_size;
+        static_cast<void>(RegQueryValueExW(
+            key,
+            value_name,
+            nullptr,
+            &original_type,
+            original_data.data(),
+            &read_size));
+        original_data.resize(read_size);
+    }
+
+    const std::array<BYTE, 4> blocked{0xB1U, 0U, 0U, 0U};
+    const LSTATUS seed_status = RegSetValueExW(
+        key,
+        value_name,
+        0,
+        REG_BINARY,
+        blocked.data(),
+        static_cast<DWORD>(blocked.size()));
+    expect(seed_status == ERROR_SUCCESS, "live AutoPlay test seeds a blocked binary policy");
+
+    const auto before = query_audio_cd_autoplay_policy();
+    const auto repair = repair_audio_cd_autoplay_policy();
+    DWORD repaired_type{};
+    std::array<BYTE, 4> repaired{};
+    DWORD repaired_size = static_cast<DWORD>(repaired.size());
+    const LSTATUS repaired_status = RegQueryValueExW(
+        key,
+        value_name,
+        nullptr,
+        &repaired_type,
+        repaired.data(),
+        &repaired_size);
+    expect(
+        before.current_user_blocked && repair.succeeded &&
+            repair.explorer_restart_required &&
+            repaired_status == ERROR_SUCCESS && repaired_type == REG_BINARY &&
+            repaired_size == repaired.size() && repaired[0] == 0x91U,
+        "live AutoPlay repair changes the blocked binary policy from 0xB1 to 0x91");
+
+    if (original_status == ERROR_SUCCESS) {
+        static_cast<void>(RegSetValueExW(
+            key,
+            value_name,
+            0,
+            original_type,
+            original_data.empty() ? nullptr : original_data.data(),
+            static_cast<DWORD>(original_data.size())));
+    } else {
+        static_cast<void>(RegDeleteValueW(key, value_name));
+    }
+    RegCloseKey(key);
 }
 
 void test_theme_palettes()
@@ -1943,6 +2080,8 @@ int main(const int argument_count, char** arguments)
 {
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
+    test_autoplay_launch_arguments();
+    test_autoplay_policy_masks();
     test_theme_palettes();
     test_animation_timing();
     test_settings_model();
@@ -1973,6 +2112,9 @@ int main(const int argument_count, char** arguments)
     if (argument_count == 2 &&
         std::string_view(arguments[1]) == "--hardware-cancel") {
         test_hardware_cancellation();
+    } else if (argument_count == 2 &&
+               std::string_view(arguments[1]) == "--autoplay-policy-repair") {
+        test_autoplay_policy_repair_live();
     } else if (argument_count == 2 &&
                std::string_view(arguments[1]) == "--hardware-pause") {
         test_hardware_pause_resume();

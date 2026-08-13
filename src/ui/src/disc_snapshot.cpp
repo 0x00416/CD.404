@@ -4,6 +4,7 @@
 #include <cd404/ui/metadata_source_model.hpp>
 
 #include <algorithm>
+#include <cwctype>
 #include <format>
 #include <iterator>
 #include <string_view>
@@ -23,14 +24,35 @@ namespace {
 
 } // namespace
 
-DiscSnapshot load_disc_snapshot()
+DiscSnapshot load_disc_snapshot(const std::wstring_view preferred_drive_root)
 {
     DiscSnapshot snapshot;
-    const auto drives = platform::windows::enumerate_optical_drives();
+    auto drives = platform::windows::enumerate_optical_drives();
     snapshot.has_optical_drive = !drives.empty();
     if (drives.empty()) {
         snapshot.status = L"未检测到光驱";
         return snapshot;
+    }
+
+    if (!preferred_drive_root.empty()) {
+        const auto preferred = std::ranges::find_if(
+            drives,
+            [preferred_drive_root](const auto& drive) {
+                return drive.root_path.size() == preferred_drive_root.size() &&
+                    std::ranges::equal(
+                        drive.root_path,
+                        preferred_drive_root,
+                        [](const wchar_t left, const wchar_t right) {
+                            return std::towupper(left) == std::towupper(right);
+                        });
+            });
+        if (preferred == drives.end()) {
+            snapshot.status = L"自动播放指定的光驱已不可用";
+            return snapshot;
+        }
+        platform::windows::OpticalDrive selected = *preferred;
+        drives.clear();
+        drives.push_back(std::move(selected));
     }
 
     unsigned long last_error{};

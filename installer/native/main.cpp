@@ -41,6 +41,19 @@ constexpr wchar_t kCredentialTarget[] = L"CD.404/ListenBrainz";
 constexpr wchar_t kApplicationWindowClass[] = L"CD404.MainWindow";
 constexpr wchar_t kUninstallRegistryKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CD.404";
+constexpr wchar_t kAutoPlayHandlerName[] = L"CD404PlayCDAudioOnArrival";
+constexpr wchar_t kAutoPlayProgId[] = L"CD404.AudioCD";
+constexpr wchar_t kAutoPlayEventName[] = L"PlayCDAudioOnArrival";
+constexpr wchar_t kAudioCdVerb[] = L"CD404.play";
+constexpr wchar_t kExplorerAutoPlayRegistryKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers";
+constexpr wchar_t kClassesRegistryKey[] = L"Software\\Classes";
+
+struct AutoPlayRegistryPaths final {
+    std::wstring autoplay_root{kExplorerAutoPlayRegistryKey};
+    std::wstring classes_root{kClassesRegistryKey};
+    std::wstring install_state_root{L"Software\\CD404\\Installer"};
+};
 
 struct ComGuard final {
     HRESULT result{CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)};
@@ -320,6 +333,496 @@ void show_message(
         ERROR_SUCCESS;
 }
 
+[[nodiscard]] bool create_registry_key(
+    const std::wstring& path,
+    HKEY& key,
+    DWORD& error)
+{
+    const LSTATUS status = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        path.c_str(),
+        0,
+        nullptr,
+        0,
+        KEY_SET_VALUE | KEY_QUERY_VALUE,
+        nullptr,
+        &key,
+        nullptr);
+    if (status != ERROR_SUCCESS) {
+        error = static_cast<DWORD>(status);
+        return false;
+    }
+    return true;
+}
+
+void delete_registry_value_if_equal(
+    const std::wstring& path,
+    const wchar_t* const name,
+    const std::wstring_view expected)
+{
+    std::wstring value(512U, L'\0');
+    DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+    const LSTATUS queried = RegGetValueW(
+        HKEY_CURRENT_USER,
+        path.c_str(),
+        name,
+        RRF_RT_REG_SZ,
+        nullptr,
+        value.data(),
+        &bytes);
+    if (queried != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
+        return;
+    }
+    value.resize((bytes / sizeof(wchar_t)) - 1U);
+    if (CompareStringOrdinal(
+            value.c_str(), -1,
+            expected.data(), static_cast<int>(expected.size()),
+            TRUE) == CSTR_EQUAL) {
+        static_cast<void>(RegDeleteKeyValueW(
+            HKEY_CURRENT_USER, path.c_str(), name));
+    }
+}
+
+void delete_registry_key_if_empty(const std::wstring& path)
+{
+    HKEY key{};
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            path.c_str(),
+            0,
+            KEY_QUERY_VALUE,
+            &key) != ERROR_SUCCESS) {
+        return;
+    }
+    DWORD subkeys{};
+    DWORD values{};
+    const bool empty = RegQueryInfoKeyW(
+        key, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr,
+        &values, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS &&
+        subkeys == 0U && values == 0U;
+    RegCloseKey(key);
+    if (empty) {
+        static_cast<void>(RegDeleteKeyW(HKEY_CURRENT_USER, path.c_str()));
+    }
+}
+
+[[nodiscard]] std::optional<std::wstring> read_registry_string(
+    const std::wstring& path,
+    const wchar_t* const name)
+{
+    std::wstring value(2'048U, L'\0');
+    DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+    if (RegGetValueW(
+            HKEY_CURRENT_USER,
+            path.c_str(),
+            name,
+            RRF_RT_REG_SZ,
+            nullptr,
+            value.data(),
+            &bytes) != ERROR_SUCCESS ||
+        bytes < sizeof(wchar_t)) {
+        return std::nullopt;
+    }
+    value.resize((bytes / sizeof(wchar_t)) - 1U);
+    return value;
+}
+
+[[nodiscard]] bool set_registry_dword(
+    const HKEY key,
+    const wchar_t* const name,
+    const DWORD value)
+{
+    return RegSetValueExW(
+               key,
+               name,
+               0,
+               REG_DWORD,
+               reinterpret_cast<const BYTE*>(&value),
+               sizeof(value)) == ERROR_SUCCESS;
+}
+
+[[nodiscard]] bool capture_audio_cd_shell_default(
+    const AutoPlayRegistryPaths& paths,
+    DWORD& error)
+{
+    const std::wstring state = paths.install_state_root + L"\\AudioCDShell";
+    DWORD captured{};
+    DWORD bytes = sizeof(captured);
+    if (RegGetValueW(
+            HKEY_CURRENT_USER,
+            state.c_str(),
+            L"Captured",
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &captured,
+            &bytes) == ERROR_SUCCESS &&
+        captured == 1U) {
+        return true;
+    }
+
+    HKEY key{};
+    if (!create_registry_key(state, key, error)) {
+        return false;
+    }
+    const std::wstring shell = paths.classes_root + L"\\AudioCD\\shell";
+    const auto previous = read_registry_string(shell, nullptr);
+    bool success = set_registry_dword(key, L"Captured", 1U) &&
+        set_registry_dword(key, L"HadPreviousDefault", previous ? 1U : 0U);
+    if (success && previous) {
+        success = set_registry_string(key, L"PreviousDefault", *previous);
+    }
+    RegCloseKey(key);
+    if (!success) {
+        error = ERROR_WRITE_FAULT;
+    }
+    return success;
+}
+
+void restore_audio_cd_shell_default(const AutoPlayRegistryPaths& paths)
+{
+    const std::wstring shell = paths.classes_root + L"\\AudioCD\\shell";
+    const auto current = read_registry_string(shell, nullptr);
+    if (current && CompareStringOrdinal(
+            current->c_str(), -1, kAudioCdVerb, -1, TRUE) == CSTR_EQUAL) {
+        const std::wstring state = paths.install_state_root + L"\\AudioCDShell";
+        DWORD had_previous{};
+        DWORD bytes = sizeof(had_previous);
+        const bool previous_present = RegGetValueW(
+            HKEY_CURRENT_USER,
+            state.c_str(),
+            L"HadPreviousDefault",
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &had_previous,
+            &bytes) == ERROR_SUCCESS &&
+            had_previous == 1U;
+        HKEY key{};
+        DWORD ignored{};
+        if (create_registry_key(shell, key, ignored)) {
+            if (previous_present) {
+                const auto previous = read_registry_string(
+                    state, L"PreviousDefault");
+                if (previous) {
+                    static_cast<void>(set_registry_string(key, nullptr, *previous));
+                }
+            } else {
+                static_cast<void>(RegDeleteValueW(key, nullptr));
+            }
+            RegCloseKey(key);
+        }
+    }
+
+    const std::wstring verb = shell + L"\\" + kAudioCdVerb;
+    static_cast<void>(RegDeleteTreeW(HKEY_CURRENT_USER, verb.c_str()));
+    static_cast<void>(RegDeleteTreeW(
+        HKEY_CURRENT_USER,
+        (paths.install_state_root + L"\\AudioCDShell").c_str()));
+    delete_registry_key_if_empty(shell);
+    delete_registry_key_if_empty(paths.classes_root + L"\\AudioCD");
+    delete_registry_key_if_empty(paths.install_state_root);
+}
+
+void remove_autoplay_registration(
+    const AutoPlayRegistryPaths& paths = {})
+{
+    restore_audio_cd_shell_default(paths);
+    const std::wstring event = paths.autoplay_root +
+        L"\\EventHandlers\\" + kAutoPlayEventName;
+    static_cast<void>(RegDeleteKeyValueW(
+        HKEY_CURRENT_USER, event.c_str(), kAutoPlayHandlerName));
+    delete_registry_key_if_empty(event);
+
+    const std::wstring handler = paths.autoplay_root +
+        L"\\Handlers\\" + kAutoPlayHandlerName;
+    static_cast<void>(RegDeleteTreeW(HKEY_CURRENT_USER, handler.c_str()));
+
+    const std::wstring prog_id = paths.classes_root + L"\\" + kAutoPlayProgId;
+    static_cast<void>(RegDeleteTreeW(HKEY_CURRENT_USER, prog_id.c_str()));
+
+    // Never choose CD.404 as the default during installation. On uninstall,
+    // remove only a previous user/default selection that still points to the
+    // handler being removed, otherwise Windows would retain a dead selection.
+    delete_registry_value_if_equal(
+        paths.autoplay_root + L"\\UserChosenExecuteHandlers",
+        kAutoPlayEventName,
+        kAutoPlayHandlerName);
+    delete_registry_value_if_equal(
+        paths.autoplay_root + L"\\EventHandlersDefaultSelection",
+        kAutoPlayEventName,
+        kAutoPlayHandlerName);
+
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+}
+
+[[nodiscard]] bool write_autoplay_registration(
+    const std::filesystem::path& directory,
+    DWORD& error,
+    const AutoPlayRegistryPaths& paths = {})
+{
+    const std::filesystem::path application = directory / kApplicationFile;
+    const std::wstring icon = application.wstring() + L",0";
+    const std::wstring command =
+        L"\"" + application.wstring() + L"\" /autoplay \"%L\"";
+
+    HKEY key{};
+    const std::wstring prog_id = paths.classes_root + L"\\" + kAutoPlayProgId;
+    if (!create_registry_key(prog_id, key, error)) {
+        return false;
+    }
+    bool success = set_registry_string(key, nullptr, L"CD.404 音频 CD");
+    RegCloseKey(key);
+
+    const std::wstring icon_key = prog_id + L"\\DefaultIcon";
+    if (success && create_registry_key(icon_key, key, error)) {
+        success = set_registry_string(key, nullptr, icon);
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    const std::wstring shell_key = prog_id + L"\\shell";
+    if (success && create_registry_key(shell_key, key, error)) {
+        success = set_registry_string(key, nullptr, L"play");
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    const std::wstring verb_key = shell_key + L"\\play";
+    if (success && create_registry_key(verb_key, key, error)) {
+        success = set_registry_string(key, nullptr, L"使用 CD.404 播放");
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    const std::wstring command_key = verb_key + L"\\command";
+    if (success && create_registry_key(command_key, key, error)) {
+        success = set_registry_string(key, nullptr, command);
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    if (success) {
+        success = capture_audio_cd_shell_default(paths, error);
+    }
+    const std::wstring audio_cd_shell =
+        paths.classes_root + L"\\AudioCD\\shell";
+    const std::wstring audio_cd_verb = audio_cd_shell + L"\\" + kAudioCdVerb;
+    if (success && create_registry_key(audio_cd_verb, key, error)) {
+        success = set_registry_string(key, nullptr, L"使用 CD.404 播放");
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+    const std::wstring audio_cd_command = audio_cd_verb + L"\\command";
+    if (success && create_registry_key(audio_cd_command, key, error)) {
+        success = set_registry_string(key, nullptr, command);
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+    if (success && create_registry_key(audio_cd_shell, key, error)) {
+        success = set_registry_string(key, nullptr, kAudioCdVerb);
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    const std::wstring handler = paths.autoplay_root +
+        L"\\Handlers\\" + kAutoPlayHandlerName;
+    if (success && create_registry_key(handler, key, error)) {
+        success =
+            set_registry_string(key, L"Action", L"播放音频 CD") &&
+            set_registry_string(key, L"DefaultIcon", icon) &&
+            set_registry_string(key, L"InvokeProgID", kAutoPlayProgId) &&
+            set_registry_string(key, L"InvokeVerb", L"play") &&
+            set_registry_string(key, L"Provider", kProductName);
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    const std::wstring event = paths.autoplay_root +
+        L"\\EventHandlers\\" + kAutoPlayEventName;
+    if (success && create_registry_key(event, key, error)) {
+        success = set_registry_string(key, kAutoPlayHandlerName, L"");
+        RegCloseKey(key);
+    } else if (success) {
+        success = false;
+    }
+
+    if (!success) {
+        if (error == ERROR_SUCCESS) {
+            error = ERROR_WRITE_FAULT;
+        }
+        remove_autoplay_registration(paths);
+        return false;
+    }
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    return true;
+}
+
+[[nodiscard]] bool registry_string_equals(
+    const std::wstring& path,
+    const wchar_t* const name,
+    const std::wstring_view expected)
+{
+    std::wstring value(2'048U, L'\0');
+    DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+    const LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        path.c_str(),
+        name,
+        RRF_RT_REG_SZ,
+        nullptr,
+        value.data(),
+        &bytes);
+    if (status != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
+        return false;
+    }
+    value.resize((bytes / sizeof(wchar_t)) - 1U);
+    return value == expected;
+}
+
+[[nodiscard]] bool registry_key_missing(const std::wstring& path)
+{
+    HKEY key{};
+    const LSTATUS status = RegOpenKeyExW(
+        HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &key);
+    if (status == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        return false;
+    }
+    return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+}
+
+[[nodiscard]] int verify_autoplay_registration()
+{
+    const std::wstring test_root = std::format(
+        L"Software\\CD404\\InstallerTests\\{}-{}",
+        GetCurrentProcessId(),
+        GetTickCount64());
+    const AutoPlayRegistryPaths paths{
+        test_root + L"\\AutoplayHandlers",
+        test_root + L"\\Classes",
+        test_root + L"\\InstallerState",
+    };
+    struct Cleanup final {
+        std::wstring root;
+        ~Cleanup()
+        {
+            static_cast<void>(RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str()));
+            static_cast<void>(RegDeleteKeyW(HKEY_CURRENT_USER, root.c_str()));
+            delete_registry_key_if_empty(L"Software\\CD404\\InstallerTests");
+            delete_registry_key_if_empty(L"Software\\CD404");
+        }
+    } cleanup{test_root};
+
+    DWORD error{};
+    HKEY key{};
+    if (!create_registry_key(paths.autoplay_root, key, error)) {
+        return 20;
+    }
+    RegCloseKey(key);
+    if (!create_registry_key(paths.classes_root, key, error)) {
+        return 20;
+    }
+    RegCloseKey(key);
+    const std::wstring user_choice = paths.autoplay_root +
+        L"\\UserChosenExecuteHandlers";
+    if (!create_registry_key(user_choice, key, error)) {
+        return 21;
+    }
+    const bool default_seeded = set_registry_string(
+        key, kAutoPlayEventName, L"ExistingPlayerHandler");
+    RegCloseKey(key);
+    if (!default_seeded) {
+        return 22;
+    }
+
+    const std::wstring audio_cd_shell =
+        paths.classes_root + L"\\AudioCD\\shell";
+    if (!create_registry_key(audio_cd_shell, key, error)) {
+        return 22;
+    }
+    const bool audio_default_seeded = set_registry_string(
+        key, nullptr, L"ExistingAudioCdVerb");
+    RegCloseKey(key);
+    if (!audio_default_seeded) {
+        return 22;
+    }
+
+    const std::filesystem::path directory = L"C:\\CD.404 AutoPlay Test";
+    if (!write_autoplay_registration(directory, error, paths)) {
+        return 23;
+    }
+    const std::wstring handler = paths.autoplay_root +
+        L"\\Handlers\\" + kAutoPlayHandlerName;
+    const std::wstring event = paths.autoplay_root +
+        L"\\EventHandlers\\" + kAutoPlayEventName;
+    const std::wstring prog_id = paths.classes_root + L"\\" + kAutoPlayProgId;
+    const std::wstring command = prog_id + L"\\shell\\play\\command";
+    const std::wstring audio_cd_verb =
+        audio_cd_shell + L"\\" + kAudioCdVerb;
+    const std::wstring audio_cd_command = audio_cd_verb + L"\\command";
+    const std::wstring expected_command =
+        L"\"C:\\CD.404 AutoPlay Test\\CD.404.exe\" /autoplay \"%L\"";
+    if (!registry_string_equals(handler, L"InvokeProgID", kAutoPlayProgId) ||
+        !registry_string_equals(handler, L"InvokeVerb", L"play") ||
+        !registry_string_equals(event, kAutoPlayHandlerName, L"") ||
+        !registry_string_equals(command, nullptr, expected_command) ||
+        !registry_string_equals(audio_cd_shell, nullptr, kAudioCdVerb) ||
+        !registry_string_equals(audio_cd_command, nullptr, expected_command) ||
+        !registry_string_equals(
+            user_choice, kAutoPlayEventName, L"ExistingPlayerHandler")) {
+        return 24;
+    }
+
+    if (!create_registry_key(user_choice, key, error)) {
+        return 25;
+    }
+    const bool seeded =
+        set_registry_string(key, kAutoPlayEventName, kAutoPlayHandlerName) &&
+        set_registry_string(key, L"UnrelatedEvent", L"OtherHandler");
+    RegCloseKey(key);
+    if (!seeded) {
+        return 26;
+    }
+
+    remove_autoplay_registration(paths);
+    if (!registry_key_missing(handler) || !registry_key_missing(prog_id) ||
+        !registry_key_missing(audio_cd_verb) ||
+        !registry_string_equals(
+            audio_cd_shell, nullptr, L"ExistingAudioCdVerb") ||
+        registry_string_equals(event, kAutoPlayHandlerName, L"") ||
+        registry_string_equals(
+            user_choice, kAutoPlayEventName, kAutoPlayHandlerName) ||
+        !registry_string_equals(
+            user_choice, L"UnrelatedEvent", L"OtherHandler")) {
+        return 27;
+    }
+
+    if (!write_autoplay_registration(directory, error, paths) ||
+        !create_registry_key(audio_cd_shell, key, error)) {
+        return 28;
+    }
+    const bool user_changed = set_registry_string(
+        key, nullptr, L"UserChangedAfterInstall");
+    RegCloseKey(key);
+    if (!user_changed) {
+        return 29;
+    }
+    remove_autoplay_registration(paths);
+    if (!registry_string_equals(
+            audio_cd_shell, nullptr, L"UserChangedAfterInstall") ||
+        !registry_key_missing(audio_cd_verb)) {
+        return 30;
+    }
+    return 0;
+}
+
 [[nodiscard]] bool write_uninstall_registration(
     const std::filesystem::path& directory,
     const std::uint64_t installed_bytes,
@@ -518,20 +1021,25 @@ void show_message(
     if (!replace_with_bytes(directory / kInstallMarkerFile, marker, error)) {
         return false;
     }
-    progress(95, L"正在登记 Windows 卸载信息…");
+    progress(93, L"正在注册音频 CD 自动播放选项…");
+    if (!write_autoplay_registration(directory, error)) {
+        return false;
+    }
+    progress(96, L"正在登记 Windows 卸载信息…");
     const bool registered = write_uninstall_registration(
         directory,
         application->size() + privacy->size() + notices->size() +
             std::filesystem::file_size(self, filesystem_error),
         error);
     if (registered) {
-        progress(97, L"正在完成安装…");
+        progress(98, L"正在完成安装…");
     }
     return registered;
 }
 
 void remove_shortcuts_and_registration()
 {
+    remove_autoplay_registration();
     std::error_code error;
     const auto menu = start_menu_shortcut();
     const auto desktop = desktop_shortcut();
@@ -775,7 +1283,7 @@ void mark_self_for_deletion()
     if (!remove_installed_files(directory, error)) {
         return static_cast<int>(error == ERROR_SUCCESS ? ERROR_DELETE_PENDING : error);
     }
-    if (progress) progress(86, L"正在移除快捷方式和卸载登记…");
+    if (progress) progress(82, L"正在移除自动播放注册…");
     remove_shortcuts_and_registration();
     if (progress) progress(94, L"正在完成卸载…");
     if (progress) progress(100, L"卸载完成");
@@ -889,6 +1397,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
         has_valid_install_marker(current_module.parent_path());
     if (has_argument(arguments, L"/verify")) {
         const int result = verify_embedded_payload();
+        LocalFree(values);
+        return result;
+    }
+    if (has_argument(arguments, L"/verify-autoplay")) {
+        const int result = verify_autoplay_registration();
         LocalFree(values);
         return result;
     }

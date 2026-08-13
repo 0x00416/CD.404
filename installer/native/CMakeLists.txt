@@ -4,8 +4,23 @@ file(TO_CMAKE_PATH "${PROJECT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md" CD404_NOTICES_
 configure_file(resources.rc.in resources.rc.in.generated @ONLY)
 file(
     GENERATE
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/resources-$<CONFIG>.rc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/resources-template-$<CONFIG>.rc"
     INPUT "${CMAKE_CURRENT_BINARY_DIR}/resources.rc.in.generated"
+)
+set(CD404_APPLICATION_RESOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/resources-$<CONFIG>.rc")
+add_custom_command(
+    OUTPUT "${CD404_APPLICATION_RESOURCE}"
+    COMMAND
+        "${CMAKE_COMMAND}" -E copy
+        "${CMAKE_CURRENT_BINARY_DIR}/resources-template-$<CONFIG>.rc"
+        "${CD404_APPLICATION_RESOURCE}"
+    DEPENDS
+        cd404_app
+        "$<TARGET_FILE:cd404_app>"
+        "${CMAKE_CURRENT_BINARY_DIR}/resources-template-$<CONFIG>.rc"
+    VERBATIM
+    COMMENT "Refreshing the embedded CD.404 application resource"
 )
 
 add_executable(
@@ -14,7 +29,7 @@ add_executable(
     main.cpp
     wizard.cpp
     wizard.hpp
-    "${CMAKE_CURRENT_BINARY_DIR}/resources-$<CONFIG>.rc"
+    "${CD404_APPLICATION_RESOURCE}"
 )
 add_dependencies(cd404_installer cd404_app)
 target_compile_features(cd404_installer PRIVATE cxx_std_20)

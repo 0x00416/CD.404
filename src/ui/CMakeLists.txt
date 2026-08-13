@@ -4,6 +4,7 @@ target_sources(
     cd404_ui
     PRIVATE
         src/animation_timing.cpp
+        src/application_launch.cpp
         src/disc_snapshot.cpp
         src/main_window.cpp
         src/metadata_source_model.cpp
@@ -17,6 +18,7 @@ target_sources(
         BASE_DIRS include
         FILES
             include/cd404/ui/animation_timing.hpp
+            include/cd404/ui/application_launch.hpp
             include/cd404/ui/main_window.hpp
             include/cd404/ui/metadata_source_model.hpp
             include/cd404/ui/playback_presenter.hpp

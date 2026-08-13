@@ -16,6 +16,7 @@
 #include <cd404/core/cd_time.hpp>
 #include <cd404/core/lyrics.hpp>
 #include <cd404/listenbrainz/playback_tracker.hpp>
+#include <cd404/platform/windows/autoplay_policy.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
@@ -112,7 +113,7 @@ constexpr float kDesignHeight = 760.0F;
 constexpr float kMinimumWidth = 840.0F;
 constexpr float kMinimumHeight = 600.0F;
 constexpr float kSettingsContentTop = 140.0F;
-constexpr float kSettingsContentBottom = 736.0F;
+constexpr float kSettingsContentBottom = 880.0F;
 
 [[nodiscard]] D2D1_COLOR_F color(
     const std::uint32_t rgb,
@@ -419,8 +420,10 @@ struct CddbSubmissionSnapshot final {
 
 class MainWindow final {
 public:
-    explicit MainWindow(HINSTANCE instance)
+    explicit MainWindow(HINSTANCE instance, ApplicationLaunchOptions options)
         : instance_(instance),
+          preferred_drive_root_(std::move(options.autoplay_drive_root)),
+          autoplay_pending_(preferred_drive_root_.has_value()),
           user_settings_(platform::windows::load_user_settings()),
           volume_(user_settings_.volume),
           listenbrainz_tracker_([this](const listenbrainz::Submission& submission) {
@@ -2940,8 +2943,10 @@ private:
         ui_message_.clear();
         InvalidateRect(window_, nullptr, FALSE);
         const HWND target_window = window_;
-        disc_worker_ = std::jthread([target_window] {
-            auto snapshot = std::make_unique<DiscSnapshot>(load_disc_snapshot());
+        const std::wstring preferred_drive = preferred_drive_root_.value_or(L"");
+        disc_worker_ = std::jthread([target_window, preferred_drive] {
+            auto snapshot = std::make_unique<DiscSnapshot>(
+                load_disc_snapshot(preferred_drive));
             auto* const raw_snapshot = snapshot.release();
             if (PostMessageW(
                     target_window,
@@ -2993,7 +2998,11 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
         sync_system_media(true);
         start_online_metadata_lookup();
-        if (recovery_actions.restart_playback) {
+        if (autoplay_pending_ && disc_.toc && !disc_.tracks.empty()) {
+            autoplay_pending_ = false;
+            playback_track_frame_ = 0;
+            start_playback(0);
+        } else if (recovery_actions.restart_playback) {
             start_playback(playback_track_frame_);
         }
     }
@@ -6220,6 +6229,10 @@ private:
         settings_save_failed_ = false;
         settings_saved_ = false;
         settings_input_required_ = false;
+        autoplay_policy_status_ =
+            platform::windows::query_audio_cd_autoplay_policy();
+        autoplay_policy_feedback_.clear();
+        autoplay_policy_feedback_error_ = false;
         audio_endpoints_ = platform::windows::enumerate_wasapi_render_endpoints(
             &audio_endpoint_status_);
         audio_endpoints_.insert(
@@ -6537,10 +6550,25 @@ private:
             cddb_settings_error_.clear();
             persist_user_settings();
             InvalidateRect(window_, nullptr, FALSE);
+        } else if (contains(layout_.settings_autoplay_repair, point)) {
+            repair_audio_cd_autoplay();
         } else if (contains(layout_.settings_back, point) ||
                    contains(layout_.settings_button, point)) {
             close_settings();
         }
+    }
+
+    void repair_audio_cd_autoplay()
+    {
+        const auto result =
+            platform::windows::repair_audio_cd_autoplay_policy();
+        autoplay_policy_status_ = result.status;
+        autoplay_policy_feedback_ = result.message;
+        autoplay_policy_feedback_error_ = !result.succeeded;
+        diagnostics_.record(
+            L"autoplay",
+            result.succeeded ? L"policy repaired" : L"policy repair failed");
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void export_diagnostics()
@@ -7356,6 +7384,62 @@ private:
             layout_.settings_cddb_save,
             accent_text_brush_.Get(),
             DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const auto autoplay_card = D2D1::RoundedRect(
+            layout_.settings_autoplay_card,
+            16.0F,
+            16.0F);
+        render_target_->FillRoundedRectangle(autoplay_card, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            autoplay_card, border_brush_.Get(), 1.0F);
+        draw_text(
+            L"音频 CD 自动播放",
+            heading_format_.Get(),
+            D2D1::RectF(
+                autoplay_card.rect.left + 24.0F,
+                autoplay_card.rect.top + 18.0F,
+                autoplay_card.rect.right - 152.0F,
+                autoplay_card.rect.top + 46.0F),
+            text_brush_.Get());
+        const std::wstring autoplay_status_text =
+            autoplay_policy_feedback_.empty()
+            ? platform::windows::describe_audio_cd_autoplay_policy(
+                  autoplay_policy_status_)
+            : autoplay_policy_feedback_;
+        draw_text(
+            autoplay_status_text,
+            small_format_.Get(),
+            D2D1::RectF(
+                autoplay_card.rect.left + 24.0F,
+                autoplay_card.rect.top + 52.0F,
+                layout_.settings_autoplay_repair.left - 16.0F,
+                autoplay_card.rect.top + 82.0F),
+            autoplay_policy_feedback_error_ ||
+                    !autoplay_policy_status_.enabled()
+                ? error_brush_.Get()
+                : success_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        const auto autoplay_repair = D2D1::RoundedRect(
+            layout_.settings_autoplay_repair,
+            10.0F,
+            10.0F);
+        const bool autoplay_repair_available =
+            autoplay_policy_status_.repairable_for_current_user();
+        render_target_->FillRoundedRectangle(
+            autoplay_repair,
+            autoplay_repair_available ? accent_brush_.Get() : elevated_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            autoplay_repair, border_brush_.Get(), 1.0F);
+        draw_text(
+            autoplay_policy_status_.enabled() ? L"重新检测" : L"修复",
+            button_format_.Get(),
+            layout_.settings_autoplay_repair,
+            autoplay_repair_available
+                ? accent_text_brush_.Get()
+                : text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         render_target_->PopAxisAlignedClip();
         draw_settings_scrollbar();
     }
@@ -8093,6 +8177,8 @@ private:
     }
 
     HINSTANCE instance_{};
+    std::optional<std::wstring> preferred_drive_root_;
+    bool autoplay_pending_{};
     HWND window_{};
     HWND resize_focus_{};
     bool window_resizing_{};
@@ -8215,6 +8301,9 @@ private:
     HWND settings_cddb_server_edit_{};
     HWND settings_cddb_email_edit_{};
     std::wstring cddb_settings_error_;
+    platform::windows::AudioCdAutoplayPolicyStatus autoplay_policy_status_{};
+    std::wstring autoplay_policy_feedback_;
+    bool autoplay_policy_feedback_error_{};
     WNDPROC settings_edit_original_proc_{};
     HWND metadata_album_title_edit_{};
     HWND metadata_album_artist_edit_{};
@@ -8278,7 +8367,10 @@ void enable_per_monitor_dpi_awareness()
 
 } // namespace
 
-int run_application(HINSTANCE instance, const int show_command)
+int run_application(
+    HINSTANCE instance,
+    const int show_command,
+    ApplicationLaunchOptions options)
 {
     enable_per_monitor_dpi_awareness();
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -8288,7 +8380,7 @@ int run_application(HINSTANCE instance, const int show_command)
 
     int exit_code{1};
     {
-        MainWindow window(instance);
+        MainWindow window(instance, std::move(options));
         if (window.create(show_command)) {
             exit_code = window.run();
         }
