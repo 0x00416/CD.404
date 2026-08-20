@@ -21,6 +21,7 @@ CMakeLists.txt text eol=lf
 *.jpeg binary
 *.ico binary
 *.wav binary
+*.ttf binary
 *.bin binary
 *.msix binary
 *.msixbundle binary

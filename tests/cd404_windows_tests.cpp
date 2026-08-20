@@ -3,12 +3,15 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <dbt.h>
+#include <dwrite.h>
 #include <objbase.h>
 #include <winsqlite/winsqlite3.h>
+#include <wrl/client.h>
 
 #include <cd404/audio/playback_state_machine.hpp>
 #include <cd404/core/version.hpp>
 #include <cd404/platform/windows/autoplay_policy.hpp>
+#include <cd404/platform/windows/bundled_font.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
@@ -24,6 +27,7 @@
 #include <cd404/platform/windows/wasapi_output.hpp>
 #include <cd404/ui/animation_timing.hpp>
 #include <cd404/ui/application_launch.hpp>
+#include <cd404/ui/font_rendering.hpp>
 #include <cd404/ui/theme.hpp>
 #include <cd404/ui/playback_presenter.hpp>
 #include <cd404/ui/metadata_source_model.hpp>
@@ -31,6 +35,10 @@
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
+
+#ifdef DrawText
+#undef DrawText
+#endif
 
 #include <array>
 #include <atomic>
@@ -211,6 +219,301 @@ void test_autoplay_policy_repair_live()
         static_cast<void>(RegDeleteValueW(key, value_name));
     }
     RegCloseKey(key);
+}
+
+void test_bundled_font_multilingual_coverage()
+{
+    using namespace cd404::platform::windows;
+    using Microsoft::WRL::ComPtr;
+
+    const BundledFontRegistration registration(CD404_TEST_FONT_PATH);
+    expect(registration.loaded(), "bundled Noto Sans CJK font loads privately");
+    if (!registration.loaded()) {
+        return;
+    }
+
+    ComPtr<IDWriteFactory> factory;
+    HRESULT result = DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(factory.GetAddressOf()));
+    ComPtr<IDWriteFontCollection> collection;
+    if (SUCCEEDED(result)) {
+        result = factory->GetSystemFontCollection(
+            collection.GetAddressOf(), TRUE);
+    }
+    UINT32 family_index{};
+    BOOL family_exists{};
+    if (SUCCEEDED(result)) {
+        result = collection->FindFamilyName(
+            kBundledFontFamily,
+            &family_index,
+            &family_exists);
+    }
+    expect(
+        SUCCEEDED(result) && family_exists,
+        "DirectWrite resolves the private Noto Sans CJK SC family");
+    if (FAILED(result) || !family_exists) {
+        return;
+    }
+
+    ComPtr<IDWriteFontFamily> family;
+    ComPtr<IDWriteFont> font;
+    ComPtr<IDWriteFontFace> face;
+    result = collection->GetFontFamily(family_index, family.GetAddressOf());
+    if (SUCCEEDED(result)) {
+        result = family->GetFirstMatchingFont(
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            font.GetAddressOf());
+    }
+    if (SUCCEEDED(result)) {
+        result = font->CreateFontFace(face.GetAddressOf());
+    }
+    constexpr std::array<UINT32, 32> multilingual_code_points{
+        0x0041U, 0x0061U, 0x005AU, 0x007AU,
+        0x041FU, 0x0440U, 0x0438U, 0x0432U, 0x0435U, 0x0442U,
+        0x00C4U, 0x00D6U, 0x00DCU, 0x00DFU,
+        0x4E2DU, 0x6587U,
+        0x65E5U, 0x672CU, 0x8A9EU, 0x304BU, 0x306AU, 0x30ABU, 0x30CAU,
+        0xD55CU, 0xAD6DU, 0xC5B4U,
+        0x0030U, 0x0039U, 0x002DU, 0x002EU, 0x002FU, 0x0020U,
+    };
+    std::array<UINT16, multilingual_code_points.size()> glyphs{};
+    if (SUCCEEDED(result)) {
+        result = face->GetGlyphIndices(
+            multilingual_code_points.data(),
+            static_cast<UINT32>(multilingual_code_points.size()),
+            glyphs.data());
+    }
+    expect(
+        SUCCEEDED(result) &&
+            std::ranges::none_of(glyphs, [](const UINT16 glyph) {
+                return glyph == 0U;
+            }),
+        "one Noto Sans CJK face covers English, Russian, German, Chinese, Japanese and Korean");
+
+    const HFONT gdi_font = CreateFontW(
+        -16,
+        0,
+        0,
+        0,
+        FW_NORMAL,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_NATURAL_QUALITY,
+        DEFAULT_PITCH | FF_SWISS,
+        kBundledFontFamily);
+    const HDC context = CreateCompatibleDC(nullptr);
+    const HGDIOBJ previous = context != nullptr && gdi_font != nullptr
+        ? SelectObject(context, gdi_font)
+        : nullptr;
+    std::array<wchar_t, LF_FACESIZE> selected_face{};
+    const int selected_length = context != nullptr
+        ? GetTextFaceW(
+              context,
+              static_cast<int>(selected_face.size()),
+              selected_face.data())
+        : 0;
+    expect(
+        selected_length > 0 &&
+            _wcsicmp(selected_face.data(), kBundledFontFamily) == 0,
+        "GDI controls resolve the same private Noto Sans CJK SC family");
+    LOGFONTW logical_font{};
+    const int logical_font_size = gdi_font != nullptr
+        ? GetObjectW(gdi_font, sizeof(logical_font), &logical_font)
+        : 0;
+    expect(
+        logical_font_size == sizeof(logical_font) &&
+            logical_font.lfQuality == CLEARTYPE_NATURAL_QUALITY,
+        "native control fallback requests smooth ClearType rendering");
+    if (previous != nullptr) {
+        SelectObject(context, previous);
+    }
+    if (context != nullptr) {
+        DeleteDC(context);
+    }
+    if (gdi_font != nullptr) {
+        DeleteObject(gdi_font);
+    }
+}
+
+void test_text_antialiasing_configuration()
+{
+    using Microsoft::WRL::ComPtr;
+
+    ComPtr<ID2D1Factory> d2d_factory;
+    HRESULT result = D2D1CreateFactory(
+        D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        d2d_factory.GetAddressOf());
+
+    ComPtr<IDWriteFactory> write_factory;
+    if (SUCCEEDED(result)) {
+        result = DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(write_factory.GetAddressOf()));
+    }
+
+    ComPtr<ID2D1DCRenderTarget> render_target;
+    if (SUCCEEDED(result)) {
+        const D2D1_RENDER_TARGET_PROPERTIES properties =
+            D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    D2D1_ALPHA_MODE_IGNORE));
+        result = d2d_factory->CreateDCRenderTarget(
+            &properties,
+            render_target.GetAddressOf());
+    }
+    if (SUCCEEDED(result)) {
+        result = cd404::ui::configure_text_rendering(
+            *render_target.Get(),
+            *write_factory.Get());
+    }
+
+    ComPtr<IDWriteRenderingParams> rendering_parameters;
+    if (SUCCEEDED(result)) {
+        render_target->GetTextRenderingParams(
+            rendering_parameters.GetAddressOf());
+    }
+    expect(
+        SUCCEEDED(result) &&
+            render_target->GetTextAntialiasMode() ==
+                cd404::ui::kInterfaceTextAntialiasMode &&
+            rendering_parameters != nullptr &&
+            rendering_parameters->GetRenderingMode() ==
+                cd404::ui::kTextRenderingMode &&
+            rendering_parameters->GetPixelGeometry() ==
+                DWRITE_PIXEL_GEOMETRY_FLAT &&
+            rendering_parameters->GetClearTypeLevel() == 0.0F,
+        "DirectWrite UI text uses two-axis grayscale antialiasing without color fringes");
+    expect(
+        cd404::ui::kAnimatedTextAntialiasMode ==
+            D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        "animated lyric text uses grayscale antialiasing without color fringes");
+
+    constexpr int bitmap_width = 240;
+    constexpr int bitmap_height = 64;
+    BITMAPINFO bitmap_info{};
+    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap_info.bmiHeader.biWidth = bitmap_width;
+    bitmap_info.bmiHeader.biHeight = -bitmap_height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    void* pixel_memory{};
+    const HDC memory_context = CreateCompatibleDC(nullptr);
+    const HBITMAP bitmap = CreateDIBSection(
+        memory_context,
+        &bitmap_info,
+        DIB_RGB_COLORS,
+        &pixel_memory,
+        nullptr,
+        0);
+    const HGDIOBJ previous_bitmap =
+        memory_context != nullptr && bitmap != nullptr
+        ? SelectObject(memory_context, bitmap)
+        : nullptr;
+    RECT bitmap_bounds{0, 0, bitmap_width, bitmap_height};
+    if (SUCCEEDED(result)) {
+        result = render_target->BindDC(memory_context, &bitmap_bounds);
+    }
+    const cd404::platform::windows::BundledFontRegistration registration(
+        CD404_TEST_FONT_PATH);
+    ComPtr<IDWriteTextFormat> text_format;
+    if (SUCCEEDED(result) && registration.loaded()) {
+        result = write_factory->CreateTextFormat(
+            cd404::platform::windows::kBundledFontFamily,
+            nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            15.0F,
+            L"",
+            text_format.GetAddressOf());
+    }
+    if (SUCCEEDED(result)) {
+        result = text_format->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    ComPtr<ID2D1SolidColorBrush> text_brush;
+    if (SUCCEEDED(result)) {
+        result = render_target->CreateSolidColorBrush(
+            D2D1::ColorF(0.95F, 0.95F, 0.95F),
+            text_brush.GetAddressOf());
+    }
+    ComPtr<IDWriteTextLayout> text_layout;
+    if (SUCCEEDED(result)) {
+        result = write_factory->CreateTextLayout(
+            L"CDDB / freedb",
+            static_cast<UINT32>(std::size(L"CDDB / freedb") - 1U),
+            text_format.Get(),
+            232.0F,
+            56.0F,
+            text_layout.GetAddressOf());
+    }
+    FLOAT caret_x = 0.0F;
+    FLOAT caret_y = 0.0F;
+    DWRITE_HIT_TEST_METRICS caret_metrics{};
+    if (SUCCEEDED(result)) {
+        result = text_layout->HitTestTextPosition(
+            4U,
+            FALSE,
+            &caret_x,
+            &caret_y,
+            &caret_metrics);
+    }
+    expect(
+        SUCCEEDED(result) &&
+            std::abs(
+                caret_metrics.top + caret_metrics.height * 0.5F - 28.0F) <
+                0.75F,
+        "DirectWrite edit layout vertically centres its caret and line box");
+    if (SUCCEEDED(result)) {
+        render_target->BeginDraw();
+        render_target->Clear(D2D1::ColorF(0.05F, 0.05F, 0.05F));
+        render_target->DrawTextLayout(
+            D2D1::Point2F(4.0F, 4.0F),
+            text_layout.Get(),
+            text_brush.Get());
+        result = render_target->EndDraw();
+    }
+    bool has_partial_coverage{};
+    bool has_color_fringe{};
+    if (SUCCEEDED(result) && pixel_memory != nullptr) {
+        const auto* pixels = static_cast<const std::uint32_t*>(pixel_memory);
+        for (int index{}; index < bitmap_width * bitmap_height; ++index) {
+            const std::uint32_t pixel = pixels[index];
+            const auto blue = static_cast<unsigned char>(pixel & 0xFFU);
+            const auto green = static_cast<unsigned char>((pixel >> 8U) & 0xFFU);
+            const auto red = static_cast<unsigned char>((pixel >> 16U) & 0xFFU);
+            if (red > 20U && red < 235U) {
+                has_partial_coverage = true;
+            }
+            if (red != green || green != blue) {
+                has_color_fringe = true;
+            }
+        }
+    }
+    expect(
+        SUCCEEDED(result) && has_partial_coverage && !has_color_fringe,
+        "DirectWrite DCRenderTarget produces real grayscale edge coverage for native fields and menus");
+    if (previous_bitmap != nullptr) {
+        SelectObject(memory_context, previous_bitmap);
+    }
+    if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+    }
+    if (memory_context != nullptr) {
+        DeleteDC(memory_context);
+    }
 }
 
 void test_theme_palettes()
@@ -2082,6 +2385,8 @@ int main(const int argument_count, char** arguments)
     test_result_semantics();
     test_autoplay_launch_arguments();
     test_autoplay_policy_masks();
+    test_bundled_font_multilingual_coverage();
+    test_text_antialiasing_configuration();
     test_theme_palettes();
     test_animation_timing();
     test_settings_model();

@@ -16,6 +16,7 @@ namespace cd404::installer {
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"CD404InstallerWizard";
+constexpr wchar_t kUiFontFamily[] = L"Noto Sans CJK SC";
 constexpr COLORREF kAccent = RGB(102, 126, 234);
 constexpr int kBack = 1101;
 constexpr int kNext = 1102;
@@ -164,7 +165,9 @@ void apply_theme(Wizard& state)
     return CreateFontW(
         -MulDiv(points, static_cast<int>(state.dpi), 72), 0, 0, 0, weight,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_NATURAL_QUALITY,
+        DEFAULT_PITCH | FF_SWISS,
+        kUiFontFamily);
 }
 
 void rebuild_fonts(Wizard& state)

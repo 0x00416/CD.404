@@ -1,6 +1,12 @@
 set(CD404_APPLICATION_RESOURCE "$<TARGET_FILE:cd404_app>")
 file(TO_CMAKE_PATH "${PROJECT_SOURCE_DIR}/docs/PRIVACY.md" CD404_PRIVACY_RESOURCE)
 file(TO_CMAKE_PATH "${PROJECT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md" CD404_NOTICES_RESOURCE)
+file(TO_CMAKE_PATH
+    "${PROJECT_SOURCE_DIR}/assets/fonts/NotoSansCJKsc-VF.ttf"
+    CD404_FONT_RESOURCE)
+file(TO_CMAKE_PATH
+    "${PROJECT_SOURCE_DIR}/assets/fonts/OFL-1.1.txt"
+    CD404_FONT_LICENSE_RESOURCE)
 configure_file(resources.rc.in resources.rc.in.generated @ONLY)
 file(
     GENERATE
@@ -18,6 +24,8 @@ add_custom_command(
     DEPENDS
         cd404_app
         "$<TARGET_FILE:cd404_app>"
+        "${CD404_FONT_RESOURCE}"
+        "${CD404_FONT_LICENSE_RESOURCE}"
         "${CMAKE_CURRENT_BINARY_DIR}/resources-template-$<CONFIG>.rc"
     VERBATIM
     COMMENT "Refreshing the embedded CD.404 application resource"
@@ -49,6 +57,7 @@ target_link_libraries(
         comctl32
         advapi32
         dwmapi
+        gdi32
         ole32
         shell32
         user32

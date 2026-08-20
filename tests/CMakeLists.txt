@@ -9,6 +9,12 @@ add_test(NAME cd404_tests COMMAND cd404_tests)
 if(WIN32)
     add_executable(cd404_windows_tests cd404_windows_tests.cpp)
     target_compile_features(cd404_windows_tests PRIVATE cxx_std_20)
+    file(TO_CMAKE_PATH
+        "${PROJECT_SOURCE_DIR}/assets/fonts/NotoSansCJKsc-VF.ttf"
+        CD404_TEST_FONT_PATH)
+    target_compile_definitions(
+        cd404_windows_tests
+        PRIVATE CD404_TEST_FONT_PATH=L"${CD404_TEST_FONT_PATH}")
     target_link_libraries(cd404_windows_tests PRIVATE cd404::windows cd404::ui)
     cd404_set_project_warnings(cd404_windows_tests)
 

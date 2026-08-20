@@ -4,6 +4,7 @@ target_sources(
     cd404_windows
     PRIVATE
         src/autoplay_policy.cpp
+        src/bundled_font.cpp
         src/cdda_playback_engine.cpp
         src/device_lifecycle.cpp
         src/diagnostics.cpp
@@ -28,6 +29,7 @@ target_sources(
         BASE_DIRS include
         FILES
             include/cd404/platform/windows/autoplay_policy.hpp
+            include/cd404/platform/windows/bundled_font.hpp
             include/cd404/platform/windows/cdda_playback_engine.hpp
             include/cd404/platform/windows/device_lifecycle.hpp
             include/cd404/platform/windows/diagnostics.hpp

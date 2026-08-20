@@ -103,6 +103,11 @@ make package
 设置 `CD404_SIGNING_THUMBPRINT` 并显式加 `-Sign`；证书、私钥和 Token 均不得进入仓库。
 没有签名证书仍可生成安装包，但不得声称 Authenticode 已通过。
 
+播放器和原生安装/卸载向导随包携带 `Noto Sans CJK SC` 可变字体，并以进程私有方式加载，
+不依赖系统预装字体，也不会写入 Windows 字体目录。DirectWrite 绘制、原生输入框、列表、
+按钮和自绘菜单统一使用该字体；同一字体文件覆盖拉丁文、德文扩展、俄文、西里尔文、简体
+中文、日文假名/汉字和韩文。
+
 推荐在 **Developer PowerShell for VS 2026** 中使用 Ninja：
 
 ```powershell

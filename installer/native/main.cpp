@@ -34,6 +34,8 @@ using Microsoft::WRL::ComPtr;
 constexpr wchar_t kProductName[] = L"CD.404";
 constexpr wchar_t kPublisher[] = L"CD.404 contributors";
 constexpr wchar_t kApplicationFile[] = L"CD.404.exe";
+constexpr wchar_t kFontFile[] = L"NotoSansCJKsc-VF.ttf";
+constexpr wchar_t kFontLicenseFile[] = L"OFL-1.1.txt";
 constexpr wchar_t kUninstallerFile[] = L"Uninstall.exe";
 constexpr wchar_t kInstallMarkerFile[] = L".cd404-install";
 constexpr char kInstallMarker[] = "CD.404 native installer v1\n";
@@ -177,6 +179,8 @@ void show_message(
     const auto application = resource_bytes(IDR_CD404_APPLICATION);
     const auto privacy = resource_bytes(IDR_CD404_PRIVACY);
     const auto notices = resource_bytes(IDR_CD404_NOTICES);
+    const auto font = resource_bytes(IDR_CD404_FONT);
+    const auto font_license = resource_bytes(IDR_CD404_FONT_LICENSE);
     if (!application || application->size() < 2U) {
         return 11;
     }
@@ -186,11 +190,23 @@ void show_message(
     if (!notices) {
         return 13;
     }
+    if (!font || font->size() < 4U) {
+        return 18;
+    }
+    if (!font_license || font_license->empty()) {
+        return 21;
+    }
     const auto first = std::to_integer<unsigned char>((*application)[0]);
     const auto second = std::to_integer<unsigned char>((*application)[1]);
     if (first != static_cast<unsigned char>('M') ||
         second != static_cast<unsigned char>('Z')) {
         return 14;
+    }
+    if (std::to_integer<unsigned char>((*font)[0]) != 0x00U ||
+        std::to_integer<unsigned char>((*font)[1]) != 0x01U ||
+        std::to_integer<unsigned char>((*font)[2]) != 0x00U ||
+        std::to_integer<unsigned char>((*font)[3]) != 0x00U) {
+        return 19;
     }
     const auto destination = default_install_directory();
     if (destination.empty()) {
@@ -201,6 +217,32 @@ void show_message(
     }
     return destination.parent_path().filename() == L"Programs" ? 0 : 17;
 }
+
+struct EmbeddedFontRegistration final {
+    HANDLE handle{};
+
+    EmbeddedFontRegistration()
+    {
+        const auto font = resource_bytes(IDR_CD404_FONT);
+        DWORD count{};
+        if (font) {
+            handle = AddFontMemResourceEx(
+                const_cast<std::byte*>(font->data()),
+                static_cast<DWORD>(font->size()),
+                nullptr,
+                &count);
+        }
+    }
+
+    ~EmbeddedFontRegistration()
+    {
+        if (handle != nullptr) {
+            static_cast<void>(RemoveFontMemResourceEx(handle));
+        }
+    }
+
+    [[nodiscard]] bool loaded() const noexcept { return handle != nullptr; }
+};
 
 [[nodiscard]] bool write_all(
     const HANDLE file,
@@ -970,7 +1012,10 @@ void remove_autoplay_registration(
     const auto application = resource_bytes(IDR_CD404_APPLICATION);
     const auto privacy = resource_bytes(IDR_CD404_PRIVACY);
     const auto notices = resource_bytes(IDR_CD404_NOTICES);
-    if (directory.empty() || self.empty() || !application || !privacy || !notices) {
+    const auto font = resource_bytes(IDR_CD404_FONT);
+    const auto font_license = resource_bytes(IDR_CD404_FONT_LICENSE);
+    if (directory.empty() || self.empty() || !application || !privacy || !notices ||
+        !font || !font_license) {
         error = ERROR_RESOURCE_DATA_NOT_FOUND;
         return false;
     }
@@ -984,8 +1029,22 @@ void remove_autoplay_registration(
         error = static_cast<DWORD>(filesystem_error.value());
         return false;
     }
+    std::filesystem::create_directories(directory / L"fonts", filesystem_error);
+    if (filesystem_error) {
+        error = static_cast<DWORD>(filesystem_error.value());
+        return false;
+    }
     progress(22, L"正在安装 CD.404…");
     if (!replace_with_bytes(directory / kApplicationFile, *application, error)) {
+        return false;
+    }
+    if (!replace_with_bytes(directory / L"fonts" / kFontFile, *font, error)) {
+        return false;
+    }
+    if (!replace_with_bytes(
+            directory / L"fonts" / kFontLicenseFile,
+            *font_license,
+            error)) {
         return false;
     }
     progress(52, L"正在安装隐私与许可说明…");
@@ -1028,7 +1087,8 @@ void remove_autoplay_registration(
     progress(96, L"正在登记 Windows 卸载信息…");
     const bool registered = write_uninstall_registration(
         directory,
-        application->size() + privacy->size() + notices->size() +
+        application->size() + privacy->size() + notices->size() + font->size() +
+            font_license->size() +
             std::filesystem::file_size(self, filesystem_error),
         error);
     if (registered) {
@@ -1390,6 +1450,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
         return 1;
     }
     const std::span arguments(values, static_cast<std::size_t>(count));
+    const EmbeddedFontRegistration bundled_font;
+    if (!bundled_font.loaded()) {
+        LocalFree(values);
+        return 20;
+    }
     const bool silent = has_argument(arguments, L"/silent");
     const auto current_module = module_path();
     const bool installed_uninstaller =
@@ -1472,12 +1537,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
     const auto application = resource_bytes(IDR_CD404_APPLICATION);
     const auto privacy = resource_bytes(IDR_CD404_PRIVACY);
     const auto notices = resource_bytes(IDR_CD404_NOTICES);
+    const auto font = resource_bytes(IDR_CD404_FONT);
+    const auto font_license = resource_bytes(IDR_CD404_FONT_LICENSE);
     std::error_code filesystem_error;
     const auto self_size = std::filesystem::file_size(module_path(), filesystem_error);
     const std::uint64_t required =
         (application ? application->size() : 0U) +
         (privacy ? privacy->size() : 0U) +
         (notices ? notices->size() : 0U) +
+        (font ? font->size() : 0U) +
+        (font_license ? font_license->size() : 0U) +
         (filesystem_error ? 0U : self_size);
     const bool updating = std::filesystem::exists(
         directory / kApplicationFile, filesystem_error);

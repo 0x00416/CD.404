@@ -16,6 +16,9 @@ $installDirectory = [IO.Path]::GetFullPath($InstallDirectory)
 $migratedDirectory = "$installDirectory-Moved"
 $installedApplication = Join-Path $installDirectory 'CD.404.exe'
 $uninstaller = Join-Path $installDirectory 'Uninstall.exe'
+$installedFont = Join-Path $installDirectory 'fonts\NotoSansCJKsc-VF.ttf'
+$installedFontLicense = Join-Path $installDirectory 'fonts\OFL-1.1.txt'
+$expectedFont = Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fonts\NotoSansCJKsc-VF.ttf'
 $startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\CD.404.lnk'
 $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CD.404.lnk'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CD.404'
@@ -55,6 +58,8 @@ foreach ($required in @(
     $uninstaller,
     (Join-Path $installDirectory 'docs\PRIVACY.md'),
     (Join-Path $installDirectory 'THIRD_PARTY_NOTICES.md'),
+    $installedFont,
+    $installedFontLicense,
     (Join-Path $installDirectory '.cd404-install'),
     $startMenuShortcut,
     $uninstallKey
@@ -70,6 +75,11 @@ $expectedHash = (Get-FileHash -LiteralPath $expectedApplicationPath -Algorithm S
 $installedHash = (Get-FileHash -LiteralPath $installedApplication -Algorithm SHA256).Hash
 if ($expectedHash -ne $installedHash) {
     throw 'The installed application does not match the Release application payload.'
+}
+$expectedFontHash = (Get-FileHash -LiteralPath $expectedFont -Algorithm SHA256).Hash
+$installedFontHash = (Get-FileHash -LiteralPath $installedFont -Algorithm SHA256).Hash
+if ($expectedFontHash -ne $installedFontHash) {
+    throw 'The installed Noto Sans CJK font does not match the source asset.'
 }
 
 

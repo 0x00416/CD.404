@@ -9,6 +9,9 @@ $required = @(
     'docs/RELEASE_CHECKLIST.md',
     'docs/HARDWARE_VALIDATION.md',
     'THIRD_PARTY_NOTICES.md',
+    'assets/fonts/NotoSansCJKsc-VF.ttf',
+    'assets/fonts/OFL-1.1.txt',
+    'assets/fonts/README.md',
     'installer/native/CMakeLists.txt',
     'installer/native/main.cpp',
     'installer/native/wizard.cpp',
@@ -24,6 +27,12 @@ foreach ($relative in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $relative) -PathType Leaf)) {
         throw "Required release file is missing: $relative"
     }
+}
+
+$font = Join-Path $repoRoot 'assets/fonts/NotoSansCJKsc-VF.ttf'
+$fontHash = (Get-FileHash -LiteralPath $font -Algorithm SHA256).Hash
+if ($fontHash -ne '990C807E79C25662A5A9ECF7F971BAEB2BF2EAB9A559E5ECF15CDFDB8561D21F') {
+    throw "Bundled Noto Sans CJK font hash mismatch: $fontHash"
 }
 
 $cmake = Get-Content -LiteralPath (Join-Path $repoRoot 'CMakeLists.txt') -Raw

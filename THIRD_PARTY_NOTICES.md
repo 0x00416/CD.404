@@ -7,6 +7,15 @@ CD.404 不嵌入浏览器运行时，也不随安装包分发第三方动态库�
 Windows 自带 SQLite 接口）；Release 使用静态 MSVC 运行库。相应组件仍受 Microsoft
 Windows 与 Visual Studio Build Tools 的许可条款约束。
 
+字体：
+
+- 界面随程序分发 Noto Sans CJK SC Variable Font，来源于 Noto CJK 项目：
+  <https://github.com/notofonts/noto-cjk>
+- 字体采用 SIL Open Font License 1.1。完整许可文本安装在
+  `fonts/OFL-1.1.txt`，仓库副本位于 `assets/fonts/OFL-1.1.txt`。
+- 字体仅以 `FR_PRIVATE` 加载到 CD.404/安装器进程，不安装到 Windows 字体目录，
+  进程退出后由系统移除私有注册。
+
 在线元数据/服务说明：
 
 - MusicBrainz 核心数据库采用 CC0；其补充数据可能采用 CC BY-NC-SA 3.0。CD.404 显示
@@ -27,5 +36,5 @@ Windows 与 Visual Studio Build Tools 的许可条款约束。
 
 安装包由项目内的原生 Win32 安装器生成，不依赖或分发 Inno Setup、WiX 等第三方打包程序。
 
-若正式发行加入新的代码库、字体、图标、音频或其他资源，发布者必须在签名之前更新
+若正式发行加入新的代码库、图标、音频或其他资源，发布者必须在签名之前更新
 本文件并附上其完整许可文本（如许可要求）。

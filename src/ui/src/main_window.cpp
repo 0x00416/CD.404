@@ -17,6 +17,7 @@
 #include <cd404/core/lyrics.hpp>
 #include <cd404/listenbrainz/playback_tracker.hpp>
 #include <cd404/platform/windows/autoplay_policy.hpp>
+#include <cd404/platform/windows/bundled_font.hpp>
 #include <cd404/platform/windows/cdda_playback_engine.hpp>
 #include <cd404/platform/windows/device_lifecycle.hpp>
 #include <cd404/platform/windows/diagnostics.hpp>
@@ -28,6 +29,7 @@
 #include <cd404/platform/windows/system_media_controls.hpp>
 #include <cd404/platform/windows/user_settings.hpp>
 #include <cd404/ui/animation_timing.hpp>
+#include <cd404/ui/font_rendering.hpp>
 #include <cd404/ui/main_window.hpp>
 #include <cd404/ui/metadata_source_model.hpp>
 #include <cd404/ui/playback_presenter.hpp>
@@ -39,6 +41,7 @@
 #include "ui_layout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -99,6 +102,7 @@ constexpr int kLyricsOffsetDelay10Id = 1'254;
 constexpr int kLyricsOffsetDelay100Id = 1'255;
 constexpr int kLyricsOffsetResetId = 1'256;
 constexpr int kLyricsOffsetApplyId = 1'257;
+constexpr int kLyricsOffsetUnitId = 1'258;
 constexpr UINT_PTR kMaintenanceTimer = 1;
 constexpr UINT kMaintenanceIntervalMs = 50;
 constexpr UINT_PTR kSettingsScrollSettleTimer = 2;
@@ -779,7 +783,12 @@ private:
         case WM_ENTERSIZEMOVE:
             cancel_settings_scroll_session();
             window_resizing_ = true;
-            hide_active_input_controls();
+            // Settings inputs are fully owner-painted now. Keep them visible
+            // while DWM moves or resizes the top-level window instead of
+            // replacing their text with an empty parent snapshot.
+            if (active_page_ != AppPage::settings) {
+                hide_active_input_controls();
+            }
             return 0;
         case WM_EXITSIZEMOVE:
             window_resizing_ = false;
@@ -802,7 +811,11 @@ private:
                 static_cast<void>(render_target_->Resize(D2D1::SizeU(width, height)));
             }
             InvalidateRect(window_, nullptr, FALSE);
-            if (!window_resizing_) {
+            if (window_resizing_ && active_page_ == AppPage::settings) {
+                // WM_PAINT recalculates layout_, then moves and repaints each
+                // DirectWrite input in the same interactive resize frame.
+                static_cast<void>(UpdateWindow(window_));
+            } else if (!window_resizing_) {
                 finish_input_control_relayout();
             }
             return 0;
@@ -958,9 +971,18 @@ private:
         }
         case WM_CTLCOLOREDIT:
             if (reinterpret_cast<HWND>(lparam) == settings_token_edit_ ||
-                reinterpret_cast<HWND>(lparam) == metadata_edit_ ||
                 reinterpret_cast<HWND>(lparam) == settings_cddb_server_edit_ ||
-                reinterpret_cast<HWND>(lparam) == settings_cddb_email_edit_ ||
+                reinterpret_cast<HWND>(lparam) == settings_cddb_email_edit_) {
+                const auto device_context = reinterpret_cast<HDC>(wparam);
+                // The native EDIT is only the text/IME/clipboard backend. Its
+                // GDI glyphs stay invisible; DirectWrite owns every visible
+                // glyph plus selection, caret, hit-testing and scrolling.
+                SetTextColor(device_context, colorref(theme_.elevated));
+                SetBkColor(device_context, colorref(theme_.elevated));
+                SetBkMode(device_context, OPAQUE);
+                return reinterpret_cast<LRESULT>(settings_edit_brush_);
+            }
+            if (reinterpret_cast<HWND>(lparam) == metadata_edit_ ||
                 is_metadata_edit(reinterpret_cast<HWND>(lparam))) {
                 const auto device_context = reinterpret_cast<HDC>(wparam);
                 SetTextColor(device_context, colorref(theme_.text));
@@ -1098,6 +1120,19 @@ private:
     struct SettingsDropdownHit final {
         D2D1_RECT_F rectangle{};
         std::size_t option_index{};
+    };
+
+    // DirectWrite owns the visible geometry and pointer interaction for every
+    // settings input.  The native EDIT remains the text/IME/clipboard backend,
+    // but its GDI layout is deliberately not used for hit-testing or scrolling.
+    struct SettingsEditInteractionState final {
+        HWND edit{};
+        ComPtr<IDWriteTextLayout> layout;
+        float scroll_x{};
+        float origin_x{2.0F};
+        DWORD anchor{};
+        DWORD caret{};
+        bool selecting{};
     };
 
     enum class MetadataEditField {
@@ -1247,7 +1282,7 @@ private:
         ComPtr<IDWriteTextFormat>& target)
     {
         const HRESULT result = write_factory_->CreateTextFormat(
-            L"Segoe UI",
+            platform::windows::kBundledFontFamily,
             nullptr,
             weight,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1277,6 +1312,14 @@ private:
             D2D1::HwndRenderTargetProperties(window_, size),
             render_target_.ReleaseAndGetAddressOf());
         if (FAILED(result)) {
+            return result;
+        }
+
+        result = configure_text_rendering(
+            *render_target_.Get(),
+            *write_factory_.Get());
+        if (FAILED(result)) {
+            discard_device_resources();
             return result;
         }
 
@@ -1823,15 +1866,20 @@ private:
             muted_brush_.Get());
 
         const float device_left = layout_.width < 960.0F ? 202.0F : 224.0F;
-        const float device_right = std::min(layout_.width - 360.0F, 540.0F);
+        const float device_right = std::min(layout_.width - 408.0F, 540.0F);
         const auto device_pill = D2D1::RoundedRect(
             D2D1::RectF(device_left, 12.0F, device_right, 52.0F),
             10.0F,
             10.0F);
         render_target_->FillRoundedRectangle(device_pill, surface_brush_.Get());
         render_target_->DrawRoundedRectangle(device_pill, border_brush_.Get(), 1.0F);
+        const float device_center_y =
+            (device_pill.rect.top + device_pill.rect.bottom) * 0.5F;
         render_target_->FillEllipse(
-            D2D1::Ellipse(D2D1::Point2F(device_left + 20.0F, 32.0F), 4.0F, 4.0F),
+            D2D1::Ellipse(
+                D2D1::Point2F(device_left + 20.0F, device_center_y),
+                4.0F,
+                4.0F),
             disc_.tracks.empty() ? warning_brush_.Get() : success_brush_.Get());
         const std::wstring drive_label = disc_.has_optical_drive
             ? L"音频 CD · 光驱"
@@ -1839,16 +1887,22 @@ private:
         draw_text(
             drive_label,
             body_format_.Get(),
-            D2D1::RectF(device_left + 34.0F, 19.0F, device_right - 12.0F, 47.0F),
-            text_brush_.Get());
+            D2D1::RectF(
+                device_left + 34.0F,
+                device_pill.rect.top,
+                device_right - 12.0F,
+                device_pill.rect.bottom),
+            text_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         const float status_left = device_right + 18.0F;
         if ((disc_loading_ || disc_.tracks.empty()) &&
-            status_left < layout_.width - 178.0F) {
+            status_left < layout_.width - 226.0F) {
             draw_text(
                 disc_loading_ ? L"正在读取目录…" : disc_.status,
                 small_format_.Get(),
-                D2D1::RectF(status_left, 21.0F, layout_.width - 180.0F, 48.0F),
+                D2D1::RectF(status_left, 21.0F, layout_.width - 228.0F, 48.0F),
                 secondary_brush_.Get());
         }
 
@@ -2342,6 +2396,9 @@ private:
         render_target_->PushAxisAlignedClip(
             area,
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const D2D1_TEXT_ANTIALIAS_MODE previous_text_antialias_mode =
+            render_target_->GetTextAntialiasMode();
+        render_target_->SetTextAntialiasMode(kAnimatedTextAntialiasMode);
         for (std::size_t visual_index{};
              visual_index < context.size(); ++visual_index) {
             const auto& item = context[visual_index];
@@ -2395,6 +2452,7 @@ private:
                 top += sentence_gap * scale;
             }
         }
+        render_target_->SetTextAntialiasMode(previous_text_antialias_mode);
         render_target_->PopAxisAlignedClip();
     }
 
@@ -3453,6 +3511,13 @@ private:
                 &metrics,
                 0);
         }
+        static_cast<void>(wcscpy_s(
+            metrics.lfMenuFont.lfFaceName,
+            platform::windows::kBundledFontFamily));
+        metrics.lfMenuFont.lfCharSet = DEFAULT_CHARSET;
+        metrics.lfMenuFont.lfOutPrecision = OUT_TT_ONLY_PRECIS;
+        metrics.lfMenuFont.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+        metrics.lfMenuFont.lfPitchAndFamily = DEFAULT_PITCH | FF_SWISS;
         menu_font_ = CreateFontIndirectW(&metrics.lfMenuFont);
         if (menu_font_ == nullptr) {
             menu_font_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
@@ -3511,29 +3576,48 @@ private:
         }
         SetBkMode(draw.hDC, TRANSPARENT);
         SetTextColor(draw.hDC, colorref(theme_.text));
-        const HGDIOBJ previous = SelectObject(
-            draw.hDC,
-            menu_font_ != nullptr ? menu_font_ : GetStockObject(DEFAULT_GUI_FONT));
+        const HFONT font = menu_font_ != nullptr
+            ? menu_font_
+            : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         RECT text_rectangle = draw.rcItem;
         text_rectangle.left += 14;
         text_rectangle.right -= item->submenu ? 30 : 14;
-        DrawTextW(
-            draw.hDC,
-            item->text.c_str(),
-            static_cast<int>(item->text.size()),
-            &text_rectangle,
-            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        if (!draw_directwrite_text_to_hdc(
+                draw.hDC,
+                text_rectangle,
+                item->text,
+                colorref(theme_.text),
+                font,
+                DWRITE_TEXT_ALIGNMENT_LEADING)) {
+            const HGDIOBJ previous = SelectObject(draw.hDC, font);
+            DrawTextW(
+                draw.hDC,
+                item->text.c_str(),
+                static_cast<int>(item->text.size()),
+                &text_rectangle,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+            SelectObject(draw.hDC, previous);
+        }
         if (item->submenu) {
             RECT arrow = draw.rcItem;
             arrow.left = arrow.right - 24;
-            DrawTextW(
-                draw.hDC,
-                L"›",
-                1,
-                &arrow,
-                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            if (!draw_directwrite_text_to_hdc(
+                    draw.hDC,
+                    arrow,
+                    L"›",
+                    colorref(theme_.text),
+                    font,
+                    DWRITE_TEXT_ALIGNMENT_CENTER)) {
+                const HGDIOBJ previous = SelectObject(draw.hDC, font);
+                DrawTextW(
+                    draw.hDC,
+                    L"›",
+                    1,
+                    &arrow,
+                    DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+                SelectObject(draw.hDC, previous);
+            }
         }
-        SelectObject(draw.hDC, previous);
     }
 
     static void append_dark_menu_item(
@@ -3701,6 +3785,13 @@ private:
                     &metrics,
                     0);
             }
+            static_cast<void>(wcscpy_s(
+                metrics.lfMessageFont.lfFaceName,
+                platform::windows::kBundledFontFamily));
+            metrics.lfMessageFont.lfCharSet = DEFAULT_CHARSET;
+            metrics.lfMessageFont.lfOutPrecision = OUT_TT_ONLY_PRECIS;
+            metrics.lfMessageFont.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+            metrics.lfMessageFont.lfPitchAndFamily = DEFAULT_PITCH | FF_SWISS;
             settings_font_ = CreateFontIndirectW(&metrics.lfMessageFont);
             if (settings_font_ == nullptr) {
                 settings_font_ = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
@@ -3765,12 +3856,28 @@ private:
             ReleaseDC(reference, context);
         }
         const int fallback = MulDiv(15, static_cast<int>(dpi), 96);
-        const int text_height = metrics.tmHeight > 0 ? metrics.tmHeight : fallback;
-        const int vertical_padding = MulDiv(6, static_cast<int>(dpi), 96);
+        const int text_height = metrics.tmHeight > 0
+            ? metrics.tmHeight + metrics.tmExternalLeading
+            : fallback;
+        // Keep the borderless native edit close to the font line box; the
+        // Direct2D field then centres this smaller control as one unit.
+        const int vertical_padding = MulDiv(2, static_cast<int>(dpi), 96);
         const int edge_height = client_edge
             ? GetSystemMetricsForDpi(SM_CYEDGE, dpi) * 2
             : 0;
         return text_height + vertical_padding + edge_height;
+    }
+
+    [[nodiscard]] int visually_centered_edit_top(
+        const HWND /*edit*/,
+        const int /*field_top*/,
+        const int /*field_height*/,
+        const int fallback_top) const
+    {
+        // The edit text is now laid out and vertically centred by DirectWrite.
+        // Compensating for the native GDI edit baseline would move the entire
+        // child window away from the centre of its Direct2D field.
+        return fallback_top;
     }
 
     void open_lyrics_search_window()
@@ -3887,7 +3994,8 @@ private:
             SetWindowLongPtrW(
                 lyrics_search_edit_,
                 GWLP_WNDPROC,
-                reinterpret_cast<LONG_PTR>(lyrics_search_edit_window_proc)));
+                reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
+        register_settings_edit(lyrics_search_edit_);
         const float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0F;
         SendMessageW(
             lyrics_search_list_,
@@ -3901,34 +4009,6 @@ private:
         SetWindowTextW(lyrics_search_edit_, keywords.c_str());
         EnableWindow(lyrics_search_apply_, FALSE);
         update_lyrics_search_layout(window);
-    }
-
-    static LRESULT CALLBACK lyrics_search_edit_window_proc(
-        const HWND edit,
-        const UINT message,
-        const WPARAM wparam,
-        const LPARAM lparam)
-    {
-        auto* self = reinterpret_cast<MainWindow*>(
-            GetWindowLongPtrW(edit, GWLP_USERDATA));
-        if (self != nullptr && message == WM_KEYDOWN) {
-            if (wparam == VK_RETURN) {
-                self->start_manual_lyrics_search();
-                return 0;
-            }
-            if (wparam == VK_ESCAPE && self->lyrics_search_window_ != nullptr) {
-                DestroyWindow(self->lyrics_search_window_);
-                return 0;
-            }
-        }
-        return self != nullptr && self->lyrics_search_edit_original_proc_ != nullptr
-            ? CallWindowProcW(
-                  self->lyrics_search_edit_original_proc_,
-                  edit,
-                  message,
-                  wparam,
-                  lparam)
-            : DefWindowProcW(edit, message, wparam, lparam);
     }
 
     void update_lyrics_search_layout(const HWND window) const
@@ -3947,9 +4027,17 @@ private:
         const int action_height = static_cast<int>(std::lround(34.0F * scale));
         const int width = client.right - client.left;
         const int height = client.bottom - client.top;
+        const int search_edit_width = width - margin * 2 - button_width - gap;
+        const int search_edit_fallback_top = margin + (row - edit_height) / 2;
         SetWindowPos(lyrics_search_edit_, nullptr,
-            margin, margin + (row - edit_height) / 2,
-            width - margin * 2 - button_width - gap, edit_height,
+            margin, search_edit_fallback_top,
+            search_edit_width, edit_height,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        SetWindowPos(lyrics_search_edit_, nullptr,
+            margin,
+            visually_centered_edit_top(
+                lyrics_search_edit_, margin, row, search_edit_fallback_top),
+            search_edit_width, edit_height,
             SWP_NOACTIVATE | SWP_NOZORDER);
         SetWindowPos(lyrics_search_button_, nullptr,
             width - margin - button_width, margin, button_width, row,
@@ -4081,10 +4169,10 @@ private:
             0,
             L"STATIC",
             L"ms",
-            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+            WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
             0, 0, 1, 1,
             window,
-            nullptr,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLyricsOffsetUnitId)),
             instance_,
             nullptr);
         lyrics_offset_delay10_ = create_button(kLyricsOffsetDelay10Id, L"延后 10");
@@ -4114,37 +4202,10 @@ private:
             SetWindowLongPtrW(
                 lyrics_offset_edit_,
                 GWLP_WNDPROC,
-                reinterpret_cast<LONG_PTR>(lyrics_offset_edit_window_proc)));
+                reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
+        register_settings_edit(lyrics_offset_edit_);
         update_lyrics_offset_edit_value();
         update_lyrics_offset_layout(window);
-    }
-
-    static LRESULT CALLBACK lyrics_offset_edit_window_proc(
-        const HWND edit,
-        const UINT message,
-        const WPARAM wparam,
-        const LPARAM lparam)
-    {
-        auto* self = reinterpret_cast<MainWindow*>(
-            GetWindowLongPtrW(edit, GWLP_USERDATA));
-        if (self != nullptr && message == WM_KEYDOWN) {
-            if (wparam == VK_RETURN) {
-                self->apply_lyrics_offset_edit();
-                return 0;
-            }
-            if (wparam == VK_ESCAPE && self->lyrics_offset_window_ != nullptr) {
-                DestroyWindow(self->lyrics_offset_window_);
-                return 0;
-            }
-        }
-        return self != nullptr && self->lyrics_offset_edit_original_proc_ != nullptr
-            ? CallWindowProcW(
-                  self->lyrics_offset_edit_original_proc_,
-                  edit,
-                  message,
-                  wparam,
-                  lparam)
-            : DefWindowProcW(edit, message, wparam, lparam);
     }
 
     void update_lyrics_offset_layout(const HWND window) const
@@ -4175,8 +4236,18 @@ private:
         SetWindowPos(lyrics_offset_advance10_, nullptr, x, margin, step_width, row,
             SWP_NOACTIVATE | SWP_NOZORDER);
         x += step_width + gap;
-        SetWindowPos(lyrics_offset_edit_, nullptr, x, margin + (row - edit_height) / 2,
+        const int offset_edit_fallback_top = margin + (row - edit_height) / 2;
+        SetWindowPos(lyrics_offset_edit_, nullptr, x, offset_edit_fallback_top,
             edit_width, edit_height, SWP_NOACTIVATE | SWP_NOZORDER);
+        SetWindowPos(
+            lyrics_offset_edit_,
+            nullptr,
+            x,
+            visually_centered_edit_top(
+                lyrics_offset_edit_, margin, row, offset_edit_fallback_top),
+            edit_width,
+            edit_height,
+            SWP_NOACTIVATE | SWP_NOZORDER);
         x += edit_width;
         SetWindowPos(lyrics_offset_unit_, nullptr, x, margin, unit_width, row,
             SWP_NOACTIVATE | SWP_NOZORDER);
@@ -4500,7 +4571,7 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
-    void draw_lyrics_search_item(const DRAWITEMSTRUCT& draw) const
+    void draw_lyrics_search_item(const DRAWITEMSTRUCT& draw)
     {
         if (draw.itemID == static_cast<UINT>(-1) ||
             draw.itemID >= lyrics_search_items_.size()) {
@@ -4520,35 +4591,51 @@ private:
         primary.right -= 12;
         primary.top += 4;
         primary.bottom = middle + 2;
-        SetTextColor(draw.hDC, colorref(theme_.text));
         const std::wstring title = std::format(
             L"[{}]  {} — {}",
             item.source,
             item.identity.title,
             item.identity.artist);
-        DrawTextW(draw.hDC, title.c_str(), -1, &primary,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (!draw_directwrite_text_to_hdc(
+                draw.hDC,
+                primary,
+                title,
+                colorref(theme_.text),
+                settings_font_,
+                DWRITE_TEXT_ALIGNMENT_LEADING)) {
+            SetTextColor(draw.hDC, colorref(theme_.text));
+            DrawTextW(draw.hDC, title.c_str(), -1, &primary,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
         RECT secondary = draw.rcItem;
         secondary.left += 14;
         secondary.right -= 12;
         secondary.top = middle - 2;
         secondary.bottom -= 4;
-        SetTextColor(draw.hDC, colorref(theme_.secondary));
         const std::wstring details = std::format(
             L"{}  ·  {}",
             item.identity.album.empty() ? L"未标注专辑" : item.identity.album,
             format_duration(
                 item.identity.duration_milliseconds *
                 core::kCdSampleFramesPerSecond / 1'000));
-        DrawTextW(draw.hDC, details.c_str(), -1, &secondary,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (!draw_directwrite_text_to_hdc(
+                draw.hDC,
+                secondary,
+                details,
+                colorref(theme_.secondary),
+                settings_font_,
+                DWRITE_TEXT_ALIGNMENT_LEADING)) {
+            SetTextColor(draw.hDC, colorref(theme_.secondary));
+            DrawTextW(draw.hDC, details.c_str(), -1, &secondary,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
         SelectObject(draw.hDC, previous);
         if ((draw.itemState & ODS_FOCUS) != 0U) {
             DrawFocusRect(draw.hDC, &draw.rcItem);
         }
     }
 
-    void draw_lyrics_search_button(const DRAWITEMSTRUCT& draw) const
+    void draw_lyrics_search_button(const DRAWITEMSTRUCT& draw)
     {
         const bool disabled = (draw.itemState & ODS_DISABLED) != 0U;
         const bool pressed = (draw.itemState & ODS_SELECTED) != 0U;
@@ -4565,13 +4652,46 @@ private:
         wchar_t text[64]{};
         GetWindowTextW(draw.hwndItem, text, static_cast<int>(std::size(text)));
         SetBkMode(draw.hDC, TRANSPARENT);
-        SetTextColor(draw.hDC, colorref(
-            disabled ? theme_.muted : primary ? theme_.accent_text : theme_.text));
         const HGDIOBJ previous = SelectObject(draw.hDC, settings_font_);
         RECT rectangle = draw.rcItem;
-        DrawTextW(draw.hDC, text, -1, &rectangle,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        const COLORREF text_color = colorref(
+            disabled ? theme_.muted : primary ? theme_.accent_text : theme_.text);
+        if (!draw_directwrite_text_to_hdc(
+                draw.hDC,
+                rectangle,
+                text,
+                text_color,
+                settings_font_,
+                DWRITE_TEXT_ALIGNMENT_CENTER)) {
+            SetTextColor(draw.hDC, text_color);
+            DrawTextW(draw.hDC, text, -1, &rectangle,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
         SelectObject(draw.hDC, previous);
+    }
+
+    void draw_lyrics_offset_unit(const DRAWITEMSTRUCT& draw)
+    {
+        const HBRUSH background = CreateSolidBrush(colorref(theme_.background));
+        FillRect(draw.hDC, &draw.rcItem, background);
+        DeleteObject(background);
+        wchar_t text[16]{};
+        GetWindowTextW(draw.hwndItem, text, static_cast<int>(std::size(text)));
+        RECT rectangle = draw.rcItem;
+        if (!draw_directwrite_text_to_hdc(
+                draw.hDC,
+                rectangle,
+                text,
+                colorref(theme_.secondary),
+                settings_font_,
+                DWRITE_TEXT_ALIGNMENT_CENTER)) {
+            SetBkMode(draw.hDC, TRANSPARENT);
+            SetTextColor(draw.hDC, colorref(theme_.secondary));
+            const HGDIOBJ previous = SelectObject(draw.hDC, settings_font_);
+            DrawTextW(draw.hDC, text, -1, &rectangle,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(draw.hDC, previous);
+        }
     }
 
     LRESULT handle_lyrics_search_message(
@@ -4614,7 +4734,11 @@ private:
         case WM_CTLCOLORSTATIC: {
             const HDC context = reinterpret_cast<HDC>(wparam);
             SetTextColor(context, colorref(
-                message == WM_CTLCOLORSTATIC ? theme_.secondary : theme_.text));
+                message == WM_CTLCOLOREDIT
+                    ? theme_.elevated
+                    : message == WM_CTLCOLORSTATIC
+                        ? theme_.secondary
+                        : theme_.text));
             SetBkColor(context, colorref(theme_.elevated));
             SetBkMode(context, OPAQUE);
             return reinterpret_cast<LRESULT>(settings_edit_brush_);
@@ -4670,6 +4794,7 @@ private:
             DestroyWindow(window);
             return 0;
         case WM_NCDESTROY:
+            unregister_settings_edit(lyrics_search_edit_);
             lyrics_search_window_ = nullptr;
             lyrics_search_edit_ = nullptr;
             lyrics_search_button_ = nullptr;
@@ -4723,13 +4848,17 @@ private:
         case WM_CTLCOLORSTATIC: {
             const HDC context = reinterpret_cast<HDC>(wparam);
             SetTextColor(context, colorref(
-                message == WM_CTLCOLORSTATIC ? theme_.secondary : theme_.text));
+                message == WM_CTLCOLOREDIT ? theme_.elevated : theme_.secondary));
             SetBkColor(context, colorref(theme_.elevated));
             SetBkMode(context, OPAQUE);
             return reinterpret_cast<LRESULT>(settings_edit_brush_);
         }
         case WM_DRAWITEM: {
             const auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+            if (draw != nullptr && draw->CtlID == kLyricsOffsetUnitId) {
+                draw_lyrics_offset_unit(*draw);
+                return TRUE;
+            }
             if (draw != nullptr &&
                 (draw->CtlID == kLyricsOffsetAdvance100Id ||
                  draw->CtlID == kLyricsOffsetAdvance10Id ||
@@ -4779,6 +4908,7 @@ private:
             DestroyWindow(window);
             return 0;
         case WM_NCDESTROY:
+            unregister_settings_edit(lyrics_offset_edit_);
             lyrics_offset_window_ = nullptr;
             lyrics_offset_edit_ = nullptr;
             lyrics_offset_unit_ = nullptr;
@@ -4868,7 +4998,6 @@ private:
         if (contains(layout_.metadata_button, point)) return HoveredControl::metadata;
         return HoveredControl::none;
     }
-
     void handle_click(const D2D1_POINT_2F point)
     {
         for (const auto& hit : track_hits_) {
@@ -5971,6 +6100,15 @@ private:
     {
         auto* self = reinterpret_cast<MainWindow*>(
             GetWindowLongPtrW(edit, GWLP_USERDATA));
+
+        if (self != nullptr && message == WM_PAINT && GetFocus() != edit &&
+            self->paint_unfocused_edit(edit)) {
+            return 0;
+        }
+        if (self != nullptr &&
+            (message == WM_SETFOCUS || message == WM_KILLFOCUS)) {
+            InvalidateRect(edit, nullptr, TRUE);
+        }
         if (self != nullptr && message == WM_KEYDOWN) {
             if (wparam == VK_RETURN) {
                 PostMessageW(self->window_, kMetadataEditSaveMessage, 0, 0);
@@ -6081,15 +6219,25 @@ private:
         const int edit_height = std::min(
             row_height,
             preferred_edit_height(window_, true));
-        const int top = row_top + (row_height - edit_height) / 2;
+        const int fallback_top = row_top + (row_height - edit_height) / 2;
         RECT client{};
         GetClientRect(window_, &client);
+        const int width = std::max(static_cast<int>(client.right) - left * 2, 160);
         SetWindowPos(
             metadata_edit_,
             HWND_TOP,
             left,
-            top,
-            std::max(static_cast<int>(client.right) - left * 2, 160),
+            fallback_top,
+            width,
+            edit_height,
+            SWP_NOACTIVATE);
+        SetWindowPos(
+            metadata_edit_,
+            HWND_TOP,
+            left,
+            visually_centered_edit_top(
+                metadata_edit_, row_top, row_height, fallback_top),
+            width,
             edit_height,
             SWP_NOACTIVATE);
     }
@@ -6170,6 +6318,210 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
+    [[nodiscard]] SettingsEditInteractionState* settings_edit_state(
+        const HWND edit) noexcept
+    {
+        const auto found = std::find_if(
+            settings_edit_states_.begin(),
+            settings_edit_states_.end(),
+            [edit](const SettingsEditInteractionState& state) {
+                return state.edit == edit;
+            });
+        return found == settings_edit_states_.end() ? nullptr : &*found;
+    }
+
+    void register_settings_edit(const HWND edit)
+    {
+        if (edit == nullptr || settings_edit_state(edit) != nullptr) {
+            return;
+        }
+        const auto available = std::find_if(
+            settings_edit_states_.begin(),
+            settings_edit_states_.end(),
+            [](const SettingsEditInteractionState& state) {
+                return state.edit == nullptr;
+            });
+        if (available == settings_edit_states_.end()) {
+            return;
+        }
+        available->edit = edit;
+        DWORD start{};
+        DWORD end{};
+        SendMessageW(
+            edit,
+            EM_GETSEL,
+            reinterpret_cast<WPARAM>(&start),
+            reinterpret_cast<LPARAM>(&end));
+        available->anchor = start;
+        available->caret = end;
+    }
+
+    void unregister_settings_edit(const HWND edit) noexcept
+    {
+        if (auto* state = settings_edit_state(edit); state != nullptr) {
+            *state = {};
+        }
+    }
+
+    [[nodiscard]] WNDPROC directwrite_edit_original_proc(
+        const HWND edit) const noexcept
+    {
+        if (edit == lyrics_search_edit_) {
+            return lyrics_search_edit_original_proc_;
+        }
+        if (edit == lyrics_offset_edit_) {
+            return lyrics_offset_edit_original_proc_;
+        }
+        return settings_edit_original_proc_;
+    }
+
+    void sync_settings_edit_state_from_native(const HWND edit)
+    {
+        auto* state = settings_edit_state(edit);
+        if (state == nullptr) {
+            return;
+        }
+        DWORD start{};
+        DWORD end{};
+        SendMessageW(
+            edit,
+            EM_GETSEL,
+            reinterpret_cast<WPARAM>(&start),
+            reinterpret_cast<LPARAM>(&end));
+        const DWORD length = static_cast<DWORD>(std::max(0, GetWindowTextLengthW(edit)));
+        start = std::min(start, length);
+        end = std::min(end, length);
+        if (start == end) {
+            state->anchor = start;
+            state->caret = start;
+        } else if (state->anchor == start) {
+            state->caret = end;
+        } else if (state->anchor == end) {
+            state->caret = start;
+        } else {
+            state->anchor = start;
+            state->caret = end;
+        }
+    }
+
+    void apply_settings_edit_selection(
+        const HWND edit,
+        const DWORD anchor,
+        const DWORD caret,
+        const bool synchronize_native = true)
+    {
+        auto* state = settings_edit_state(edit);
+        const WNDPROC original = directwrite_edit_original_proc(edit);
+        if (state == nullptr || original == nullptr) {
+            return;
+        }
+        const DWORD length = static_cast<DWORD>(std::max(0, GetWindowTextLengthW(edit)));
+        const DWORD next_anchor = std::min(anchor, length);
+        const DWORD next_caret = std::min(caret, length);
+        const bool changed =
+            state->anchor != next_anchor || state->caret != next_caret;
+        state->anchor = next_anchor;
+        state->caret = next_caret;
+        const DWORD start = std::min(state->anchor, state->caret);
+        const DWORD end = std::max(state->anchor, state->caret);
+        if (synchronize_native) {
+            static_cast<void>(CallWindowProcW(
+                original,
+                edit,
+                EM_SETSEL,
+                static_cast<WPARAM>(start),
+                static_cast<LPARAM>(end)));
+            // EM_SETSEL may make the system caret visible again. The custom
+            // DirectWrite caret is the only caret that should reach the screen.
+            HideCaret(edit);
+        } else if (!changed) {
+            return;
+        }
+        static_cast<void>(RedrawWindow(
+            edit,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW));
+    }
+
+    [[nodiscard]] std::optional<DWORD> settings_edit_hit_test(
+        const HWND edit,
+        const LPARAM pointer) noexcept
+    {
+        auto* state = settings_edit_state(edit);
+        if (state == nullptr || state->layout == nullptr) {
+            return std::nullopt;
+        }
+        const UINT dpi = GetDpiForWindow(edit);
+        const float scale = 96.0F / static_cast<float>(std::max(1U, dpi));
+        RECT client{};
+        GetClientRect(edit, &client);
+        const int pointer_x = GET_X_LPARAM(pointer);
+        const DWORD length = static_cast<DWORD>(std::max(0, GetWindowTextLengthW(edit)));
+        if (pointer_x <= client.left) {
+            return 0U;
+        }
+        if (pointer_x >= client.right) {
+            return length;
+        }
+        const int pointer_y = std::clamp<int>(
+            GET_Y_LPARAM(pointer),
+            static_cast<int>(client.top),
+            static_cast<int>(std::max(client.top, client.bottom - 1)));
+        const float x = static_cast<float>(pointer_x) * scale - state->origin_x;
+        const float y = static_cast<float>(pointer_y) * scale;
+        BOOL trailing{};
+        BOOL inside{};
+        DWRITE_HIT_TEST_METRICS metrics{};
+        if (FAILED(state->layout->HitTestPoint(
+                x, y, &trailing, &inside, &metrics))) {
+            return std::nullopt;
+        }
+        const UINT32 position = metrics.textPosition +
+            (trailing != FALSE ? metrics.length : 0U);
+        return std::min<DWORD>(position, length);
+    }
+
+    void select_settings_edit_word(const HWND edit, const DWORD hit)
+    {
+        const int length = GetWindowTextLengthW(edit);
+        if (length <= 0) {
+            apply_settings_edit_selection(edit, 0, 0);
+            return;
+        }
+        if ((GetWindowLongPtrW(edit, GWL_STYLE) & ES_PASSWORD) != 0) {
+            apply_settings_edit_selection(edit, 0, static_cast<DWORD>(length));
+            return;
+        }
+        std::wstring text(static_cast<std::size_t>(length) + 1U, L'\0');
+        const int copied = GetWindowTextW(edit, text.data(), length + 1);
+        text.resize(static_cast<std::size_t>(std::max(0, copied)));
+        if (text.empty()) {
+            apply_settings_edit_selection(edit, 0, 0);
+            return;
+        }
+        std::size_t position = std::min<std::size_t>(hit, text.size() - 1U);
+        const auto character_class = [](const wchar_t value) {
+            if (std::iswalnum(value) != 0 || value == L'_' || value == L'-') {
+                return 0;
+            }
+            return std::iswspace(value) != 0 ? 1 : 2;
+        };
+        const int selected_class = character_class(text[position]);
+        std::size_t start = position;
+        std::size_t end = position + 1U;
+        while (start > 0U && character_class(text[start - 1U]) == selected_class) {
+            --start;
+        }
+        while (end < text.size() && character_class(text[end]) == selected_class) {
+            ++end;
+        }
+        apply_settings_edit_selection(
+            edit,
+            static_cast<DWORD>(start),
+            static_cast<DWORD>(end));
+    }
+
     static LRESULT CALLBACK settings_edit_window_proc(
         const HWND edit,
         const UINT message,
@@ -6178,13 +6530,42 @@ private:
     {
         auto* self = reinterpret_cast<MainWindow*>(
             GetWindowLongPtrW(edit, GWLP_USERDATA));
+
+        if (self != nullptr && message == WM_PAINT &&
+            self->paint_settings_edit(edit)) {
+            return 0;
+        }
+        if (self != nullptr && message == WM_ERASEBKGND) {
+            return 1;
+        }
+        if (self != nullptr && message == WM_TIMER && wparam == 1U) {
+            const auto* state = self->settings_edit_state(edit);
+            if (state != nullptr && state->anchor == state->caret) {
+                InvalidateRect(edit, nullptr, FALSE);
+            }
+            return 0;
+        }
         if (self != nullptr && message == WM_KEYDOWN) {
             if (wparam == VK_RETURN) {
-                PostMessageW(self->window_, kSettingsSaveMessage, 0, 0);
+                if (edit == self->lyrics_search_edit_) {
+                    self->start_manual_lyrics_search();
+                } else if (edit == self->lyrics_offset_edit_) {
+                    self->apply_lyrics_offset_edit();
+                } else {
+                    PostMessageW(self->window_, kSettingsSaveMessage, 0, 0);
+                }
                 return 0;
             }
             if (wparam == VK_ESCAPE) {
-                PostMessageW(self->window_, kSettingsCloseMessage, 0, 0);
+                if (edit == self->lyrics_search_edit_ &&
+                    self->lyrics_search_window_ != nullptr) {
+                    DestroyWindow(self->lyrics_search_window_);
+                } else if (edit == self->lyrics_offset_edit_ &&
+                           self->lyrics_offset_window_ != nullptr) {
+                    DestroyWindow(self->lyrics_offset_window_);
+                } else {
+                    PostMessageW(self->window_, kSettingsCloseMessage, 0, 0);
+                }
                 return 0;
             }
         }
@@ -6203,14 +6584,540 @@ private:
         if (self != nullptr && message == WM_GETDLGCODE) {
             return DLGC_WANTALLKEYS;
         }
-        return self != nullptr && self->settings_edit_original_proc_ != nullptr
-            ? CallWindowProcW(
-                  self->settings_edit_original_proc_,
-                  edit,
-                  message,
-                  wparam,
-                  lparam)
-            : DefWindowProcW(edit, message, wparam, lparam);
+        const WNDPROC original = self != nullptr
+            ? self->directwrite_edit_original_proc(edit)
+            : nullptr;
+        if (self == nullptr || original == nullptr) {
+            return DefWindowProcW(edit, message, wparam, lparam);
+        }
+
+        auto* interaction = self->settings_edit_state(edit);
+        if (interaction != nullptr &&
+            (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK)) {
+            SetFocus(edit);
+            SetCapture(edit);
+            interaction->selecting = true;
+            if (const auto hit = self->settings_edit_hit_test(edit, lparam)) {
+                if (message == WM_LBUTTONDBLCLK) {
+                    self->select_settings_edit_word(edit, *hit);
+                    interaction->selecting = false;
+                    ReleaseCapture();
+                } else {
+                    self->apply_settings_edit_selection(
+                        edit, *hit, *hit, false);
+                }
+            }
+            return 0;
+        }
+        if (interaction != nullptr && message == WM_MOUSEMOVE &&
+            interaction->selecting) {
+            if (const auto hit = self->settings_edit_hit_test(edit, lparam)) {
+                self->apply_settings_edit_selection(
+                    edit, interaction->anchor, *hit, false);
+            }
+            return 0;
+        }
+        if (interaction != nullptr && message == WM_LBUTTONUP) {
+            if (interaction->selecting) {
+                if (const auto hit = self->settings_edit_hit_test(edit, lparam)) {
+                    self->apply_settings_edit_selection(
+                        edit, interaction->anchor, *hit);
+                }
+                interaction->selecting = false;
+            }
+            if (GetCapture() == edit) {
+                ReleaseCapture();
+            }
+            return 0;
+        }
+        if (interaction != nullptr && message == WM_CAPTURECHANGED) {
+            if (interaction->selecting) {
+                self->apply_settings_edit_selection(
+                    edit, interaction->anchor, interaction->caret, true);
+            }
+            interaction->selecting = false;
+        }
+
+        const LRESULT result = CallWindowProcW(
+            original,
+            edit,
+            message,
+            wparam,
+            lparam);
+        const bool selection_or_text_changed =
+            message == WM_CHAR || message == WM_KEYDOWN ||
+            message == WM_PASTE || message == WM_CUT || message == WM_CLEAR ||
+            message == WM_UNDO || message == EM_REPLACESEL ||
+            message == EM_SCROLLCARET || message == WM_IME_STARTCOMPOSITION ||
+            message == WM_IME_COMPOSITION || message == WM_IME_ENDCOMPOSITION ||
+            message == WM_KEYUP || message == EM_SETSEL || message == WM_SETTEXT;
+        if (selection_or_text_changed) {
+            self->sync_settings_edit_state_from_native(edit);
+        }
+        if (message == WM_SETFOCUS) {
+            HideCaret(edit);
+            const UINT blink = GetCaretBlinkTime();
+            SetTimer(
+                edit,
+                1U,
+                blink == 0U || blink == INFINITE ? 500U : std::max(100U, blink),
+                nullptr);
+            static_cast<void>(RedrawWindow(
+                edit, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW));
+        } else if (message == WM_KILLFOCUS) {
+            KillTimer(edit, 1U);
+            static_cast<void>(RedrawWindow(
+                edit, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW));
+        } else if (selection_or_text_changed) {
+            static_cast<void>(RedrawWindow(
+                edit, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW));
+        }
+        return result;
+    }
+
+    [[nodiscard]] bool draw_directwrite_text_to_hdc(
+        const HDC device_context,
+        const RECT& destination,
+        const std::wstring_view text,
+        const COLORREF text_color,
+        const HFONT font,
+        const DWRITE_TEXT_ALIGNMENT alignment)
+    {
+        if (device_context == nullptr || factory_ == nullptr ||
+            write_factory_ == nullptr || destination.right <= destination.left ||
+            destination.bottom <= destination.top) {
+            return false;
+        }
+
+        const HWND target_window = WindowFromDC(device_context);
+        const UINT dpi = GetDpiForWindow(
+            target_window != nullptr ? target_window : window_);
+        const auto properties = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_IGNORE),
+            static_cast<float>(dpi),
+            static_cast<float>(dpi));
+        ComPtr<ID2D1DCRenderTarget> target;
+        HRESULT result = factory_->CreateDCRenderTarget(
+            &properties,
+            target.GetAddressOf());
+        if (FAILED(result)) {
+            return false;
+        }
+        result = target->BindDC(device_context, &destination);
+        if (SUCCEEDED(result)) {
+            result = configure_text_rendering(*target.Get(), *write_factory_.Get());
+        }
+
+        LOGFONTW logical_font{};
+        if (font != nullptr) {
+            static_cast<void>(GetObjectW(font, sizeof(logical_font), &logical_font));
+        }
+        const float font_size = logical_font.lfHeight != 0
+            ? static_cast<float>(std::abs(logical_font.lfHeight)) * 96.0F /
+                static_cast<float>(dpi)
+            : 13.0F;
+        const auto font_weight = static_cast<DWRITE_FONT_WEIGHT>(std::clamp(
+            logical_font.lfWeight > 0 ? logical_font.lfWeight : FW_NORMAL,
+            1L,
+            999L));
+        ComPtr<IDWriteTextFormat> format;
+        if (SUCCEEDED(result)) {
+            result = write_factory_->CreateTextFormat(
+                platform::windows::kBundledFontFamily,
+                nullptr,
+                font_weight,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                font_size,
+                L"",
+                format.GetAddressOf());
+        }
+        if (SUCCEEDED(result)) {
+            result = format->SetTextAlignment(alignment);
+        }
+        if (SUCCEEDED(result)) {
+            result = format->SetParagraphAlignment(
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        if (SUCCEEDED(result)) {
+            result = format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+
+        ComPtr<ID2D1SolidColorBrush> brush;
+        if (SUCCEEDED(result)) {
+            result = target->CreateSolidColorBrush(
+                D2D1::ColorF(
+                    static_cast<float>(GetRValue(text_color)) / 255.0F,
+                    static_cast<float>(GetGValue(text_color)) / 255.0F,
+                    static_cast<float>(GetBValue(text_color)) / 255.0F),
+                brush.GetAddressOf());
+        }
+        if (FAILED(result)) {
+            return false;
+        }
+
+        const D2D1_SIZE_F size = target->GetSize();
+        target->BeginDraw();
+        target->DrawTextW(
+            text.data(),
+            static_cast<UINT32>(text.size()),
+            format.Get(),
+            D2D1::RectF(0.0F, 0.0F, size.width, size.height),
+            brush.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        return SUCCEEDED(target->EndDraw());
+    }
+
+    [[nodiscard]] bool paint_unfocused_edit(const HWND edit)
+    {
+        PAINTSTRUCT paint{};
+        const HDC context = BeginPaint(edit, &paint);
+        if (context == nullptr) {
+            return false;
+        }
+        RECT client{};
+        GetClientRect(edit, &client);
+        FillRect(context, &client, settings_edit_brush_);
+
+        const int length = GetWindowTextLengthW(edit);
+        std::wstring text(static_cast<std::size_t>(std::max(0, length)) + 1U, L'\0');
+        const int copied = length > 0
+            ? GetWindowTextW(edit, text.data(), length + 1)
+            : 0;
+        text.resize(static_cast<std::size_t>(std::max(0, copied)));
+        if ((GetWindowLongPtrW(edit, GWL_STYLE) & ES_PASSWORD) != 0 && !text.empty()) {
+            wchar_t password_character = static_cast<wchar_t>(
+                SendMessageW(edit, EM_GETPASSWORDCHAR, 0, 0));
+            if (password_character == L'\0') {
+                password_character = L'\x25CF';
+            }
+            text.assign(text.size(), password_character);
+        }
+
+        const UINT dpi = GetDpiForWindow(edit);
+        client.left += MulDiv(2, static_cast<int>(dpi), 96);
+        client.right -= MulDiv(2, static_cast<int>(dpi), 96);
+        const HFONT font = reinterpret_cast<HFONT>(
+            SendMessageW(edit, WM_GETFONT, 0, 0));
+        const bool rendered = draw_directwrite_text_to_hdc(
+            context,
+            client,
+            text,
+            colorref(theme_.text),
+            font,
+            DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (!rendered) {
+            SetBkMode(context, TRANSPARENT);
+            SetTextColor(context, colorref(theme_.text));
+            const HGDIOBJ previous = font != nullptr
+                ? SelectObject(context, font)
+                : nullptr;
+            DrawTextW(
+                context,
+                text.c_str(),
+                static_cast<int>(text.size()),
+                &client,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+            if (previous != nullptr) {
+                SelectObject(context, previous);
+            }
+        }
+        EndPaint(edit, &paint);
+        return true;
+    }
+
+    [[nodiscard]] bool paint_settings_edit(const HWND edit)
+    {
+        PAINTSTRUCT paint{};
+        const HDC context = BeginPaint(edit, &paint);
+        if (context == nullptr) {
+            return false;
+        }
+
+        RECT client{};
+        GetClientRect(edit, &client);
+
+        const auto finish = [&]() {
+            EndPaint(edit, &paint);
+            return true;
+        };
+        if (factory_ == nullptr || write_factory_ == nullptr ||
+            client.right <= client.left || client.bottom <= client.top) {
+            FillRect(context, &client, settings_edit_brush_);
+            return finish();
+        }
+
+        const int length = GetWindowTextLengthW(edit);
+        std::wstring text(static_cast<std::size_t>(std::max(0, length)) + 1U, L'\0');
+        const int copied = length > 0
+            ? GetWindowTextW(edit, text.data(), length + 1)
+            : 0;
+        text.resize(static_cast<std::size_t>(std::max(0, copied)));
+        if ((GetWindowLongPtrW(edit, GWL_STYLE) & ES_PASSWORD) != 0 && !text.empty()) {
+            wchar_t password_character = static_cast<wchar_t>(
+                SendMessageW(edit, EM_GETPASSWORDCHAR, 0, 0));
+            if (password_character == L'\0') {
+                password_character = L'\x25CF';
+            }
+            text.assign(text.size(), password_character);
+        }
+
+        const UINT dpi = GetDpiForWindow(edit);
+        const auto properties = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_IGNORE),
+            static_cast<float>(dpi),
+            static_cast<float>(dpi));
+        ComPtr<ID2D1DCRenderTarget> target;
+        HRESULT result = factory_->CreateDCRenderTarget(
+            &properties,
+            target.GetAddressOf());
+        if (SUCCEEDED(result)) {
+            result = target->BindDC(context, &client);
+        }
+        if (SUCCEEDED(result)) {
+            result = configure_text_rendering(*target.Get(), *write_factory_.Get());
+        }
+
+        const HFONT font = reinterpret_cast<HFONT>(
+            SendMessageW(edit, WM_GETFONT, 0, 0));
+        LOGFONTW logical_font{};
+        if (font != nullptr) {
+            static_cast<void>(GetObjectW(font, sizeof(logical_font), &logical_font));
+        }
+        const float font_size = logical_font.lfHeight != 0
+            ? static_cast<float>(std::abs(logical_font.lfHeight)) * 96.0F /
+                static_cast<float>(dpi)
+            : 13.0F;
+        const auto font_weight = static_cast<DWRITE_FONT_WEIGHT>(std::clamp(
+            logical_font.lfWeight > 0 ? logical_font.lfWeight : FW_NORMAL,
+            1L,
+            999L));
+        ComPtr<IDWriteTextFormat> format;
+        if (SUCCEEDED(result)) {
+            result = write_factory_->CreateTextFormat(
+                platform::windows::kBundledFontFamily,
+                nullptr,
+                font_weight,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                font_size,
+                L"",
+                format.GetAddressOf());
+        }
+        const LONG_PTR edit_style = GetWindowLongPtrW(edit, GWL_STYLE);
+        const bool centered = (edit_style & ES_CENTER) != 0;
+        if (SUCCEEDED(result)) {
+            result = format->SetTextAlignment(
+                centered
+                    ? DWRITE_TEXT_ALIGNMENT_CENTER
+                    : DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        if (SUCCEEDED(result)) {
+            result = format->SetParagraphAlignment(
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        if (SUCCEEDED(result)) {
+            result = format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+
+        const float client_height = static_cast<float>(client.bottom - client.top) *
+            96.0F / static_cast<float>(dpi);
+        const float client_width = target->GetSize().width;
+        const float layout_width = centered
+            ? std::max(1.0F, client_width - 4.0F)
+            : 32768.0F;
+        ComPtr<IDWriteTextLayout> layout;
+        if (SUCCEEDED(result)) {
+            result = write_factory_->CreateTextLayout(
+                text.data(),
+                static_cast<UINT32>(text.size()),
+                format.Get(),
+                layout_width,
+                client_height,
+                layout.GetAddressOf());
+        }
+
+        ComPtr<ID2D1SolidColorBrush> text_brush;
+        ComPtr<ID2D1SolidColorBrush> selection_brush;
+        if (SUCCEEDED(result)) {
+            result = target->CreateSolidColorBrush(
+                D2D1::ColorF(
+                    static_cast<float>(GetRValue(colorref(theme_.text))) / 255.0F,
+                    static_cast<float>(GetGValue(colorref(theme_.text))) / 255.0F,
+                    static_cast<float>(GetBValue(colorref(theme_.text))) / 255.0F),
+                text_brush.GetAddressOf());
+        }
+        if (SUCCEEDED(result)) {
+            const COLORREF accent_color = colorref(theme_.accent);
+            result = target->CreateSolidColorBrush(
+                D2D1::ColorF(
+                    static_cast<float>(GetRValue(accent_color)) / 255.0F,
+                    static_cast<float>(GetGValue(accent_color)) / 255.0F,
+                    static_cast<float>(GetBValue(accent_color)) / 255.0F,
+                    0.35F),
+                selection_brush.GetAddressOf());
+        }
+        if (FAILED(result)) {
+            FillRect(context, &client, settings_edit_brush_);
+            return finish();
+        }
+
+        auto* interaction = settings_edit_state(edit);
+        const DWORD text_length = static_cast<DWORD>(std::min<std::size_t>(
+            text.size(),
+            std::numeric_limits<DWORD>::max()));
+        if (interaction == nullptr) {
+            register_settings_edit(edit);
+            interaction = settings_edit_state(edit);
+        }
+        DWORD selection_anchor{};
+        DWORD selection_caret{};
+        if (interaction != nullptr) {
+            interaction->layout = layout;
+            interaction->anchor = std::min(interaction->anchor, text_length);
+            interaction->caret = std::min(interaction->caret, text_length);
+            selection_anchor = interaction->anchor;
+            selection_caret = interaction->caret;
+        } else {
+            SendMessageW(
+                edit,
+                EM_GETSEL,
+                reinterpret_cast<WPARAM>(&selection_anchor),
+                reinterpret_cast<LPARAM>(&selection_caret));
+            selection_anchor = std::min(selection_anchor, text_length);
+            selection_caret = std::min(selection_caret, text_length);
+        }
+
+        const DWORD selection_start = std::min(selection_anchor, selection_caret);
+        const DWORD selection_end = std::max(selection_anchor, selection_caret);
+        if (interaction != nullptr && GetFocus() == edit && !centered) {
+            FLOAT caret_x{};
+            FLOAT caret_y{};
+            DWRITE_HIT_TEST_METRICS caret_metrics{};
+            if (SUCCEEDED(layout->HitTestTextPosition(
+                    selection_caret,
+                    FALSE,
+                    &caret_x,
+                    &caret_y,
+                    &caret_metrics))) {
+                constexpr float kHorizontalPadding = 2.0F;
+                const float visible_right = std::max(
+                    kHorizontalPadding,
+                    client_width - kHorizontalPadding);
+                const float visible_caret =
+                    kHorizontalPadding - interaction->scroll_x + caret_x;
+                if (visible_caret < kHorizontalPadding) {
+                    interaction->scroll_x = std::max(
+                        0.0F,
+                        interaction->scroll_x -
+                            (kHorizontalPadding - visible_caret));
+                } else if (visible_caret > visible_right) {
+                    interaction->scroll_x += visible_caret - visible_right;
+                }
+            }
+        }
+        const float origin_x = centered
+            ? 2.0F
+            : 2.0F - (interaction != nullptr ? interaction->scroll_x : 0.0F);
+        if (interaction != nullptr) {
+            interaction->origin_x = origin_x;
+        }
+
+        target->BeginDraw();
+        target->Clear(color(theme_.elevated));
+        if (GetFocus() == edit && selection_end > selection_start) {
+            UINT32 metric_count{};
+            static_cast<void>(layout->HitTestTextRange(
+                selection_start,
+                selection_end - selection_start,
+                origin_x,
+                0.0F,
+                nullptr,
+                0,
+                &metric_count));
+            std::vector<DWRITE_HIT_TEST_METRICS> metrics(metric_count);
+            if (metric_count > 0U && SUCCEEDED(layout->HitTestTextRange(
+                    selection_start,
+                    selection_end - selection_start,
+                    origin_x,
+                    0.0F,
+                    metrics.data(),
+                    metric_count,
+                    &metric_count))) {
+                for (UINT32 index = 0; index < metric_count; ++index) {
+                    const auto& metric = metrics[index];
+                    const float left = std::clamp(
+                        metric.left, 0.0F, client_width);
+                    const float right = std::clamp(
+                        metric.left + metric.width, 0.0F, client_width);
+                    if (right <= left) {
+                        continue;
+                    }
+                    target->FillRectangle(
+                        D2D1::RectF(
+                            left,
+                            metric.top,
+                            right,
+                            metric.top + metric.height),
+                        selection_brush.Get());
+                }
+            }
+        }
+        target->DrawTextLayout(
+            D2D1::Point2F(origin_x, 0.0F),
+            layout.Get(),
+            text_brush.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        if (GetFocus() == edit && selection_start == selection_end) {
+            const UINT blink = GetCaretBlinkTime();
+            const bool caret_visible = blink == INFINITE || blink == 0U ||
+                ((GetTickCount64() / std::max<UINT>(1U, blink)) % 2U) == 0U;
+            FLOAT caret_x{};
+            FLOAT caret_y{};
+            DWRITE_HIT_TEST_METRICS caret_metrics{};
+            if (SUCCEEDED(layout->HitTestTextPosition(
+                    selection_caret,
+                    FALSE,
+                    &caret_x,
+                    &caret_y,
+                    &caret_metrics))) {
+                // Keep the hidden system caret synchronized for IME and
+                // accessibility while DirectWrite renders the visible caret.
+                static_cast<void>(SetCaretPos(
+                    static_cast<int>(std::lround(
+                        (origin_x + caret_x) * static_cast<float>(dpi) / 96.0F)),
+                    static_cast<int>(std::lround(
+                        caret_y * static_cast<float>(dpi) / 96.0F))));
+                if (caret_visible) {
+                    UINT caret_width = 1U;
+                    static_cast<void>(SystemParametersInfoW(
+                        SPI_GETCARETWIDTH,
+                        0,
+                        &caret_width,
+                        0));
+                    const float caret_width_dip = std::max(
+                        1.0F,
+                        static_cast<float>(caret_width) * 96.0F /
+                            static_cast<float>(dpi));
+                    target->FillRectangle(
+                        D2D1::RectF(
+                            origin_x + caret_x,
+                            caret_y,
+                            origin_x + caret_x + caret_width_dip,
+                            caret_y + caret_metrics.height),
+                        text_brush.Get());
+                }
+            }
+        }
+        static_cast<void>(target->EndDraw());
+        return finish();
     }
 
     void open_settings()
@@ -6273,6 +7180,7 @@ private:
                     settings_token_edit_,
                     GWLP_WNDPROC,
                     reinterpret_cast<LONG_PTR>(settings_edit_window_proc)));
+            register_settings_edit(settings_token_edit_);
             refresh_settings_token_status();
         }
         const auto create_plain_edit = [this](
@@ -6304,6 +7212,7 @@ private:
                 if (settings_edit_original_proc_ == nullptr) {
                     settings_edit_original_proc_ = original;
                 }
+                register_settings_edit(edit);
             }
             return edit;
         };
@@ -6353,14 +7262,17 @@ private:
         settings_controls_ready_ = false;
         resize_focus_ = nullptr;
         if (settings_token_edit_ != nullptr) {
+            unregister_settings_edit(settings_token_edit_);
             DestroyWindow(settings_token_edit_);
             settings_token_edit_ = nullptr;
         }
         if (settings_cddb_server_edit_ != nullptr) {
+            unregister_settings_edit(settings_cddb_server_edit_);
             DestroyWindow(settings_cddb_server_edit_);
             settings_cddb_server_edit_ = nullptr;
         }
         if (settings_cddb_email_edit_ != nullptr) {
+            unregister_settings_edit(settings_cddb_email_edit_);
             DestroyWindow(settings_cddb_email_edit_);
             settings_cddb_email_edit_ = nullptr;
         }
@@ -6951,11 +7863,27 @@ private:
             const int width = to_pixel(rectangle.right - rectangle.left - 26.0F);
             const int field_top = to_pixel(rectangle.top);
             const int field_height = to_pixel(rectangle.bottom - rectangle.top);
-            const int height = std::min(
-                field_height,
-                preferred_edit_height(window_, false));
-            const int top = field_top + (field_height - height) / 2;
+            // The settings inputs paint their text with DirectWrite.  Give the
+            // child the complete field height so the layout, selection and
+            // custom caret all share the same vertically-centred line box.
+            const int height = field_height;
+            const int top = field_top;
             RECT current{};
+            GetWindowRect(edit, &current);
+            MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&current), 2);
+            const bool size_changed =
+                current.right - current.left != width ||
+                current.bottom - current.top != height;
+            if (size_changed) {
+                SetWindowPos(
+                    edit,
+                    nullptr,
+                    left,
+                    top,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOZORDER);
+            }
             GetWindowRect(edit, &current);
             MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&current), 2);
             const bool bounds_changed =
@@ -7480,6 +8408,15 @@ private:
     {
         auto* self = reinterpret_cast<MainWindow*>(
             GetWindowLongPtrW(edit, GWLP_USERDATA));
+
+        if (self != nullptr && message == WM_PAINT && GetFocus() != edit &&
+            self->paint_unfocused_edit(edit)) {
+            return 0;
+        }
+        if (self != nullptr &&
+            (message == WM_SETFOCUS || message == WM_KILLFOCUS)) {
+            InvalidateRect(edit, nullptr, TRUE);
+        }
         if (self != nullptr && message == WM_KEYDOWN && wparam == VK_ESCAPE) {
             PostMessageW(self->window_, WM_KEYDOWN, VK_ESCAPE, 0);
             return 0;
@@ -7703,12 +8640,25 @@ private:
             const int edit_height = std::min(
                 field_height,
                 preferred_edit_height(window_, false));
+            const int left = to_pixel(rectangle.left + 13.0F);
+            const int width = to_pixel(rectangle.right - rectangle.left - 26.0F);
+            const int fallback_top =
+                field_top + (field_height - edit_height) / 2;
             SetWindowPos(
                 edit,
                 HWND_TOP,
-                to_pixel(rectangle.left + 13.0F),
-                field_top + (field_height - edit_height) / 2,
-                to_pixel(rectangle.right - rectangle.left - 26.0F),
+                left,
+                fallback_top,
+                width,
+                edit_height,
+                SWP_NOACTIVATE);
+            SetWindowPos(
+                edit,
+                HWND_TOP,
+                left,
+                visually_centered_edit_top(
+                    edit, field_top, field_height, fallback_top),
+                width,
                 edit_height,
                 SWP_NOACTIVATE);
         };
@@ -8300,6 +9250,7 @@ private:
     std::vector<SettingsDropdownHit> settings_dropdown_hits_;
     HWND settings_cddb_server_edit_{};
     HWND settings_cddb_email_edit_{};
+    std::array<SettingsEditInteractionState, 5> settings_edit_states_{};
     std::wstring cddb_settings_error_;
     platform::windows::AudioCdAutoplayPolicyStatus autoplay_policy_status_{};
     std::wstring autoplay_policy_feedback_;
@@ -8373,6 +9324,15 @@ int run_application(
     ApplicationLaunchOptions options)
 {
     enable_per_monitor_dpi_awareness();
+    const platform::windows::BundledFontRegistration bundled_font;
+    if (!bundled_font.loaded()) {
+        MessageBoxW(
+            nullptr,
+            L"Noto Sans CJK 字体资源缺失或不可读取。",
+            L"CD.404",
+            MB_OK | MB_ICONERROR);
+        return 1;
+    }
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(com_result) && com_result != RPC_E_CHANGED_MODE) {
         return 1;

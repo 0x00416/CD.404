@@ -6,6 +6,7 @@ target_sources(
         src/animation_timing.cpp
         src/application_launch.cpp
         src/disc_snapshot.cpp
+        src/font_rendering.cpp
         src/main_window.cpp
         src/metadata_source_model.cpp
         src/playback_presenter.cpp
@@ -19,6 +20,7 @@ target_sources(
         FILES
             include/cd404/ui/animation_timing.hpp
             include/cd404/ui/application_launch.hpp
+            include/cd404/ui/font_rendering.hpp
             include/cd404/ui/main_window.hpp
             include/cd404/ui/metadata_source_model.hpp
             include/cd404/ui/playback_presenter.hpp
