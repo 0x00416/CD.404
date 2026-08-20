@@ -1,4 +1,10 @@
+set(CD404_VU_METER_FACE
+    "${PROJECT_SOURCE_DIR}/assets/ui/vu-meter-photoreal-calibrated.png")
 configure_file(resources.rc.in resources.rc @ONLY)
+set_source_files_properties(
+    "${CMAKE_CURRENT_BINARY_DIR}/resources.rc"
+    PROPERTIES OBJECT_DEPENDS "${CD404_VU_METER_FACE}"
+)
 
 add_executable(
     cd404_app

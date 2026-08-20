@@ -29,6 +29,7 @@
 #include <cd404/ui/application_launch.hpp>
 #include <cd404/ui/font_rendering.hpp>
 #include <cd404/ui/theme.hpp>
+#include <cd404/ui/vu_meter.hpp>
 #include <cd404/ui/playback_presenter.hpp>
 #include <cd404/ui/metadata_source_model.hpp>
 #include <cd404/ui/settings_model.hpp>
@@ -85,6 +86,131 @@ void test_result_semantics()
     expect(
         !result.succeeded(),
         "non-terminal playback is not reported as successful");
+}
+
+void test_vu_meter_mapping_and_ballistics()
+{
+    using namespace cd404::ui;
+    using cd404::platform::windows::DigitalClipKind;
+    using cd404::platform::windows::StereoPcm16TruePeakMeter;
+
+    StereoPcm16TruePeakMeter clip_meter;
+    const std::array<std::int16_t, 2> near_full_sample{32'760, -32'760};
+    const auto near_full = clip_meter.process(near_full_sample);
+    expect(
+        near_full.left_clip == DigitalClipKind::none &&
+            near_full.right_clip == DigitalClipKind::none,
+        "a single near-full-scale PCM sample is not falsely classified as clipping");
+
+    clip_meter.reset();
+    std::vector<std::int16_t> intersample_peak;
+    intersample_peak.reserve(256);
+    constexpr std::array<std::int16_t, 4> quarter_rate{
+        32'767, 32'767, -32'768, -32'768};
+    for (std::size_t frame = 0; frame < 128; ++frame) {
+        intersample_peak.push_back(quarter_rate[frame % quarter_rate.size()]);
+        intersample_peak.push_back(0);
+    }
+    const auto true_peak = clip_meter.process(intersample_peak);
+    expect(
+        true_peak.left_clip == DigitalClipKind::true_peak_over &&
+            true_peak.left_dbtp > 2.5F &&
+            true_peak.right_clip == DigitalClipKind::none,
+        "ITU-R four-phase interpolation detects inter-sample true-peak overload per channel");
+
+    clip_meter.reset();
+    const std::array<std::int16_t, 4> two_rail_frames{
+        32'767, 0, 32'767, 0};
+    const std::array<std::int16_t, 2> third_rail_frame{32'767, 0};
+    const auto before_plateau = clip_meter.process(two_rail_frames);
+    const auto hard_clip = clip_meter.process(third_rail_frame);
+    expect(
+        before_plateau.left_clip != DigitalClipKind::hard_sample_clip &&
+            hard_clip.left_clip == DigitalClipKind::hard_sample_clip &&
+            hard_clip.right_clip == DigitalClipKind::none,
+        "three same-rail samples across blocks identify a hard-clipped plateau");
+
+    const double minus_eight_dbfs_peak = std::pow(10.0, -8.0 / 20.0);
+    const double minus_eight_dbfs_sine_rms = minus_eight_dbfs_peak / std::sqrt(2.0);
+    const float measured_sine_dbfs =
+        cd404::platform::windows::sine_referenced_dbfs_from_rms(
+            minus_eight_dbfs_sine_rms);
+    expect(
+        std::abs(measured_sine_dbfs + 8.0F) < 0.001F &&
+            std::abs(vu_level_from_dbfs(measured_sine_dbfs)) < 0.001F,
+        "-8 dBFS standard sine measures at 0 VU after RMS normalization");
+    expect(
+        std::abs(vu_level_from_dbfs(-8.0F)) < 0.0001F,
+        "VU calibration maps -8 dBFS to 0 VU");
+    expect(
+        std::abs(vu_level_from_dbfs(-20.0F) + 12.0F) < 0.0001F &&
+            std::abs(vu_level_from_dbfs(-30.0F) - kVuMinimumDb) < 0.0001F &&
+            std::abs(vu_level_from_dbfs(0.0F) - kVuMaximumDb) < 0.0001F,
+        "VU calibration offsets dBFS and clamps to the printed travel");
+    expect(
+        std::abs(vu_meter_angle_degrees(-22.0F) + 50.037483F) < 0.001F,
+        "VU -22 dB maps to the aspect-corrected Sony 3 left stop");
+    expect(
+        std::abs(vu_meter_angle_degrees(5.0F) - 50.037483F) < 0.001F,
+        "VU +5 dB maps to the aspect-corrected Sony 3 right stop");
+    expect(
+        std::abs(vu_meter_angle_degrees(0.0F) - 25.664888F) < 0.001F,
+        "VU 0 dB matches the aspect-corrected Sony 3 calibration angle");
+    expect(
+        vu_meter_needle_length(-50.037483F) > vu_meter_needle_length(0.0F) &&
+            vu_meter_needle_length(0.0F) > 160.0F,
+        "VU needle reaches the angle-dependent outer edge of the elliptical scale");
+
+    VuNeedleState sixty_hz{};
+    VuNeedleState one_forty_four_hz{};
+    VuNeedleState one_eighty_hz{};
+    for (int frame = 0; frame < 18; ++frame) {
+        sixty_hz = advance_vu_needle(sixty_hz, 0.0F, 1.0F / 60.0F);
+    }
+    for (int frame = 0; frame < 43; ++frame) {
+        one_forty_four_hz = advance_vu_needle(
+            one_forty_four_hz, 0.0F, 0.3F / 43.0F);
+    }
+    for (int frame = 0; frame < 54; ++frame) {
+        one_eighty_hz = advance_vu_needle(
+            one_eighty_hz, 0.0F, 1.0F / 180.0F);
+    }
+    const float target_angle = vu_meter_angle_degrees(0.0F);
+    const float travel = target_angle - kVuMinimumAngleDegrees;
+    const float response_fraction =
+        (sixty_hz.angle_degrees - kVuMinimumAngleDegrees) / travel;
+    expect(
+        response_fraction >= 0.99F && response_fraction <= 1.015F &&
+            std::abs(sixty_hz.angle_degrees - one_forty_four_hz.angle_degrees) <
+                0.001F &&
+            std::abs(sixty_hz.angle_degrees - one_eighty_hz.angle_degrees) <
+                0.001F,
+        "VU mechanics reach 99% in 300 ms independent of display frame rate");
+
+    float maximum_angle = sixty_hz.angle_degrees;
+    for (int frame = 0; frame < 30; ++frame) {
+        sixty_hz = advance_vu_needle(sixty_hz, 0.0F, 1.0F / 120.0F);
+        maximum_angle = std::max(maximum_angle, sixty_hz.angle_degrees);
+    }
+    const float overshoot = (maximum_angle - target_angle) / travel;
+    expect(
+        overshoot >= 0.01F && overshoot <= 0.015F,
+        "VU mechanics produce the standard 1%-1.5% pointer overshoot");
+
+    VuNeedleState falling{target_angle, 0.0F};
+    for (int frame = 0; frame < 18; ++frame) {
+        falling = advance_vu_needle(
+            falling, kVuMinimumDb, 1.0F / 60.0F);
+    }
+    const float return_fraction =
+        (target_angle - falling.angle_degrees) / travel;
+    expect(
+        return_fraction >= 0.99F && return_fraction <= 1.015F,
+        "VU electromechanical return is symmetrical with its rise response");
+    expect(
+        vu_backlight_opacity(true, false) > vu_backlight_opacity(false, true) &&
+            vu_backlight_opacity(false, true) > vu_backlight_opacity(false, false),
+        "VU backlight has playing, paused and idle program states");
 }
 
 void test_autoplay_launch_arguments()
@@ -2383,6 +2509,7 @@ int main(const int argument_count, char** arguments)
 {
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     test_result_semantics();
+    test_vu_meter_mapping_and_ballistics();
     test_autoplay_launch_arguments();
     test_autoplay_policy_masks();
     test_bundled_font_multilingual_coverage();

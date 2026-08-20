@@ -14,6 +14,7 @@ target_sources(
         src/theme.cpp
         src/ui_drawing.cpp
         src/ui_layout.cpp
+        src/vu_meter.cpp
     PUBLIC
         FILE_SET HEADERS
         BASE_DIRS include
@@ -26,6 +27,7 @@ target_sources(
             include/cd404/ui/playback_presenter.hpp
             include/cd404/ui/settings_model.hpp
             include/cd404/ui/theme.hpp
+            include/cd404/ui/vu_meter.hpp
 )
 
 target_compile_features(cd404_ui PUBLIC cxx_std_20)

@@ -1,0 +1,382 @@
+{
+  "asset": "vu-meter-photoreal-calibrated.png",
+  "asset1200": "vu-meter-photoreal-calibrated-1200x450.png",
+  "asset2x": "vu-meter-face@2x.png",
+  "visualStyle": "photographic-calibrated-top-pivot-dual",
+  "scaleGeometry": "elliptical-arc-with-radial-ticks-from-program-needle-pivot",
+  "scaleArc": {
+    "shape": "ellipse",
+    "radiusX": 320.0,
+    "radiusY": 150.0,
+    "polarIntersection": true,
+    "supersample": 4,
+    "layoutTransform": "reference card 660x328 nonuniformly fitted to target card 448.5x167",
+    "blackLineWidth": 2.15,
+    "redLineWidth": 3.6,
+    "continuousUnderArc": false,
+    "sharedNodeAngle": 25.664888,
+    "blackRedGapDegrees": 1.25,
+    "junctionMode": "separated-black-red-arcs-with-arc-over-tick-caps",
+    "junctionCoveredByZeroTick": true
+  },
+  "tickHierarchy": {
+    "stop": {
+      "length": 24.0,
+      "lineWidth": 3.8
+    },
+    "major": {
+      "length": 24.0,
+      "lineWidth": 2.8
+    },
+    "minor": {
+      "length": 12.0,
+      "lineWidth": 1.1
+    },
+    "percentage": {
+      "length": 5.5,
+      "lineWidth": 1.2
+    }
+  },
+  "percentageLayout": {
+    "angleMin": -50.037483,
+    "angleMax": 25.664888,
+    "labelRadiusInset": 29.0,
+    "fontSize": 8.2,
+    "compositeCenterAligned": true,
+    "labelAlignment": "vertical-over-percentage-mark",
+    "unitPlacement": "inline-compact-with-100",
+    "mapping": "field amplitude p converts to dB by 20*log10(p/100), then uses the needle map",
+    "dbValues": {
+      "0": null,
+      "20": -13.979400086720375,
+      "40": -7.958800173440752,
+      "60": -4.436974992327128,
+      "80": -1.938200260161128,
+      "100": 0.0
+    },
+    "angleDegrees": {
+      "0": -50.037483,
+      "20": -40.122703,
+      "40": -23.675805,
+      "60": -7.228907,
+      "80": 9.21799,
+      "100": 25.664888
+    }
+  },
+  "referenceCalibration": {
+    "sourceAnchors": {
+      "minLevelDb": -22.0,
+      "minAngleDegrees": 41.8,
+      "zeroLevelDb": 0.0,
+      "zeroAngleDegrees": -19.8,
+      "maxLevelDb": 5.0,
+      "maxAngleDegrees": -41.8
+    },
+    "programConventionAnchors": {
+      "minLevelDb": -22.0,
+      "minAngleDegrees": -50.037483,
+      "zeroLevelDb": 0.0,
+      "zeroAngleDegrees": 25.664888,
+      "maxLevelDb": 5.0,
+      "maxAngleDegrees": 50.037483
+    }
+  },
+  "coordinateSpace": {
+    "width": 1200,
+    "height": 450
+  },
+  "sourceSize": {
+    "width": 2046,
+    "height": 768
+  },
+  "meterCount": 2,
+  "dbRange": {
+    "min": -22.0,
+    "max": 5.0
+  },
+  "printedDbRange": {
+    "min": -20.0,
+    "max": 5.0
+  },
+  "tickValuesDb": [
+    -20.0,
+    -13.979400086720375,
+    -10.0,
+    -9.0,
+    -8.0,
+    -7.0,
+    -6.0,
+    -5.0,
+    -4.0,
+    -3.0,
+    -2.0,
+    -1.0,
+    0.0,
+    1.0,
+    2.0,
+    3.0,
+    4.0,
+    5.0
+  ],
+  "labelValuesDb": [
+    -20,
+    -10,
+    -7,
+    -5,
+    -3,
+    0,
+    3,
+    5
+  ],
+  "percentLabels": [
+    0,
+    20,
+    40,
+    60,
+    80,
+    100
+  ],
+  "ticks": [
+    {
+      "db": -20.0,
+      "angleDegrees": -48.346152,
+      "class": "stop",
+      "innerRadius": 199.063466,
+      "outerRadius": 223.663466,
+      "length": 24.0,
+      "lineWidth": 3.8,
+      "color": "black"
+    },
+    {
+      "db": -13.979400086720375,
+      "angleDegrees": -40.122703,
+      "class": "minor",
+      "innerRadius": 181.844012,
+      "outerRadius": 194.444012,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": -10.0,
+      "angleDegrees": -30.564772,
+      "class": "major",
+      "innerRadius": 167.290579,
+      "outerRadius": 191.890579,
+      "length": 24.0,
+      "lineWidth": 2.8,
+      "color": "black"
+    },
+    {
+      "db": -9.0,
+      "angleDegrees": -27.391703,
+      "class": "minor",
+      "innerRadius": 163.56813,
+      "outerRadius": 176.16813,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": -8.0,
+      "angleDegrees": -23.831461,
+      "class": "minor",
+      "innerRadius": 159.975566,
+      "outerRadius": 172.575566,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": -7.0,
+      "angleDegrees": -19.836804,
+      "class": "major",
+      "innerRadius": 156.629849,
+      "outerRadius": 181.229849,
+      "length": 24.0,
+      "lineWidth": 2.8,
+      "color": "black"
+    },
+    {
+      "db": -6.0,
+      "angleDegrees": -15.354725,
+      "class": "minor",
+      "innerRadius": 153.679649,
+      "outerRadius": 166.279649,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": -5.0,
+      "angleDegrees": -10.325749,
+      "class": "major",
+      "innerRadius": 151.316284,
+      "outerRadius": 175.916284,
+      "length": 24.0,
+      "lineWidth": 2.8,
+      "color": "black"
+    },
+    {
+      "db": -4.0,
+      "angleDegrees": -4.683146,
+      "class": "minor",
+      "innerRadius": 149.791624,
+      "outerRadius": 162.391624,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": -3.0,
+      "angleDegrees": 1.647959,
+      "class": "major",
+      "innerRadius": 149.448422,
+      "outerRadius": 174.048422,
+      "length": 24.0,
+      "lineWidth": 2.8,
+      "color": "black"
+    },
+    {
+      "db": -2.0,
+      "angleDegrees": 8.751576,
+      "class": "minor",
+      "innerRadius": 150.773372,
+      "outerRadius": 163.373372,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": -1.0,
+      "angleDegrees": 16.721965,
+      "class": "minor",
+      "innerRadius": 154.492859,
+      "outerRadius": 167.092859,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "black"
+    },
+    {
+      "db": 0.0,
+      "angleDegrees": 25.664888,
+      "class": "major",
+      "innerRadius": 161.751056,
+      "outerRadius": 186.351056,
+      "length": 24.0,
+      "lineWidth": 2.8,
+      "color": "red"
+    },
+    {
+      "db": 1.0,
+      "angleDegrees": 29.486017,
+      "class": "minor",
+      "innerRadius": 165.96781,
+      "outerRadius": 178.56781,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "red"
+    },
+    {
+      "db": 2.0,
+      "angleDegrees": 33.773395,
+      "class": "minor",
+      "innerRadius": 171.590114,
+      "outerRadius": 184.190114,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "red"
+    },
+    {
+      "db": 3.0,
+      "angleDegrees": 38.583912,
+      "class": "major",
+      "innerRadius": 179.132756,
+      "outerRadius": 203.732756,
+      "length": 24.0,
+      "lineWidth": 2.8,
+      "color": "red"
+    },
+    {
+      "db": 4.0,
+      "angleDegrees": 43.981401,
+      "class": "minor",
+      "innerRadius": 189.329424,
+      "outerRadius": 201.929424,
+      "length": 12.0,
+      "lineWidth": 1.1,
+      "color": "red"
+    },
+    {
+      "db": 5.0,
+      "angleDegrees": 50.037483,
+      "class": "stop",
+      "innerRadius": 203.219755,
+      "outerRadius": 227.819755,
+      "length": 24.0,
+      "lineWidth": 3.8,
+      "color": "red"
+    }
+  ],
+  "meters": [
+    {
+      "channel": "L",
+      "pivot": {
+        "x": 300.5,
+        "y": 100.0
+      },
+      "faceRect": {
+        "x": 76.0,
+        "y": 141.0,
+        "width": 449.0,
+        "height": 167.0
+      },
+      "needle": {
+        "angleConvention": "degrees clockwise from downward vertical",
+        "angleMin": -50.037483,
+        "angleZero": 25.664888,
+        "angleMax": 50.037483,
+        "lengthMode": "angle-dependent outer tick radius",
+        "lengthFormula": "ellipsePolarRadius(angle, rx=320, ry=150) + 24",
+        "dbMin": -22.0,
+        "dbMax": 5.0,
+        "mapping": "piecewise amplitude-linear through aspect-corrected Sony 3 anchors: -22 dB/-50.037483 deg, 0 dB/+25.664888 deg, +5 dB/+50.037483 deg"
+      }
+    },
+    {
+      "channel": "R",
+      "pivot": {
+        "x": 898.0,
+        "y": 100.0
+      },
+      "faceRect": {
+        "x": 674.0,
+        "y": 141.0,
+        "width": 448.0,
+        "height": 167.0
+      },
+      "needle": {
+        "angleConvention": "degrees clockwise from downward vertical",
+        "angleMin": -50.037483,
+        "angleZero": 25.664888,
+        "angleMax": 50.037483,
+        "lengthMode": "angle-dependent outer tick radius",
+        "lengthFormula": "ellipsePolarRadius(angle, rx=320, ry=150) + 24",
+        "dbMin": -22.0,
+        "dbMax": 5.0,
+        "mapping": "piecewise amplitude-linear through aspect-corrected Sony 3 anchors: -22 dB/-50.037483 deg, 0 dB/+25.664888 deg, +5 dB/+50.037483 deg"
+      }
+    }
+  ],
+  "backlight": {
+    "mode": "programmatic",
+    "bakedIntoAsset": false
+  },
+  "clipIndicator": {
+    "mode": "programmatic-active",
+    "center": {
+      "x": 600,
+      "y": 231
+    }
+  }
+}

@@ -22,6 +22,107 @@
 #include <vector>
 
 namespace cd404::platform::windows {
+
+float sine_referenced_dbfs_from_rms(const double rms_amplitude) noexcept
+{
+    if (!std::isfinite(rms_amplitude) || rms_amplitude <= 0.0) {
+        return -120.0F;
+    }
+    constexpr double rms_to_full_scale_sine = 1.4142135623730950488;
+    const double sine_referenced_amplitude =
+        std::max(rms_amplitude * rms_to_full_scale_sine, 1.0e-6);
+    return static_cast<float>(std::clamp(
+        20.0 * std::log10(sine_referenced_amplitude), -120.0, 0.0));
+}
+
+void StereoPcm16TruePeakMeter::reset() noexcept
+{
+    left_ = {};
+    right_ = {};
+}
+
+StereoTruePeakAnalysis StereoPcm16TruePeakMeter::process(
+    const std::span<const std::int16_t> samples) noexcept
+{
+    // ITU-R BS.1770 Annex 2: order-48, four-phase FIR interpolator.
+    static constexpr std::array<std::array<double, 4>, 12> coefficients{{
+        {{ 0.0017089843750, -0.0291748046875, -0.0189208984375, -0.0083007812500}},
+        {{ 0.0109863281250,  0.0292968750000,  0.0330810546875,  0.0148925781250}},
+        {{-0.0196533203125, -0.0517578125000, -0.0582275390625, -0.0266113281250}},
+        {{ 0.0332031250000,  0.0891113281250,  0.1015625000000,  0.0476074218750}},
+        {{-0.0594482421875, -0.1665039062500, -0.2003173828125, -0.1022949218750}},
+        {{ 0.1373291015625,  0.4650878906250,  0.7797851562500,  0.9721679687500}},
+        {{ 0.9721679687500,  0.7797851562500,  0.4650878906250,  0.1373291015625}},
+        {{-0.1022949218750, -0.2003173828125, -0.1665039062500, -0.0594482421875}},
+        {{ 0.0476074218750,  0.1015625000000,  0.0891113281250,  0.0332031250000}},
+        {{-0.0266113281250, -0.0582275390625, -0.0517578125000, -0.0196533203125}},
+        {{ 0.0148925781250,  0.0330810546875,  0.0292968750000,  0.0109863281250}},
+        {{-0.0083007812500, -0.0189208984375, -0.0291748046875,  0.0017089843750}},
+    }};
+
+    double left_peak{};
+    double right_peak{};
+    bool left_hard_clip{};
+    bool right_hard_clip{};
+    const auto process_channel = [&](
+        ChannelState& state,
+        const std::int16_t sample,
+        double& peak,
+        bool& hard_clip) {
+        std::move_backward(
+            state.history.begin(), state.history.end() - 1, state.history.end());
+        const double normalized = static_cast<double>(sample) / 32768.0;
+        state.history.front() = normalized;
+        peak = std::max(peak, std::abs(normalized));
+        for (std::size_t phase = 0; phase < 4; ++phase) {
+            double interpolated{};
+            for (std::size_t tap = 0; tap < state.history.size(); ++tap) {
+                interpolated += state.history[tap] * coefficients[tap][phase];
+            }
+            peak = std::max(peak, std::abs(interpolated));
+        }
+
+        const int rail_sign = sample == std::numeric_limits<std::int16_t>::max()
+            ? 1
+            : sample == std::numeric_limits<std::int16_t>::min() ? -1 : 0;
+        if (rail_sign == 0) {
+            state.rail_sign = 0;
+            state.rail_run = 0;
+        } else if (rail_sign == state.rail_sign) {
+            ++state.rail_run;
+        } else {
+            state.rail_sign = rail_sign;
+            state.rail_run = 1;
+        }
+        hard_clip = hard_clip || state.rail_run >= 3;
+    };
+
+    const std::size_t frames = samples.size() / audio::kPcm16StereoChannelCount;
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        process_channel(
+            left_, samples[frame * 2], left_peak, left_hard_clip);
+        process_channel(
+            right_, samples[frame * 2 + 1], right_peak, right_hard_clip);
+    }
+    const auto to_dbtp = [](const double peak) {
+        return static_cast<float>(20.0 * std::log10(std::max(peak, 1.0e-6)));
+    };
+    const auto clip_kind = [](const bool hard_clip, const double peak) {
+        if (hard_clip) {
+            return DigitalClipKind::hard_sample_clip;
+        }
+        return peak > 1.0
+            ? DigitalClipKind::true_peak_over
+            : DigitalClipKind::none;
+    };
+    return {
+        to_dbtp(left_peak),
+        to_dbtp(right_peak),
+        clip_kind(left_hard_clip, left_peak),
+        clip_kind(right_hard_clip, right_peak),
+    };
+}
+
 namespace {
 
 using core::SampleFrame;
@@ -34,6 +135,41 @@ constexpr std::size_t kRingCapacityFrames =
 constexpr std::size_t kPrebufferFrames =
     3 * static_cast<std::size_t>(core::kCdSampleFramesPerSecond);
 constexpr auto kQueueWait = std::chrono::milliseconds(50);
+
+[[nodiscard]] StereoMeterLevels measure_stereo_pcm16(
+    const std::span<const std::int16_t> samples) noexcept
+{
+    if (samples.size() < audio::kPcm16StereoChannelCount) {
+        return {};
+    }
+    double left_sum{};
+    double right_sum{};
+    const std::size_t frames = samples.size() / audio::kPcm16StereoChannelCount;
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        const auto left = static_cast<std::int32_t>(samples[frame * 2]);
+        const auto right = static_cast<std::int32_t>(samples[frame * 2 + 1]);
+        const double normalized_left = static_cast<double>(left) / 32768.0;
+        const double normalized_right = static_cast<double>(right) / 32768.0;
+        left_sum += normalized_left * normalized_left;
+        right_sum += normalized_right * normalized_right;
+    }
+    const auto to_dbfs = [frames](const double sum) {
+        const double rms = std::sqrt(sum / static_cast<double>(frames));
+        return sine_referenced_dbfs_from_rms(rms);
+    };
+    return {to_dbfs(left_sum), to_dbfs(right_sum)};
+}
+
+void latch_clip_kind(
+    std::atomic<DigitalClipKind>& destination,
+    const DigitalClipKind value) noexcept
+{
+    auto current = destination.load(std::memory_order_acquire);
+    while (static_cast<unsigned int>(current) < static_cast<unsigned int>(value) &&
+           !destination.compare_exchange_weak(
+               current, value, std::memory_order_acq_rel)) {
+    }
+}
 
 struct StreamState final {
     std::mutex mutex;
@@ -347,6 +483,12 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
     frames_produced_.store(0, std::memory_order_release);
     frames_submitted_.store(0, std::memory_order_release);
     frames_rendered_.store(0, std::memory_order_release);
+    left_meter_dbfs_.store(-120.0F, std::memory_order_release);
+    right_meter_dbfs_.store(-120.0F, std::memory_order_release);
+    left_true_peak_dbtp_.store(-120.0F, std::memory_order_release);
+    right_true_peak_dbtp_.store(-120.0F, std::memory_order_release);
+    left_clip_.store(DigitalClipKind::none, std::memory_order_release);
+    right_clip_.store(DigitalClipKind::none, std::memory_order_release);
 
     audio::PlaybackStateMachine state_machine;
     const auto advance = [this, &state_machine](const audio::PlaybackEvent event) {
@@ -490,6 +632,7 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
         std::max(kReadBlockFrames, endpoint_buffer_frames);
     std::vector<std::int16_t> consumer_samples(
         consumer_capacity * audio::kPcm16StereoChannelCount);
+    StereoPcm16TruePeakMeter true_peak_meter;
     audio::Pcm16SpscRingBuffer ring(kRingCapacityFrames);
     StreamState stream_state;
     static_cast<void>(advance(audio::PlaybackEvent::source_ready));
@@ -572,6 +715,7 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
                     target_frames = std::min(target_frames, *request.maximum_frames);
                 }
                 submitted_frames = 0;
+                true_peak_meter.reset();
                 frames_produced_.store(0, std::memory_order_release);
                 frames_submitted_.store(0, std::memory_order_release);
                 frames_rendered_.store(0, std::memory_order_release);
@@ -682,10 +826,35 @@ CddaPlaybackResult CddaPlaybackEngine::play(const CddaPlaybackRequest& request)
             continue;
         }
         stream_state.changed.notify_one();
-        audio::apply_pcm16_volume(
-            destination.first(
-                pop_result.frames_transferred * audio::kPcm16StereoChannelCount),
-            volume_.load(std::memory_order_acquire));
+        const auto meter_samples = destination.first(
+            pop_result.frames_transferred * audio::kPcm16StereoChannelCount);
+        const StereoTruePeakAnalysis source_peak = true_peak_meter.process(meter_samples);
+        const float gain = std::clamp(
+            volume_.load(std::memory_order_acquire), 0.0F, 1.0F);
+        audio::apply_pcm16_volume(meter_samples, gain);
+        const StereoMeterLevels levels = measure_stereo_pcm16(
+            meter_samples);
+        left_meter_dbfs_.store(levels.left_dbfs, std::memory_order_release);
+        right_meter_dbfs_.store(levels.right_dbfs, std::memory_order_release);
+        const float gain_db = gain > 0.0F
+            ? 20.0F * std::log10(gain)
+            : -120.0F;
+        const float left_output_dbtp = source_peak.left_dbtp + gain_db;
+        const float right_output_dbtp = source_peak.right_dbtp + gain_db;
+        left_true_peak_dbtp_.store(left_output_dbtp, std::memory_order_release);
+        right_true_peak_dbtp_.store(right_output_dbtp, std::memory_order_release);
+        const auto output_clip = [](
+            const DigitalClipKind source_clip,
+            const float output_dbtp) {
+            if (source_clip == DigitalClipKind::hard_sample_clip) {
+                return DigitalClipKind::hard_sample_clip;
+            }
+            return output_dbtp > 0.0F
+                ? DigitalClipKind::true_peak_over
+                : DigitalClipKind::none;
+        };
+        latch_clip_kind(left_clip_, output_clip(source_peak.left_clip, left_output_dbtp));
+        latch_clip_kind(right_clip_, output_clip(source_peak.right_clip, right_output_dbtp));
 
         const auto submit_result = submit_frames(
             output,
@@ -850,6 +1019,18 @@ CddaPlaybackProgress CddaPlaybackEngine::progress() const noexcept
         frames_produced_.load(std::memory_order_acquire),
         frames_submitted_.load(std::memory_order_acquire),
         frames_rendered_.load(std::memory_order_acquire),
+    };
+}
+
+StereoMeterLevels CddaPlaybackEngine::meter_levels() noexcept
+{
+    return {
+        left_meter_dbfs_.load(std::memory_order_acquire),
+        right_meter_dbfs_.load(std::memory_order_acquire),
+        left_true_peak_dbtp_.load(std::memory_order_acquire),
+        right_true_peak_dbtp_.load(std::memory_order_acquire),
+        left_clip_.exchange(DigitalClipKind::none, std::memory_order_acq_rel),
+        right_clip_.exchange(DigitalClipKind::none, std::memory_order_acq_rel),
     };
 }
 

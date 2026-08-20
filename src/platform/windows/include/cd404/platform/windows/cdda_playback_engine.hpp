@@ -8,11 +8,13 @@
 #include <cd404/platform/windows/wasapi_output.hpp>
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <span>
 
 namespace cd404::platform::windows {
 
@@ -61,6 +63,49 @@ struct CddaPlaybackProgress final {
     core::SampleFrame frames_submitted{};
     core::SampleFrame frames_rendered{};
 };
+
+enum class DigitalClipKind : std::uint8_t {
+    none,
+    true_peak_over,
+    hard_sample_clip,
+};
+
+struct StereoTruePeakAnalysis final {
+    float left_dbtp{-120.0F};
+    float right_dbtp{-120.0F};
+    DigitalClipKind left_clip{DigitalClipKind::none};
+    DigitalClipKind right_clip{DigitalClipKind::none};
+};
+
+class StereoPcm16TruePeakMeter final {
+public:
+    void reset() noexcept;
+    [[nodiscard]] StereoTruePeakAnalysis process(
+        std::span<const std::int16_t> samples) noexcept;
+
+private:
+    struct ChannelState final {
+        std::array<double, 12> history{};
+        int rail_sign{};
+        unsigned int rail_run{};
+    };
+
+    ChannelState left_;
+    ChannelState right_;
+};
+
+struct StereoMeterLevels final {
+    float left_dbfs{-120.0F};
+    float right_dbfs{-120.0F};
+    float left_true_peak_dbtp{-120.0F};
+    float right_true_peak_dbtp{-120.0F};
+    DigitalClipKind left_clip{DigitalClipKind::none};
+    DigitalClipKind right_clip{DigitalClipKind::none};
+};
+
+// Converts a linear RMS amplitude to sine-referenced dBFS, where a full-scale
+// sine reads 0 dBFS rather than -3.0103 dBFS.
+[[nodiscard]] float sine_referenced_dbfs_from_rms(double rms_amplitude) noexcept;
 
 struct CddaPlaybackResult final {
     audio::PlaybackState final_state{audio::PlaybackState::idle};
@@ -160,6 +205,7 @@ public:
     void set_volume(float volume) noexcept;
     [[nodiscard]] float volume() const noexcept;
     [[nodiscard]] CddaPlaybackProgress progress() const noexcept;
+    [[nodiscard]] StereoMeterLevels meter_levels() noexcept;
 
 private:
     std::atomic_bool active_{};
@@ -180,6 +226,12 @@ private:
     std::atomic<core::SampleFrame> frames_produced_{};
     std::atomic<core::SampleFrame> frames_submitted_{};
     std::atomic<core::SampleFrame> frames_rendered_{};
+    std::atomic<float> left_meter_dbfs_{-120.0F};
+    std::atomic<float> right_meter_dbfs_{-120.0F};
+    std::atomic<float> left_true_peak_dbtp_{-120.0F};
+    std::atomic<float> right_true_peak_dbtp_{-120.0F};
+    std::atomic<DigitalClipKind> left_clip_{DigitalClipKind::none};
+    std::atomic<DigitalClipKind> right_clip_{DigitalClipKind::none};
 };
 
 [[nodiscard]] const char* to_string(CddaPlaybackError error) noexcept;

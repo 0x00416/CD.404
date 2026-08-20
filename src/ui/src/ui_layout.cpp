@@ -24,8 +24,9 @@ Layout calculate_layout(
         std::max(220.0F, transport_top - top - 185.0F));
     const float cover_top = top + 52.0F;
 
-    result.refresh_button = D2D1::RectF(width - 160.0F, 12.0F, width - 120.0F, 52.0F);
-    result.eject_button = D2D1::RectF(width - 112.0F, 12.0F, width - 72.0F, 52.0F);
+    result.refresh_button = D2D1::RectF(width - 208.0F, 12.0F, width - 168.0F, 52.0F);
+    result.eject_button = D2D1::RectF(width - 160.0F, 12.0F, width - 120.0F, 52.0F);
+    result.vu_button = D2D1::RectF(width - 112.0F, 12.0F, width - 72.0F, 52.0F);
     result.settings_button = D2D1::RectF(width - 64.0F, 12.0F, width - 24.0F, 52.0F);
     result.cover = D2D1::RectF(margin, cover_top, margin + cover_size, cover_top + cover_size);
     result.track_list = D2D1::RectF(

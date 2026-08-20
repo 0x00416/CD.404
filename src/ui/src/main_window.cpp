@@ -35,6 +35,7 @@
 #include <cd404/ui/playback_presenter.hpp>
 #include <cd404/ui/settings_model.hpp>
 #include <cd404/ui/theme.hpp>
+#include <cd404/ui/vu_meter.hpp>
 
 #include "disc_snapshot.hpp"
 #include "ui_drawing.hpp"
@@ -105,6 +106,7 @@ constexpr int kLyricsOffsetApplyId = 1'257;
 constexpr int kLyricsOffsetUnitId = 1'258;
 constexpr UINT_PTR kMaintenanceTimer = 1;
 constexpr UINT kMaintenanceIntervalMs = 50;
+constexpr int kVuMeterFaceResourceId = 201;
 constexpr UINT_PTR kSettingsScrollSettleTimer = 2;
 constexpr UINT kSettingsScrollSettleDelayMs = 150;
 constexpr DWORD kHighResolutionTimerFlag = 0x00000002;
@@ -658,10 +660,21 @@ private:
 
     [[nodiscard]] bool needs_animation_frames() const noexcept
     {
-        return window_ != nullptr && IsWindowVisible(window_) != FALSE &&
-            IsIconic(window_) == FALSE && active_page_ == AppPage::player &&
-            ((playback_active_ && !playback_paused_) ||
-             lyric_transition_running_);
+        if (window_ == nullptr || IsWindowVisible(window_) == FALSE ||
+            IsIconic(window_) != FALSE) {
+            return false;
+        }
+        if (active_page_ == AppPage::player) {
+            return (playback_active_ && !playback_paused_) ||
+                lyric_transition_running_;
+        }
+        if (active_page_ == AppPage::vu_meter) {
+            return (playback_active_ && !playback_paused_) ||
+                !vu_needle_is_at_rest(vu_left_needle_, kVuMinimumDb) ||
+                !vu_needle_is_at_rest(vu_right_needle_, kVuMinimumDb) ||
+                GetTickCount64() < vu_clip_hold_until_;
+        }
+        return false;
     }
 
     void arm_frame_timer()
@@ -689,6 +702,9 @@ private:
 
     void update_frame_timer_state()
     {
+        if (active_page_ != AppPage::vu_meter) {
+            last_vu_frame_time_ = {};
+        }
         if (needs_animation_frames()) {
             arm_frame_timer();
         } else if (frame_timer_armed_) {
@@ -700,6 +716,15 @@ private:
     void render_animation_frame()
     {
         update_playback_clock(false);
+        if (active_page_ == AppPage::vu_meter) {
+            const auto now = std::chrono::steady_clock::now();
+            const float elapsed_seconds =
+                last_vu_frame_time_.time_since_epoch().count() == 0
+                ? static_cast<float>(frame_interval_100ns_) / 10'000'000.0F
+                : std::chrono::duration<float>(now - last_vu_frame_time_).count();
+            last_vu_frame_time_ = now;
+            update_vu_meter(elapsed_seconds);
+        }
         InvalidateRect(window_, nullptr, FALSE);
         UpdateWindow(window_);
     }
@@ -874,6 +899,9 @@ private:
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_MOUSEWHEEL:
+            if (active_page_ == AppPage::vu_meter) {
+                return 0;
+            }
             if (active_page_ == AppPage::settings) {
                 handle_settings_mouse_wheel(GET_WHEEL_DELTA_WPARAM(wparam));
                 return 0;
@@ -889,6 +917,12 @@ private:
             return 0;
         case WM_LBUTTONDOWN:
             SetFocus(window_);
+            if (active_page_ == AppPage::vu_meter) {
+                handle_vu_meter_click(D2D1::Point2F(
+                    pixel_to_dip(GET_X_LPARAM(lparam)),
+                    pixel_to_dip(GET_Y_LPARAM(lparam))));
+                return 0;
+            }
             if (active_page_ == AppPage::settings) {
                 handle_settings_click(D2D1::Point2F(
                     pixel_to_dip(GET_X_LPARAM(lparam)),
@@ -1013,6 +1047,10 @@ private:
             }
             if (wparam == kMaintenanceTimer) {
                 update_playback_clock();
+                if (active_page_ != AppPage::vu_meter || frame_timer_ == nullptr) {
+                    update_vu_meter(
+                        static_cast<float>(kMaintenanceIntervalMs) / 1000.0F);
+                }
                 ensure_lyrics_for_selected_track();
                 if (lyrics_offset_window_ != nullptr &&
                     lyrics_offset_track_ != selected_track_) {
@@ -1025,7 +1063,8 @@ private:
                     settings_saved_ = false;
                 }
                 if (frame_timer_ == nullptr ||
-                    active_page_ == AppPage::settings) {
+                    active_page_ == AppPage::settings ||
+                    active_page_ == AppPage::vu_meter) {
                     InvalidateRect(window_, nullptr, FALSE);
                 }
             }
@@ -1096,6 +1135,7 @@ private:
         none,
         refresh,
         eject,
+        vu_meter,
         settings,
         previous,
         play,
@@ -1107,6 +1147,7 @@ private:
 
     enum class AppPage {
         player,
+        vu_meter,
         settings,
         metadata_editor,
     };
@@ -1307,13 +1348,26 @@ private:
         const D2D1_SIZE_U size = D2D1::SizeU(
             static_cast<UINT32>(std::max<LONG>(client.right, 1)),
             static_cast<UINT32>(std::max<LONG>(client.bottom, 1)));
+        const auto window_properties = D2D1::HwndRenderTargetProperties(window_, size);
         HRESULT result = factory_->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(),
-            D2D1::HwndRenderTargetProperties(window_, size),
+            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_HARDWARE),
+            window_properties,
             render_target_.ReleaseAndGetAddressOf());
+        render_target_hardware_accelerated_ = SUCCEEDED(result);
+        if (FAILED(result)) {
+            result = factory_->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT),
+                window_properties,
+                render_target_.ReleaseAndGetAddressOf());
+        }
         if (FAILED(result)) {
             return result;
         }
+        diagnostics_.record(
+            L"render",
+            render_target_hardware_accelerated_
+                ? L"direct2d_hardware"
+                : L"direct2d_default_fallback");
 
         result = configure_text_rendering(
             *render_target_.Get(),
@@ -1366,7 +1420,49 @@ private:
         if (SUCCEEDED(result) && !disc_.cover_art_path.empty()) {
             load_cover_bitmap(disc_.cover_art_path);
         }
+        if (SUCCEEDED(result)) {
+            load_vu_meter_bitmap();
+        }
         return result;
+    }
+
+    void load_vu_meter_bitmap()
+    {
+        vu_meter_bitmap_.Reset();
+        if (!render_target_ || !imaging_factory_) {
+            return;
+        }
+        const HRSRC resource = FindResourceW(
+            instance_, MAKEINTRESOURCEW(kVuMeterFaceResourceId), RT_RCDATA);
+        if (resource == nullptr) {
+            return;
+        }
+        const HGLOBAL loaded = LoadResource(instance_, resource);
+        const DWORD byte_count = SizeofResource(instance_, resource);
+        auto* bytes = static_cast<BYTE*>(LockResource(loaded));
+        if (loaded == nullptr || bytes == nullptr || byte_count == 0) {
+            return;
+        }
+        ComPtr<IWICStream> stream;
+        ComPtr<IWICBitmapDecoder> decoder;
+        ComPtr<IWICBitmapFrameDecode> frame;
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(imaging_factory_->CreateStream(stream.ReleaseAndGetAddressOf())) ||
+            FAILED(stream->InitializeFromMemory(bytes, byte_count)) ||
+            FAILED(imaging_factory_->CreateDecoderFromStream(
+                stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad,
+                decoder.ReleaseAndGetAddressOf())) ||
+            FAILED(decoder->GetFrame(0, frame.ReleaseAndGetAddressOf())) ||
+            FAILED(imaging_factory_->CreateFormatConverter(
+                converter.ReleaseAndGetAddressOf())) ||
+            FAILED(converter->Initialize(
+                frame.Get(), GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.0,
+                WICBitmapPaletteTypeMedianCut))) {
+            return;
+        }
+        static_cast<void>(render_target_->CreateBitmapFromWicBitmap(
+            converter.Get(), nullptr, vu_meter_bitmap_.ReleaseAndGetAddressOf()));
     }
 
     void load_cover_bitmap(const std::filesystem::path& path)
@@ -1418,6 +1514,7 @@ private:
 
     void discard_device_resources()
     {
+        vu_meter_bitmap_.Reset();
         cover_bitmap_.Reset();
         cover_brush_.Reset();
         disc_brush_.Reset();
@@ -1436,6 +1533,7 @@ private:
         surface_brush_.Reset();
         background_brush_.Reset();
         render_target_.Reset();
+        render_target_hardware_accelerated_ = false;
     }
 
     void apply_window_materials() const
@@ -1707,6 +1805,11 @@ private:
                 update_metadata_edit_bounds();
                 update_metadata_editor_bounds();
                 draw_metadata_editor_page();
+            } else if (active_page_ == AppPage::vu_meter) {
+                update_metadata_edit_bounds();
+                draw_content();
+                draw_transport();
+                draw_vu_meter_page();
             } else {
                 update_metadata_edit_bounds();
                 draw_content();
@@ -1916,12 +2019,249 @@ private:
             ControlIcon::eject,
             hovered_control_ == HoveredControl::eject,
             disc_.drive.has_value());
+        draw_vu_entry_button(
+            layout_.vu_button,
+            hovered_control_ == HoveredControl::vu_meter ||
+                active_page_ == AppPage::vu_meter);
         draw_icon_button(
             layout_.settings_button,
             ControlIcon::settings,
             hovered_control_ == HoveredControl::settings ||
                 active_page_ == AppPage::settings,
             true);
+    }
+
+    void draw_vu_entry_button(const D2D1_RECT_F rectangle, const bool active)
+    {
+        const auto rounded = D2D1::RoundedRect(rectangle, 10.0F, 10.0F);
+        render_target_->FillRoundedRectangle(
+            rounded, active ? elevated_brush_.Get() : surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            rounded, active ? accent_brush_.Get() : border_brush_.Get(), 1.0F);
+        const float center_x = (rectangle.left + rectangle.right) * 0.5F;
+        const float center_y = (rectangle.top + rectangle.bottom) * 0.5F + 2.0F;
+        ComPtr<ID2D1PathGeometry> arc;
+        if (SUCCEEDED(factory_->CreatePathGeometry(arc.ReleaseAndGetAddressOf()))) {
+            ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(arc->Open(sink.ReleaseAndGetAddressOf()))) {
+                sink->BeginFigure(
+                    D2D1::Point2F(center_x - 10.0F, center_y + 3.0F),
+                    D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(center_x + 10.0F, center_y + 3.0F),
+                    D2D1::SizeF(11.0F, 11.0F), 0.0F,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL));
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                if (SUCCEEDED(sink->Close())) {
+                    render_target_->DrawGeometry(
+                        arc.Get(), active ? accent_brush_.Get() : secondary_brush_.Get(),
+                        1.5F);
+                }
+            }
+        }
+        render_target_->DrawLine(
+            D2D1::Point2F(center_x, center_y + 3.0F),
+            D2D1::Point2F(center_x + 6.0F, center_y - 4.0F),
+            active ? accent_brush_.Get() : secondary_brush_.Get(), 1.5F);
+        draw_text(
+            L"VU", caption_format_.Get(),
+            D2D1::RectF(rectangle.left, rectangle.top + 2.0F,
+                        rectangle.right, rectangle.top + 15.0F),
+            active ? accent_brush_.Get() : muted_brush_.Get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    [[nodiscard]] D2D1_RECT_F vu_meter_destination() const noexcept
+    {
+        constexpr float aspect = 1200.0F / 450.0F;
+        constexpr float inset = 12.0F;
+        const auto bounds = vu_meter_bounds();
+        const float available_width = std::max(
+            1.0F, bounds.right - bounds.left - inset * 2.0F);
+        const float available_height = std::max(
+            1.0F, bounds.bottom - bounds.top - inset * 2.0F);
+        const float width = std::min(available_width, available_height * aspect);
+        const float height = width / aspect;
+        const float left = bounds.left + (bounds.right - bounds.left - width) * 0.5F;
+        const float top = bounds.top + (bounds.bottom - bounds.top - height) * 0.5F;
+        return D2D1::RectF(left, top, left + width, top + height);
+    }
+
+    [[nodiscard]] D2D1_RECT_F vu_meter_bounds() const noexcept
+    {
+        return D2D1::RectF(
+            layout_.track_list.left,
+            84.0F,
+            layout_.track_list.right,
+            layout_.track_list.bottom);
+    }
+
+    [[nodiscard]] static D2D1_POINT_2F vu_design_point(
+        const D2D1_RECT_F destination,
+        const float x,
+        const float y) noexcept
+    {
+        const float scale = (destination.right - destination.left) / 1200.0F;
+        return D2D1::Point2F(
+            destination.left + x * scale,
+            destination.top + y * scale);
+    }
+
+    [[nodiscard]] static D2D1_RECT_F vu_design_rect(
+        const D2D1_RECT_F destination,
+        const float x,
+        const float y,
+        const float width,
+        const float height) noexcept
+    {
+        const auto top_left = vu_design_point(destination, x, y);
+        const auto bottom_right = vu_design_point(
+            destination, x + width, y + height);
+        return D2D1::RectF(
+            top_left.x, top_left.y, bottom_right.x, bottom_right.y);
+    }
+
+    void draw_vu_backlight(
+        const D2D1_RECT_F destination,
+        const D2D1_RECT_F face,
+        const float design_center_x,
+        const float opacity)
+    {
+        const D2D1_GRADIENT_STOP stops[]{
+            {0.0F, color(0xFFB243, opacity)},
+            {0.55F, color(0xFF9C32, opacity * 0.42F)},
+            {1.0F, color(0xFF8A24, 0.0F)},
+        };
+        ComPtr<ID2D1GradientStopCollection> stop_collection;
+        ComPtr<ID2D1RadialGradientBrush> glow;
+        if (FAILED(render_target_->CreateGradientStopCollection(
+                stops, static_cast<UINT32>(std::size(stops)),
+                stop_collection.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        const float scale = (destination.right - destination.left) / 1200.0F;
+        const auto center = vu_design_point(destination, design_center_x, 167.0F);
+        if (FAILED(render_target_->CreateRadialGradientBrush(
+                D2D1::RadialGradientBrushProperties(
+                    center, D2D1::Point2F(), 235.0F * scale, 190.0F * scale),
+                stop_collection.Get(), glow.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        render_target_->PushAxisAlignedClip(face, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        render_target_->FillRectangle(face, glow.Get());
+        render_target_->PopAxisAlignedClip();
+    }
+
+    void draw_vu_needle(
+        const D2D1_RECT_F destination,
+        const D2D1_RECT_F face,
+        const float pivot_x,
+        const float angle)
+    {
+        const float scale = (destination.right - destination.left) / 1200.0F;
+        const auto pivot = vu_design_point(destination, pivot_x, 100.0F);
+        const float radians = angle * 3.14159265358979323846F / 180.0F;
+        const float needle_length = vu_meter_needle_length(angle);
+        const auto tip = D2D1::Point2F(
+            pivot.x + std::sin(radians) * needle_length * scale,
+            pivot.y + std::cos(radians) * needle_length * scale);
+        ComPtr<ID2D1SolidColorBrush> shadow;
+        ComPtr<ID2D1SolidColorBrush> needle;
+        ComPtr<ID2D1SolidColorBrush> highlight;
+        static_cast<void>(create_brush(color(0x000000, 0.42F), shadow));
+        static_cast<void>(create_brush(color(0x11100D, 0.98F), needle));
+        static_cast<void>(create_brush(color(0x756D5D, 0.55F), highlight));
+        render_target_->PushAxisAlignedClip(face, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        render_target_->DrawLine(
+            D2D1::Point2F(pivot.x + 1.4F * scale, pivot.y + 1.6F * scale),
+            D2D1::Point2F(tip.x + 1.4F * scale, tip.y + 1.6F * scale),
+            shadow.Get(), std::max(1.0F, 3.2F * scale));
+        render_target_->DrawLine(
+            pivot, tip, needle.Get(), std::max(1.0F, 2.0F * scale));
+        render_target_->DrawLine(
+            D2D1::Point2F(pivot.x - 0.4F * scale, pivot.y),
+            D2D1::Point2F(tip.x - 0.4F * scale, tip.y),
+            highlight.Get(), std::max(0.60F, 0.60F * scale));
+        render_target_->PopAxisAlignedClip();
+    }
+
+    void draw_vu_clip_indicator(const D2D1_RECT_F destination)
+    {
+        if (GetTickCount64() >= vu_clip_hold_until_) {
+            return;
+        }
+
+        const float scale = (destination.right - destination.left) / 1200.0F;
+        // The photographic panel already contains one physical red lens between
+        // the meters. Illuminate that lens in place instead of drawing another LED.
+        const auto center = vu_design_point(destination, 600.0F, 231.0F);
+        const D2D1_GRADIENT_STOP stops[]{
+            {0.0F, color(0xFFF5EC, 0.96F)},
+            {0.18F, color(0xFF2A18, 0.94F)},
+            {0.48F, color(0xE20B12, 0.42F)},
+            {1.0F, color(0xE20B12, 0.0F)},
+        };
+        ComPtr<ID2D1GradientStopCollection> stop_collection;
+        ComPtr<ID2D1RadialGradientBrush> glow;
+        if (SUCCEEDED(render_target_->CreateGradientStopCollection(
+                stops, static_cast<UINT32>(std::size(stops)),
+                stop_collection.ReleaseAndGetAddressOf())) &&
+            SUCCEEDED(render_target_->CreateRadialGradientBrush(
+                D2D1::RadialGradientBrushProperties(
+                    center, D2D1::Point2F(), 19.0F * scale, 19.0F * scale),
+                stop_collection.Get(), glow.ReleaseAndGetAddressOf()))) {
+            render_target_->FillEllipse(
+                D2D1::Ellipse(center, 19.0F * scale, 19.0F * scale), glow.Get());
+        }
+    }
+
+    void draw_vu_meter_page()
+    {
+        const auto bounds = vu_meter_bounds();
+        const auto destination = vu_meter_destination();
+        const auto panel = D2D1::RoundedRect(bounds, 12.0F, 12.0F);
+        render_target_->FillRoundedRectangle(panel, surface_brush_.Get());
+        render_target_->DrawRoundedRectangle(panel, border_brush_.Get(), 1.0F);
+        if (!vu_meter_bitmap_) {
+            draw_text(
+                L"VU meter resource is unavailable", body_format_.Get(), destination,
+                error_brush_.Get(), DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            return;
+        }
+        render_target_->DrawBitmap(
+            vu_meter_bitmap_.Get(), destination, 1.0F,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+        const auto left_face = vu_design_rect(destination, 76.0F, 141.0F, 449.0F, 167.0F);
+        const auto right_face = vu_design_rect(destination, 674.0F, 141.0F, 448.0F, 167.0F);
+        const float light = vu_backlight_opacity(playback_active_, playback_paused_);
+        draw_vu_backlight(destination, left_face, 300.0F, light);
+        draw_vu_backlight(destination, right_face, 900.0F, light);
+        draw_vu_needle(
+            destination, left_face, 300.5F, vu_left_needle_.angle_degrees);
+        draw_vu_needle(
+            destination, right_face, 898.0F, vu_right_needle_.angle_degrees);
+        draw_vu_clip_indicator(destination);
+    }
+
+    void update_vu_meter(const float elapsed_seconds)
+    {
+        const auto levels = playback_engine_.meter_levels();
+        const float left_target = playback_active_ && !playback_paused_
+            ? vu_level_from_dbfs(levels.left_dbfs) : kVuMinimumDb;
+        const float right_target = playback_active_ && !playback_paused_
+            ? vu_level_from_dbfs(levels.right_dbfs) : kVuMinimumDb;
+        vu_left_needle_ = advance_vu_needle(
+            vu_left_needle_, left_target, elapsed_seconds);
+        vu_right_needle_ = advance_vu_needle(
+            vu_right_needle_, right_target, elapsed_seconds);
+        if (levels.left_clip == platform::windows::DigitalClipKind::hard_sample_clip ||
+            levels.right_clip == platform::windows::DigitalClipKind::hard_sample_clip) {
+            vu_clip_hold_until_ = GetTickCount64() + 2'500U;
+        }
     }
 
     void draw_content()
@@ -4974,10 +5314,12 @@ private:
         const auto previous_control = hovered_control_;
         hovered_track_.reset();
         hovered_control_ = hit_control(point);
-        for (const auto& hit : track_hits_) {
-            if (contains(hit.rectangle, point)) {
-                hovered_track_ = hit.track_index;
-                break;
+        if (active_page_ != AppPage::vu_meter) {
+            for (const auto& hit : track_hits_) {
+                if (contains(hit.rectangle, point)) {
+                    hovered_track_ = hit.track_index;
+                    break;
+                }
             }
         }
         if (previous_track != hovered_track_ || previous_control != hovered_control_) {
@@ -4987,17 +5329,70 @@ private:
 
     [[nodiscard]] HoveredControl hit_control(const D2D1_POINT_2F point) const
     {
-        if (contains(layout_.refresh_button, point)) return HoveredControl::refresh;
-        if (contains(layout_.eject_button, point)) return HoveredControl::eject;
-        if (contains(layout_.settings_button, point)) return HoveredControl::settings;
+        const auto header = hit_header_control(point);
+        if (header != HoveredControl::none) return header;
+        if (active_page_ == AppPage::vu_meter && contains(vu_meter_bounds(), point)) {
+            return HoveredControl::none;
+        }
         if (contains(layout_.previous_button, point)) return HoveredControl::previous;
         if (contains(layout_.play_button, point)) return HoveredControl::play;
         if (contains(layout_.next_button, point)) return HoveredControl::next;
         if (contains(layout_.progress_hit, point)) return HoveredControl::progress;
         if (contains(layout_.volume_hit, point)) return HoveredControl::volume;
-        if (contains(layout_.metadata_button, point)) return HoveredControl::metadata;
+        if (active_page_ != AppPage::vu_meter &&
+            contains(layout_.metadata_button, point)) {
+            return HoveredControl::metadata;
+        }
         return HoveredControl::none;
     }
+
+    [[nodiscard]] HoveredControl hit_header_control(
+        const D2D1_POINT_2F point) const
+    {
+        if (contains(layout_.refresh_button, point)) return HoveredControl::refresh;
+        if (contains(layout_.eject_button, point)) return HoveredControl::eject;
+        if (contains(layout_.vu_button, point)) return HoveredControl::vu_meter;
+        if (contains(layout_.settings_button, point)) return HoveredControl::settings;
+        return HoveredControl::none;
+    }
+
+    void handle_vu_meter_click(const D2D1_POINT_2F point)
+    {
+        switch (hit_control(point)) {
+        case HoveredControl::vu_meter:
+            active_page_ = AppPage::player;
+            InvalidateRect(window_, nullptr, FALSE);
+            break;
+        case HoveredControl::settings:
+            open_settings();
+            break;
+        case HoveredControl::refresh:
+            refresh_disc();
+            break;
+        case HoveredControl::eject:
+            eject_disc();
+            break;
+        case HoveredControl::previous:
+            select_relative_track(-1);
+            break;
+        case HoveredControl::play:
+            toggle_playback();
+            break;
+        case HoveredControl::next:
+            select_relative_track(1);
+            break;
+        case HoveredControl::progress:
+            seek_from_point(point.x);
+            break;
+        case HoveredControl::volume:
+            set_volume_from_point(point.x);
+            persist_user_settings();
+            break;
+        default:
+            break;
+        }
+    }
+
     void handle_click(const D2D1_POINT_2F point)
     {
         for (const auto& hit : track_hits_) {
@@ -5021,6 +5416,11 @@ private:
             break;
         case HoveredControl::eject:
             eject_disc();
+            break;
+        case HoveredControl::vu_meter:
+            active_page_ = AppPage::vu_meter;
+            hovered_track_.reset();
+            InvalidateRect(window_, nullptr, FALSE);
             break;
         case HoveredControl::settings:
             open_settings();
@@ -5093,7 +5493,23 @@ private:
             }
             return 0;
         }
+        if (active_page_ == AppPage::vu_meter) {
+            if (key == VK_ESCAPE || key == 'V') {
+                active_page_ = AppPage::player;
+                InvalidateRect(window_, nullptr, FALSE);
+            } else if (key == 'S') {
+                open_settings();
+            } else if (key == VK_SPACE || key == VK_RETURN) {
+                toggle_playback();
+            }
+            return 0;
+        }
         switch (key) {
+        case 'V':
+            active_page_ = AppPage::vu_meter;
+            hovered_track_.reset();
+            InvalidateRect(window_, nullptr, FALSE);
+            return 0;
         case VK_SPACE:
         case VK_RETURN:
             toggle_playback();
@@ -9142,7 +9558,9 @@ private:
     ComPtr<IDWriteFactory> write_factory_;
     ComPtr<IWICImagingFactory> imaging_factory_;
     ComPtr<ID2D1HwndRenderTarget> render_target_;
+    bool render_target_hardware_accelerated_{};
     ComPtr<ID2D1Bitmap> cover_bitmap_;
+    ComPtr<ID2D1Bitmap> vu_meter_bitmap_;
     ComPtr<ID2D1SolidColorBrush> background_brush_;
     ComPtr<ID2D1SolidColorBrush> surface_brush_;
     ComPtr<ID2D1SolidColorBrush> elevated_brush_;
@@ -9294,6 +9712,10 @@ private:
     bool playback_active_{};
     bool playback_paused_{};
     bool playback_completed_{};
+    VuNeedleState vu_left_needle_{};
+    VuNeedleState vu_right_needle_{};
+    std::chrono::steady_clock::time_point last_vu_frame_time_{};
+    ULONGLONG vu_clip_hold_until_{};
     std::size_t playback_start_track_{};
     core::SampleFrame playback_start_offset_frames_{};
     core::SampleFrame playback_track_frame_{};

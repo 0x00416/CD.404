@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+  width="1200" height="450" viewBox="0 0 1200 450"
+  role="img" aria-labelledby="title description"
+  data-meter-count="2" data-visual-style="photographic-calibrated-top-pivot-dual"
+  data-source-medium="generated-photograph" data-scale-medium="calibrated-elliptical-print"
+  data-aspect-correction="preserve-source" data-backlight-mode="programmatic" data-backlight-baked="false"
+  data-clip-mode="programmatic" data-db-min="-22" data-db-max="5"
+  data-angle-min="-50.037483" data-angle-zero="25.664888" data-angle-max="50.037483">
+  <title id="title">CD.404 photographic dual VU meter panel</title>
+  <desc id="description">Wide elliptical top-pivot VU scale using the Sony 3 -22/0/+5 dB angle anchors. Every printed tick is radial to the same pivot, and the angle-dependent program needle ends exactly at the corresponding outer tick.</desc>
+  <image id="photographic-meter-design" href="vu-meter-photoreal-calibrated-1200x450.png" xlink:href="vu-meter-photoreal-calibrated-1200x450.png" x="0" y="0" width="1200" height="450" preserveAspectRatio="xMidYMid meet"/>
+  
+  <g id="backlight-zone-L" data-render="programmatic" data-x="76" data-y="141" data-width="449" data-height="167"/>
+  <g id="needle-overlay-anchor-L" data-channel="L" data-pivot-x="300.5" data-pivot-y="100" data-clip-x="76" data-clip-y="141" data-clip-width="449" data-clip-height="167"/>
+  <g id="backlight-zone-R" data-render="programmatic" data-x="674" data-y="141" data-width="448" data-height="167"/>
+  <g id="needle-overlay-anchor-R" data-channel="R" data-pivot-x="898" data-pivot-y="100" data-clip-x="674" data-clip-y="141" data-clip-width="448" data-clip-height="167"/>
+  <g id="clip-indicator" data-render="programmatic-active" data-center-x="600" data-center-y="231" data-lens-radius="10" data-glow-radius="30"/>
+</svg>

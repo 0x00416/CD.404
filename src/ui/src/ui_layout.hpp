@@ -9,6 +9,7 @@ struct Layout final {
     float height{};
     D2D1_RECT_F refresh_button{};
     D2D1_RECT_F eject_button{};
+    D2D1_RECT_F vu_button{};
     D2D1_RECT_F settings_button{};
     D2D1_RECT_F cover{};
     D2D1_RECT_F track_list{};
